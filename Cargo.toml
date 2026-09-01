@@ -17,7 +17,10 @@ repository = "https://github.com/hyperi-io/factbook-rs"
 publish = true
 keywords = ["geoip", "mmdb", "maxmind", "enrichment", "ip"]
 categories = ["network-programming", "caching", "database"]
-exclude = [".claude/", ".github/", ".hyperi-ai/", "docs/", "benches/", "scripts/"]
+# benches/ ships: the manifest declares that target, so excluding the file
+# warns on every publish and leaves the package describing something it does
+# not contain.
+exclude = [".claude/", ".github/", ".hyperi-ai/", "docs/", "scripts/"]
 
 [package.metadata.docs.rs]
 all-features = true
