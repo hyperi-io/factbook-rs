@@ -434,8 +434,68 @@ fn read(readers: &Readers, ip: IpAddr) -> Option<GeoIpRecord> {
     found.then_some(record)
 }
 
+/// IPinfo Lite's record, which is flat where MaxMind's nests and carries the
+/// network alongside the location.
+#[derive(serde::Deserialize)]
+struct IpInfoRecord<'a> {
+    #[serde(borrow, default)]
+    country_code: Option<&'a str>,
+    #[serde(borrow, default)]
+    country: Option<&'a str>,
+    #[serde(borrow, default)]
+    continent_code: Option<&'a str>,
+    #[serde(borrow, default)]
+    asn: Option<&'a str>,
+    #[serde(borrow, default)]
+    as_name: Option<&'a str>,
+}
+
+/// Whether a database is written in IPinfo's schema rather than MaxMind's.
+///
+/// Every database names its own schema in its metadata, so this holds for a
+/// file that was pre-seeded or mounted rather than downloaded.
+fn is_ipinfo(reader: &Reader<Mmap>) -> bool {
+    reader.metadata().database_type.starts_with("ipinfo")
+}
+
+/// IPinfo writes `AS15169` where every other source writes `15169`.
+fn asn_number(text: &str) -> Option<u32> {
+    text.strip_prefix("AS").unwrap_or(text).parse().ok()
+}
+
+/// Fill the fields an IPinfo database carries, location and network together.
+fn read_ipinfo(reader: &Reader<Mmap>, ip: IpAddr, record: &mut GeoIpRecord) -> bool {
+    let Some(result) = lookup_in(reader, ip, "ipinfo") else {
+        return false;
+    };
+    let found = match result.decode::<IpInfoRecord<'_>>() {
+        Ok(Some(found)) => found,
+        Ok(None) => return false,
+        Err(e) => {
+            debug!(%ip, error = %e, "IPinfo record did not decode");
+            return false;
+        }
+    };
+
+    record.country_code = found.country_code.map(CompactString::from);
+    record.country_name = found.country.map(CompactString::from);
+    record.continent_code = found.continent_code.map(CompactString::from);
+    record.autonomous_system_number = found.asn.and_then(asn_number);
+    record.autonomous_system_organization = found.as_name.map(CompactString::from);
+
+    let network = network_of(&result);
+    record.network.clone_from(&network);
+    record.asn_network = network;
+
+    true
+}
+
 /// Fill the location fields, reporting whether the database held the address.
 fn read_city(reader: &Reader<Mmap>, ip: IpAddr, record: &mut GeoIpRecord) -> bool {
+    if is_ipinfo(reader) {
+        return read_ipinfo(reader, ip, record);
+    }
+
     let Some(result) = lookup_in(reader, ip, "city") else {
         return false;
     };
@@ -475,6 +535,10 @@ fn read_city(reader: &Reader<Mmap>, ip: IpAddr, record: &mut GeoIpRecord) -> boo
 
 /// Fill the ASN fields, reporting whether the database held the address.
 fn read_asn(reader: &Reader<Mmap>, ip: IpAddr, record: &mut GeoIpRecord) -> bool {
+    if is_ipinfo(reader) {
+        return read_ipinfo(reader, ip, record);
+    }
+
     let Some(result) = lookup_in(reader, ip, "asn") else {
         return false;
     };
@@ -716,9 +780,77 @@ mod tests {
         .unwrap()
     }
 
+    /// A database in IPinfo Lite's schema, built to match the real one.
+    const IPINFO_DB: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/IPinfo-Lite-Test.mmdb"
+    );
+
     /// Parse a literal the tests are asserting about.
     fn ip(literal: &str) -> IpAddr {
         literal.parse().unwrap()
+    }
+
+    /// An enricher over the IPinfo database alone.
+    fn ipinfo() -> GeoIp {
+        GeoIp::open(Some(Path::new(IPINFO_DB)), None, CacheConfig::default()).unwrap()
+    }
+
+    #[test]
+    fn an_ipinfo_database_resolves_location_and_network_together() {
+        let record = ipinfo().lookup(ip("8.8.8.8")).unwrap();
+
+        assert_eq!(record.country_code.as_deref(), Some("US"));
+        assert_eq!(record.country_name.as_deref(), Some("United States"));
+        assert_eq!(record.continent_code.as_deref(), Some("NA"));
+        // The source writes `AS15169`; every other source writes a number.
+        assert_eq!(record.autonomous_system_number, Some(15169));
+        assert_eq!(
+            record.autonomous_system_organization.as_deref(),
+            Some("Google LLC")
+        );
+        assert_eq!(record.network.as_deref(), Some("8.8.8.0/24"));
+        assert_eq!(record.asn_network.as_deref(), Some("8.8.8.0/24"));
+    }
+
+    #[test]
+    fn an_ipinfo_database_answers_ipv6() {
+        let record = ipinfo().lookup(ip("2606:4700:4700::1111")).unwrap();
+
+        assert_eq!(record.country_code.as_deref(), Some("US"));
+        assert_eq!(record.autonomous_system_number, Some(13335));
+    }
+
+    #[test]
+    fn an_ipinfo_record_without_network_fields_still_resolves() {
+        let record = ipinfo().lookup(ip("45.45.45.45")).unwrap();
+
+        assert_eq!(record.country_code.as_deref(), Some("AU"));
+        assert!(record.autonomous_system_number.is_none());
+        assert!(record.autonomous_system_organization.is_none());
+    }
+
+    #[test]
+    fn an_address_the_ipinfo_database_omits_reads_as_absent() {
+        assert!(ipinfo().lookup(ip("9.9.9.9")).is_none());
+    }
+
+    #[test]
+    fn an_ipinfo_database_serves_the_asn_slot_too() {
+        let geoip = GeoIp::open(None, Some(Path::new(IPINFO_DB)), CacheConfig::default()).unwrap();
+        let record = geoip.lookup(ip("1.1.1.1")).unwrap();
+
+        assert_eq!(record.autonomous_system_number, Some(13335));
+        assert_eq!(record.country_code.as_deref(), Some("AU"));
+    }
+
+    #[test]
+    fn an_as_prefixed_number_parses_and_a_malformed_one_does_not() {
+        assert_eq!(asn_number("AS15169"), Some(15169));
+        assert_eq!(asn_number("15169"), Some(15169));
+        assert_eq!(asn_number("AS"), None);
+        assert_eq!(asn_number(""), None);
+        assert_eq!(asn_number("ASN15169"), None);
     }
 
     #[test]

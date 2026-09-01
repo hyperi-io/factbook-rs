@@ -6,23 +6,30 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! The provider paths against live endpoints rather than mocks.
+//! Every modelled provider against its live endpoint rather than a mock.
 //!
 //! Off unless asked for: these spend a daily quota and move tens of megabytes.
 //!
 //! ```sh
 //! FACTBOOK_LIVE=1 MAXMIND_ACCOUNT_ID=... MAXMIND_LICENSE_KEY=... \
-//!     cargo test --test live_provider -- --nocapture
+//!     IP_INFO_API_TOKEN=... cargo test --test live_provider -- --nocapture
 //! ```
 
 #![cfg(all(feature = "geoip-download", feature = "geoip-lookup"))]
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use factbook::geoip::{
-    AutoDownloadConfig, CacheConfig, Databases, GeoIp, GeoIpConfig, GeoIpProvider,
-    ProviderSelection, ensure_databases,
+    AutoDownloadConfig, CacheConfig, Databases, GeoIp, GeoIpConfig, GeoIpProvider, GeoIpRecord,
+    ProviderSelection, ensure_databases, source_terms,
 };
+
+/// Google Public DNS, in Google's own allocation, held by every source.
+const PROBE: &str = "8.8.8.8";
+
+/// The autonomous system that allocation belongs to.
+const PROBE_ASN: u32 = 15169;
 
 /// Whether the caller asked for live runs at all.
 fn live() -> bool {
@@ -35,6 +42,33 @@ fn credential(name: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Fetch one selection into a temporary directory.
+async fn provision(
+    selection: ProviderSelection,
+    auto: AutoDownloadConfig,
+) -> (tempfile::TempDir, Databases) {
+    let data_dir = tempfile::tempdir().expect("temp dir");
+
+    let config = GeoIpConfig {
+        provider: selection,
+        auto_download: AutoDownloadConfig {
+            data_dir: data_dir.path().to_path_buf(),
+            ..auto
+        },
+        ..GeoIpConfig::default()
+    };
+
+    for terms in source_terms(selection) {
+        eprintln!(
+            "{} ({}) -- terms: {}",
+            terms.name, terms.kind, terms.terms_url
+        );
+    }
+
+    let databases = ensure_databases(&config).await.expect("provision");
+    (data_dir, databases)
+}
+
 /// Refuse a file too small to be a database.
 fn assert_real_databases(databases: &Databases) {
     let files = databases
@@ -43,25 +77,30 @@ fn assert_real_databases(databases: &Databases) {
         .chain(databases.asn.iter())
         .flat_map(|database| &database.files);
 
+    let mut seen = 0;
     for file in files {
         let size = std::fs::metadata(file).expect("a downloaded file").len();
-        eprintln!("{} -- {size} bytes", file.display());
+        eprintln!("  {} -- {size} bytes", file.display());
         assert!(size > 1_000_000, "{} is {size} bytes", file.display());
+        seen += 1;
     }
+    assert!(seen > 0, "nothing was downloaded");
 }
 
-/// Resolve `8.8.8.8`, which every provider and vintage holds.
-fn assert_answers_a_known_address(databases: &Databases) {
+/// Read the probe address and report what the source said about it.
+fn record_for(databases: &Databases) -> Arc<GeoIpRecord> {
     let geoip = GeoIp::from_databases(databases, CacheConfig::default()).expect("readers");
+    let probe: IpAddr = PROBE.parse().expect("a valid address");
+    let record = geoip.lookup(probe).expect("a record for the probe address");
+    eprintln!("  {PROBE} -> {record:?}");
+    record
+}
 
-    let probe: IpAddr = "8.8.8.8".parse().expect("a valid address");
-    let record = geoip.lookup(probe).expect("a record for 8.8.8.8");
-
-    eprintln!("8.8.8.8 -> {record:?}");
-    assert_eq!(record.country_code.as_deref(), Some("US"), "{record:?}");
+/// The operator fields an ASN-carrying source must fill.
+fn assert_names_the_operator(record: &GeoIpRecord) {
     assert_eq!(
         record.autonomous_system_number,
-        Some(15169),
+        Some(PROBE_ASN),
         "wrong or missing ASN: {record:?}"
     );
     assert!(
@@ -71,6 +110,25 @@ fn assert_answers_a_known_address(databases: &Databases) {
             .is_some_and(|name| !name.trim().is_empty()),
         "no operator name: {record:?}"
     );
+}
+
+#[tokio::test]
+async fn db_ip_lite_provisions_and_answers() {
+    if !live() {
+        eprintln!("skipped: set FACTBOOK_LIVE=1");
+        return;
+    }
+
+    let (_dir, databases) = provision(
+        ProviderSelection::from(GeoIpProvider::DbIp),
+        AutoDownloadConfig::default(),
+    )
+    .await;
+
+    assert_real_databases(&databases);
+    let record = record_for(&databases);
+    assert_eq!(record.country_code.as_deref(), Some("US"), "{record:?}");
+    assert_names_the_operator(&record);
 }
 
 #[tokio::test]
@@ -87,25 +145,20 @@ async fn maxmind_free_provisions_and_answers() {
         return;
     }
 
-    let data_dir = tempfile::tempdir().expect("temp dir");
-
-    let config = GeoIpConfig {
-        provider: ProviderSelection::from(GeoIpProvider::MaxMind),
-        auto_download: AutoDownloadConfig {
-            data_dir: data_dir.path().to_path_buf(),
+    let (_dir, databases) = provision(
+        ProviderSelection::from(GeoIpProvider::MaxMind),
+        AutoDownloadConfig {
             maxmind_account_id: Some(account.into()),
             maxmind_license_key: Some(key.into()),
             ..AutoDownloadConfig::default()
         },
-        ..GeoIpConfig::default()
-    };
-
-    let databases = ensure_databases(&config).await.expect("provision");
-    assert!(databases.city.is_some(), "no city database");
-    assert!(databases.asn.is_some(), "no ASN database");
+    )
+    .await;
 
     assert_real_databases(&databases);
-    assert_answers_a_known_address(&databases);
+    let record = record_for(&databases);
+    assert_eq!(record.country_code.as_deref(), Some("US"), "{record:?}");
+    assert_names_the_operator(&record);
 }
 
 #[tokio::test]
@@ -119,47 +172,75 @@ async fn ipinfo_lite_provisions_and_answers() {
         return;
     }
 
-    let data_dir = tempfile::tempdir().expect("temp dir");
-
-    // IPinfo publishes no ASN database, so only the city half is selected.
-    let config = GeoIpConfig {
-        provider: ProviderSelection {
+    // IPinfo publishes no separate ASN database; its one file carries both.
+    let (_dir, databases) = provision(
+        ProviderSelection {
             city: GeoIpProvider::IpInfo.into(),
             ..ProviderSelection::default()
         },
-        auto_download: AutoDownloadConfig {
-            data_dir: data_dir.path().to_path_buf(),
+        AutoDownloadConfig {
             ipinfo_token: Some(token.into()),
             ..AutoDownloadConfig::default()
         },
-        ..GeoIpConfig::default()
-    };
+    )
+    .await;
 
-    let databases = ensure_databases(&config).await.expect("provision");
-    let city = databases.city.as_ref().expect("a city database");
-    eprintln!("IPinfo Lite files: {:?}", city.files);
-
-    assert_real_databases(&Databases {
+    let only_city = Databases {
         city: databases.city.clone(),
         asn: None,
-    });
+    };
+    assert_real_databases(&only_city);
 
-    // The enricher decodes MaxMind's schema, so Lite's records read as absent.
-    let geoip = GeoIp::from_databases(
-        &Databases {
-            city: databases.city.clone(),
-            asn: None,
-        },
-        CacheConfig::default(),
-    )
-    .expect("readers");
+    let record = record_for(&only_city);
+    assert_eq!(record.country_code.as_deref(), Some("US"), "{record:?}");
+    assert_names_the_operator(&record);
+}
 
-    let probe: IpAddr = "8.8.8.8".parse().expect("a valid address");
-    match geoip.lookup(probe) {
-        Some(record) => eprintln!("IPinfo Lite answers 8.8.8.8 -> {record:?}"),
-        None => eprintln!(
-            "IPinfo Lite read as absent for 8.8.8.8 -- known: the enricher \
-             decodes MaxMind's schema"
-        ),
+#[tokio::test]
+async fn sapics_origin_asn_provisions_and_answers() {
+    if !live() {
+        eprintln!("skipped: set FACTBOOK_LIVE=1");
+        return;
     }
+
+    // ASN-only, so the city half is left unselected and no country resolves.
+    let (_dir, databases) = provision(
+        ProviderSelection {
+            asn: GeoIpProvider::SapicsOriginAsn.into(),
+            ..ProviderSelection::default()
+        },
+        AutoDownloadConfig::default(),
+    )
+    .await;
+
+    let only_asn = Databases {
+        city: None,
+        asn: databases.asn.clone(),
+    };
+    assert_real_databases(&only_asn);
+    assert_names_the_operator(&record_for(&only_asn));
+}
+
+#[tokio::test]
+async fn sapics_iptoasn_provisions_and_answers() {
+    if !live() {
+        eprintln!("skipped: set FACTBOOK_LIVE=1");
+        return;
+    }
+
+    let (_dir, databases) = provision(
+        ProviderSelection {
+            asn: GeoIpProvider::SapicsIpToAsn.into(),
+            ..ProviderSelection::default()
+        },
+        AutoDownloadConfig::default(),
+    )
+    .await;
+
+    let only_asn = Databases {
+        city: None,
+        asn: databases.asn.clone(),
+    };
+    assert_real_databases(&only_asn);
+    assert_names_the_operator(&record_for(&only_asn));
 }

@@ -208,13 +208,29 @@ impl From<GeoIpProvider> for ProviderChoice {
 ///   asn: sapics_origin_asn
 /// ```
 ///
-/// A kind omitted from the map takes the default provider on its free tier.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// A kind omitted from the map takes that kind's default, and the two differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderSelection {
     /// Where the city database comes from.
     pub city: ProviderChoice,
     /// Where the ASN database comes from.
     pub asn: ProviderChoice,
+}
+
+impl Default for ProviderSelection {
+    /// The best pair that needs no account, which is what an unconfigured
+    /// deployment gets.
+    ///
+    /// DB-IP is the only city source that asks for no credential. For ASN,
+    /// sapics `origin-asn` publishes daily where DB-IP publishes monthly, has
+    /// wider coverage, and ships a digest beside the file that DB-IP does not,
+    /// so a bad download is caught rather than trusted.
+    fn default() -> Self {
+        Self {
+            city: ProviderChoice::from(GeoIpProvider::DbIp),
+            asn: ProviderChoice::from(GeoIpProvider::SapicsOriginAsn),
+        }
+    }
 }
 
 impl From<GeoIpProvider> for ProviderSelection {
@@ -317,10 +333,13 @@ impl<'de> Deserialize<'de> for ProviderSelection {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Ok(match ProviderWire::deserialize(deserializer)? {
             ProviderWire::Uniform(choice) => Self::from(choice),
-            ProviderWire::PerKind(PerKindWire { city, asn }) => Self {
-                city: city.unwrap_or_default(),
-                asn: asn.unwrap_or_default(),
-            },
+            ProviderWire::PerKind(PerKindWire { city, asn }) => {
+                let fallback = Self::default();
+                Self {
+                    city: city.unwrap_or(fallback.city),
+                    asn: asn.unwrap_or(fallback.asn),
+                }
+            }
         })
     }
 }
@@ -619,12 +638,20 @@ mod tests {
     }
 
     #[test]
-    fn an_omitted_kind_takes_the_default_provider() {
+    fn an_omitted_kind_takes_that_kinds_default() {
         let selection: ProviderSelection =
-            serde_json::from_str(r#"{"asn": "sapics_origin_asn"}"#).unwrap();
-        assert_eq!(selection.city, ProviderChoice::default());
+            serde_json::from_str(r#"{"asn": "sapics_ip_to_asn"}"#).unwrap();
+        assert_eq!(selection.city, ProviderSelection::default().city);
         assert_eq!(
             selection.asn,
+            ProviderChoice::from(GeoIpProvider::SapicsIpToAsn)
+        );
+
+        // The city default is not the ASN default, so an omitted ASN key must
+        // not fall back to the city provider.
+        let city_only: ProviderSelection = serde_json::from_str(r#"{"city": "db_ip"}"#).unwrap();
+        assert_eq!(
+            city_only.asn,
             ProviderChoice::from(GeoIpProvider::SapicsOriginAsn)
         );
     }
@@ -683,9 +710,14 @@ mod tests {
     fn geoip_defaults() {
         let config = GeoIpConfig::default();
         assert!(config.enabled);
+        // The best pair needing no account, which is not one provider.
         assert_eq!(
-            config.provider,
-            ProviderSelection::from(GeoIpProvider::DbIp)
+            config.provider.city,
+            ProviderChoice::from(GeoIpProvider::DbIp)
+        );
+        assert_eq!(
+            config.provider.asn,
+            ProviderChoice::from(GeoIpProvider::SapicsOriginAsn)
         );
         assert!(config.city_db_path.is_none());
         assert!(config.asn_db_path.is_none());

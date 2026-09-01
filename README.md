@@ -60,7 +60,7 @@ let config = GeoIpConfig {
 let databases = ensure_databases(&config).await?;
 let geoip = GeoIp::from_databases(&databases, CacheConfig::default())?;
 
-if let Some(record) = geoip.lookup("203.0.113.42".parse()?) {
+if let Some(record) = geoip.lookup("8.8.8.8".parse()?) {
     println!("{:?} / {:?}", record.country_code, record.city_name);
 }
 # Ok(())
@@ -70,6 +70,14 @@ if let Some(record) = geoip.lookup("203.0.113.42".parse()?) {
 Credentials are `Secret`: redacted in `Debug` and `Display`, and never formatted
 into a URL or a process argument. Supply them from your secrets layer rather
 than as literals.
+
+**With no account at all**, drop the credentials and the provider line:
+`GeoIpConfig::default()` selects DB-IP Lite for location and sapics
+`origin-asn` for networks, which is the best pair that asks for no signup. The
+two halves default separately because no single no-credential provider does
+both well -- DB-IP is the only city source needing no login, and `origin-asn`
+publishes daily against DB-IP's monthly, covers more of the address space, and
+ships a digest beside the file that DB-IP does not.
 
 The same thing in config, which is how most deployments say it:
 
