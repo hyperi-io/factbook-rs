@@ -7,7 +7,7 @@ and it fetches, verifies, indexes and serves it, keeping itself current without
 anyone tending it. Your hot path gets a lookup measured in nanoseconds against
 facts that were refreshed while it was running.
 
-Reference data is never the interesting part of a system and costs a surprising
+Reference data is rarely what a system is built for, and costs a surprising
 amount anyway. Someone writes a downloader. Someone writes a freshness check.
 Someone discovers the provider answered 200 with a login page and quietly
 overwrote a good database with 35 KB of HTML. Someone else notices the
@@ -23,8 +23,7 @@ a minute. Every service grows its own copy of all four.
 - **Telco BGP** -- prefix-to-origin and operator-name data at carrier
   granularity rather than the vanilla cyber view.
 - **Defence telemetry streams** -- a reference table an operator names in their
-  own config and fetches over their own link, with no provider modelled here at
-  all.
+  own config and fetches over their own link, no provider is implemented here.
 
 That last one is the point of the generic half: factbook does not need to know
 what your data means to keep it fresh and fast.
@@ -35,15 +34,38 @@ what your data means to keep it fresh and fast.
 factbook = "0.1"
 ```
 
-### GeoIP with MaxMind
+### GeoIP, with no account anywhere
 
-The common case. Name the provider, hand it your credentials, and factbook
+The default. No credentials, no signup, nothing to configure -- factbook
 downloads what is missing or stale and opens it behind a cache:
 
 ```rust,no_run
+use factbook::geoip::{CacheConfig, GeoIp, GeoIpConfig, ensure_databases};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let databases = ensure_databases(&GeoIpConfig::default()).await?;
+let geoip = GeoIp::from_databases(&databases, CacheConfig::default())?;
+
+if let Some(record) = geoip.lookup("8.8.8.8".parse()?) {
+    println!("{:?} / {:?}", record.country_code, record.city_name);
+}
+# Ok(())
+# }
+```
+
+That takes DB-IP Lite for location and sapics `origin-asn` for networks, which
+between them answer for more of the address space than the free tier you need an
+account for. The measurements are in
+[docs/data-sources.md](https://github.com/hyperi-io/factbook-rs/blob/main/docs/data-sources.md).
+
+### GeoIP with a provider account
+
+Name the provider and hand it your credentials. The tier is named too, never
+inferred from which credential happens to be set:
+
+```rust,no_run
 use factbook::geoip::{
-    AutoDownloadConfig, CacheConfig, GeoIp, GeoIpConfig, GeoIpProvider, ProviderSelection,
-    ensure_databases,
+    AutoDownloadConfig, GeoIpConfig, GeoIpProvider, ProviderSelection, ensure_databases,
 };
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -58,62 +80,15 @@ let config = GeoIpConfig {
 };
 
 let databases = ensure_databases(&config).await?;
-let geoip = GeoIp::from_databases(&databases, CacheConfig::default())?;
-
-if let Some(record) = geoip.lookup("8.8.8.8".parse()?) {
-    println!("{:?} / {:?}", record.country_code, record.city_name);
-}
 # Ok(())
 # }
 ```
 
 Credentials are `Secret`: redacted in `Debug` and `Display`, and never formatted
 into a URL or a process argument. Supply them from your secrets layer rather
-than as literals.
-
-**With no account at all**, drop the credentials and the provider line:
-`GeoIpConfig::default()` selects DB-IP Lite for location and sapics
-`origin-asn` for networks. That pair is not a compromise -- measured over
-200,000 uniformly drawn routable addresses, it answers for *more* of the
-address space than the free tier you need an account for:
-
-| source | ASN | country |
-|---|---|---|
-| sapics `origin-asn` *(default)* | **94.77%** | -- |
-| IPinfo Lite | 84.49% | 99.83% |
-| MaxMind GeoLite2 | 84.15% | 99.46% |
-| DB-IP Lite *(default for country)* | 83.70% | **99.88%** |
-
-The two halves default separately because no single no-credential provider does
-both well. Where both a source and MaxMind answer, they agree on the network
-98.8-99.7% of the time; `origin-asn` sits at the bottom of that range and at the
-top of the coverage one, which is the right side of the trade. Part of the
-disagreement is method rather than error -- it reports the origin observed in
-BGP where MaxMind reports a registry view.
-
-Uniform draws are not traffic-weighted, and live traffic concentrates where
-every source does better. The number that matters for a default is where it
-would leave you blind.
-
-The same thing in config, which is how most deployments say it:
-
-```yaml
-geoip:
-  provider:
-    city:
-      provider: max_mind
-      tier: paid
-    asn: sapics_origin_asn
-```
-
-The tier is named, never inferred from which credential happens to be set --
-inferring it means a deployment that forgets a token silently drops to a worse
-dataset instead of saying so. `factbook::geoip::validate` is the config-load
-check, so a missing credential or an unmodelled tier is reported by name rather
-than as a 401 on the first transfer.
-
-Every modelled source, and where its publisher states its terms:
-[SOURCES.md](SOURCES.md).
+than as literals. `factbook::geoip::validate` checks a selection when config
+loads, so a missing credential is reported by name rather than as a rejected
+request on the first fetch.
 
 Provisioning and lookup stay separate calls rather than one convenience
 constructor, so a host that pre-seeds its databases or mounts them read-only
@@ -177,140 +152,28 @@ caught when the config loads rather than at the first fetch.
 
 ## How it works
 
-Four stages, and every source goes through the same ones:
+Four stages, and every source goes through the same ones: **acquire** over a
+link that may be slow or throttled, **verify** before anything becomes live
+data, **maintain** on the source's own cadence, and **serve** from a
+memory-mapped reader behind a cache.
 
-1. **Acquire.** Resolve the source, fetch it over a link that may be slow or
-   throttled, resume what was interrupted, unpack what arrives compressed.
-2. **Verify.** Check the published digest, the promised length and the contents
-   before anything is allowed to become live data.
-3. **Maintain.** Refresh on a cadence, notice a file changed underneath a
-   running process, and swap it in without blocking a lookup.
-4. **Serve.** An mmap-backed reader behind a cache, keyed for how reference
-   lookups are actually distributed.
+A refused download never replaces a good database -- the file already on disk
+keeps being served. A hit costs tens of nanoseconds against microseconds for
+the database read behind it, and private or reserved addresses never reach the
+cache at all.
 
-The swap is an atomic rename, which is what makes the memory-mapped reader safe:
-writing a refresh in place underneath an mmap is undefined behaviour, not merely
-racy.
+Why that ordering makes the memory map safe, and what the five checks are:
+[docs/architecture.md](https://github.com/hyperi-io/factbook-rs/blob/main/docs/architecture.md).
 
-## What makes it worth using
+## Documentation
 
-### The cache is shaped for reference lookups
-
-Reference lookups are heavily frequency-biased -- your own egress, the CDNs in
-front of your users, whoever is scanning you this week -- and the long tail is
-nearly all single-appearance noise. That skew punishes a plain recency policy: a
-burst of one-off keys evicts the entries that earn their keep. On a synthetic
-Zipf stream with 30% one-off addresses, a straight LRU gave up 8.8 points of hit
-ratio against a policy cache at the same capacity.
-
-factbook uses [quick_cache](https://crates.io/crates/quick_cache), whose
-Clock-PRO/S3-FIFO design keeps a ghost queue of recently-evicted keys, so an
-entry dropped under a scan burst is promoted straight back on its next
-appearance rather than starting from nothing.
-
-| path | cost | against |
-|---|---|---|
-| cache hit | 27-37 ns | -- |
-| private or reserved address | 17-19 ns | about **2x** cheaper than a hit |
-| cold read, key present | 2.4-2.7 µs | cache worth roughly **65-100x** |
-| owned record instead of an `Arc` | 69-90 ns | about **2.4x** the cost of a hit |
-
-Ranges are the spread across two runs of the default feature set on one loaded
-machine, not a leaderboard entry. Take the ratios, treat the absolutes as
-indicative, and measure your own traffic.
-
-**Measure with the features you ship.** Enabling `metrics` puts two
-`Instant::now()` calls on the hit path and costs roughly 3-4x there, which is
-enough to invert the ratios above. It is off by default for that reason.
-
-Two details follow from the same reasoning:
-
-- **A hit hands back an `Arc`, not a copy.** Returning an owned record costs
-  about two and a half times a hit, to reproduce something already in memory.
-- **The key is an `IpAddr`, not the text of one.** 17 bytes, `Copy`, no
-  allocation and no string hashing per lookup -- and `::1` and
-  `0:0:0:0:0:0:0:1` stop being two entries for one address.
-
-**`lookup_many` is not a fast path for warm data.** It deduplicates a batch
-through a map before reading, which pays only when the reads behind it are
-expensive: on a cold cache it comes out ahead, and on a warm one it measured
-1.4-1.7x *slower* than just calling `lookup` in a loop. `lookup` already
-caches, so the loop is the right default and the batch call is for the cold
-case.
-
-### It keeps itself current, safely
-
-Refresh runs on the source's own cadence, honours any fetch ceiling the provider
-sets, and swaps the reader underneath a running process without blocking a
-lookup. Nothing schedules it, nothing restarts for it.
-
-The transfer assumes the link is slow rather than quick, because reference data
-is tens of megabytes and free tiers are rate limited:
-
-- **No total timeout.** A whole-request budget caps the link speed a deployment
-  is allowed to have. The bound is an idle one -- 60 seconds by default -- so a
-  transfer that is progressing keeps going and a stalled one still fails inside
-  a minute. Connect stays short at 30, because a dead host should fail fast.
-- **Interrupted transfers resume.** The `.part` file's length becomes a `Range`
-  request. A server that ignores it answers 200 and the file starts again,
-  because appending a whole body to a prefix is exactly the corruption this
-  crate exists to avoid.
-- **Progress is logged** every 30 seconds, so a slow download is legible rather
-  than indistinguishable from a hang.
-- **Downloads are sequential.** Two transfers over one throttled link are not
-  faster and may trip a rate limiter.
-
-And a bad download never replaces good data. Providers answer 200 with a login
-page, an error page, or a body that stops early, often enough that a status code
-is not evidence of anything, so every download is checked before it is allowed
-to become live:
-
-- **The published digest**, wherever the source ships one beside the file.
-- **The contents, always.** An MMDB carries the metadata marker the format
-  requires and answers a known-answer probe. A text payload must not open with
-  `<!DOCTYPE`, `<html` or `<?xml`.
-- **The volume.** A replacement a fraction of the size of the copy on disk is
-  refused rather than trusted.
-- **The promised length**, the cheapest truncation check available.
-
-A file failing any of those is deleted and logged at error level, and the copy
-already on disk keeps being served. That matters more than it sounds: a bad file
-at the destination would also have a fresh mtime, so the freshness check would
-never replace it.
-
-Failures are classified rather than lumped together. A 401 or 403 names the
-config field to fix and is reported as permanent -- retrying burns the
-provider's quota and hides the cause. A 429 carries the provider's own
-`Retry-After` and is never retried inside the transfer, because a source that
-bans you is worse than one you never added.
-
-## Features
-
-| feature | what it adds |
+| Read | When |
 |---|---|
-| `geoip` *(default)* | `geoip-download` + `geoip-lookup` |
-| `geoip-download` | acquisition: resolve, freshness-check, download, verify, unpack, refresh -- and the generic `table` module |
-| `geoip-lookup` | mmap readers, the cache, `GeoIpRecord` |
-| `metrics` | emit hit/miss/refresh through the `metrics` facade |
-| `vrl` | map a record into `vrl::value::ObjectMap` for a host embedding VRL |
-
-`vrl` is off by default and exists for consumers that actually embed VRL. Turn
-it on if you are one; leave it off otherwise.
-
-## Bring your own HTTP client
-
-The default client is plain rustls. A deployment behind a proxy, or one that
-trusts a private CA, passes its own configured `reqwest::Client` instead:
-
-```rust,no_run
-use factbook::geoip::GeoIpConfig;
-
-# fn example(configured: reqwest::Client) {
-let config = GeoIpConfig::default().with_http_client(configured);
-# }
-```
-
-An injected client is used exactly as it stands, timeouts included.
+| [getting-started](https://github.com/hyperi-io/factbook-rs/blob/main/docs/getting-started.md) | Adding factbook to something, or checking a build works |
+| [data-sources](https://github.com/hyperi-io/factbook-rs/blob/main/docs/data-sources.md) | Choosing what to fetch, or asking why the default is what it is |
+| [configuration](https://github.com/hyperi-io/factbook-rs/blob/main/docs/configuration.md) | Looking up a key, its type or its default |
+| [metrics](https://github.com/hyperi-io/factbook-rs/blob/main/docs/metrics.md) | Wiring up alerts, or asking what to watch |
+| [architecture](https://github.com/hyperi-io/factbook-rs/blob/main/docs/architecture.md) | Understanding how a refused download cannot damage a running service |
 
 ## Licence
 
@@ -318,6 +181,8 @@ Apache-2.0. See `LICENSE`.
 
 factbook ships no reference data. It fetches at runtime from whichever source
 you configure, and each source sets its own terms for its own data.
+[SOURCES.md](https://github.com/hyperi-io/factbook-rs/blob/main/SOURCES.md)
+points at where each publisher states them.
 
 Credentials are held in a `Secret` newtype that never reaches a log line, a
 process argument or a formatted URL.

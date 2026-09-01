@@ -28,7 +28,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 # consumer that only provisions the files (it runs someone else's lookup engine)
 # takes `default-features = false, features = ["geoip-download"]` and pays for
 # no MMDB reader.
-default = ["geoip"]
+default = ["geoip", "metrics"]
 
 geoip = ["geoip-download", "geoip-lookup"]
 
@@ -53,9 +53,20 @@ geoip-lookup = [
     "dep:arc-swap",
 ]
 
-# Emit through the `metrics` facade. Off by default: a library should not decide
-# that its consumer has a recorder installed.
+# Download outcomes and the age of each database, through the `metrics` facade.
+#
+# ON by default. It runs once per database per refresh, so the cost is a stat on
+# a daily or monthly cadence, and the age gauge is the only signal a deployment
+# has that its downloads stopped working -- lookups keep hitting a cache built
+# from a database nobody has replaced in months.
 metrics = ["dep:metrics"]
+
+# Cache hits, misses, size and lookup duration.
+#
+# OFF by default, on measurement rather than principle: it costs three to four
+# times a cache hit, on the one path the crate exists to make fast. Take it when
+# you want cache behaviour visible and can pay for it.
+metrics-lookup = ["metrics"]
 
 # Map a record into `vrl::value::ObjectMap` for a host embedding VRL.
 #

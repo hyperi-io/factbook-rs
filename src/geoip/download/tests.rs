@@ -921,6 +921,48 @@ async fn maxmind_basic_auth_reaches_the_request() {
     }
 }
 
+#[test]
+fn a_refused_download_is_counted_apart_from_one_that_never_arrived() {
+    // Bytes that arrived and were rejected mean the provider published
+    // something bad; bytes that never arrived mean the network or the
+    // credential. Alerting on the two together hides both.
+    let refused = [
+        GeoIpDownloadError::NotADatabase {
+            url: "https://example.invalid/db".into(),
+        },
+        GeoIpDownloadError::Undersized {
+            path: "/tmp/db.mmdb".into(),
+            actual: 1,
+            existing: 1_000_000,
+            floor_percent: 50,
+        },
+        GeoIpDownloadError::Truncated {
+            url: "https://example.invalid/db".into(),
+            expected: 100,
+            actual: 10,
+        },
+    ];
+    for error in &refused {
+        assert_eq!(error.outcome(), "refused", "{error:?}");
+    }
+
+    assert_eq!(
+        GeoIpDownloadError::Busy {
+            path: "/tmp/db.mmdb".into()
+        }
+        .outcome(),
+        "busy"
+    );
+    assert_eq!(
+        GeoIpDownloadError::UnexpectedStatus {
+            url: "https://example.invalid/db".into(),
+            status: 500,
+        }
+        .outcome(),
+        "failed"
+    );
+}
+
 #[tokio::test]
 async fn a_second_writer_is_turned_away_rather_than_interleaved() {
     let server = MockServer::start().await;

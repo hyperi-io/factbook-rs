@@ -102,6 +102,25 @@ fn a_named_column_reaches_its_rows() {
 }
 
 #[test]
+fn a_source_with_nothing_to_do_with_addresses_works_the_same() {
+    // Nothing in the table half is about networks. A deployment enriching
+    // orders by product code reaches its rows the same way one enriching
+    // events by autonomous system number does.
+    let catalogue = "sku,description,unit,hazard_class\n\
+                     AX-1180,Sodium hydroxide pellets,kg,8\n\
+                     BR-4402,Acetone,L,3\n";
+    let table = from_csv(catalogue, &Index::Column("sku".to_string())).unwrap();
+
+    assert_eq!(table.key_column(), "sku");
+    assert_eq!(table.len(), 2);
+
+    let row = table.get("BR-4402").unwrap();
+    assert_eq!(row.get("description"), Some("Acetone"));
+    assert_eq!(row.get("hazard_class"), Some("3"));
+    assert!(table.get("ZZ-0000").is_none());
+}
+
+#[test]
 fn a_repeated_key_keeps_every_row() {
     // One prefix per row is the normal shape of an ASN-keyed side table, so
     // filing the second row over the first would drop most of the source.
@@ -187,6 +206,33 @@ fn an_address_index_falls_back_to_the_column_that_holds_addresses() {
             .unwrap()
             .get("fingerprint"),
         Some("AAAA")
+    );
+}
+
+#[test]
+fn a_v6_only_column_is_detected_under_an_unconventional_name() {
+    // Detection samples the values, so a column holding nothing but IPv6 has to
+    // be found the same as a mixed or v4-only one.
+    let body = "relay,exit_endpoint,country\n\
+                Quintex152,2606:4700:4700::1111,US\n\
+                Sunet,2001:6b0:7::2,SE\n";
+    let table = from_csv(body, &Index::Ip).unwrap();
+
+    assert_eq!(table.key_column(), "exit_endpoint");
+    assert_eq!(
+        table
+            .get_by_address("2001:6b0:7::2".parse().unwrap())
+            .unwrap()
+            .get("country"),
+        Some("SE")
+    );
+    // A long form and its compressed form are the same address.
+    assert_eq!(
+        table
+            .get_by_address("2606:4700:4700:0000:0000:0000:0000:1111".parse().unwrap())
+            .unwrap()
+            .get("relay"),
+        Some("Quintex152")
     );
 }
 

@@ -257,6 +257,27 @@ impl GeoIpDownloadError {
             _ => false,
         }
     }
+
+    /// Which of the download outcomes this is, for the metric label.
+    ///
+    /// `refused` means bytes arrived and were rejected, which is a provider
+    /// publishing something bad. `failed` means they never arrived, which is
+    /// the network or the credential. The two want different alerts.
+    #[must_use]
+    pub const fn outcome(&self) -> &'static str {
+        match self {
+            Self::Busy { .. } => "busy",
+            Self::ChecksumMismatch { .. }
+            | Self::MalformedChecksum { .. }
+            | Self::NotADatabase { .. }
+            | Self::Unparseable { .. }
+            | Self::Unpopulated { .. }
+            | Self::Undersized { .. }
+            | Self::Truncated { .. }
+            | Self::ArchiveMemberMissing { .. } => "refused",
+            _ => "failed",
+        }
+    }
 }
 
 /// Format of a provisioned database.
@@ -402,9 +423,11 @@ async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
     // returned unchecked: the operator asserted the file exists. It is declared
     // MMDB because that is the format a single operator-supplied file takes.
     if let Some(path) = kind.explicit_path(config) {
+        let files = vec![path.clone()];
+        telemetry::age(kind.label(), &files);
         return Some(Database {
             format: DatabaseFormat::Mmdb,
-            files: vec![path.clone()],
+            files,
         });
     }
 
@@ -419,11 +442,11 @@ async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
     let database = source.database().at(&config.auto_download.data_dir);
 
     if !config.auto_download.enabled {
-        return database
-            .files
-            .iter()
-            .all(|file| file.exists())
-            .then_some(database);
+        if !database.files.iter().all(|file| file.exists()) {
+            return None;
+        }
+        telemetry::age(kind.label(), &database.files);
+        return Some(database);
     }
 
     // The provider's own publish rhythm is the freshness default, so a source
@@ -437,15 +460,21 @@ async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
         .all(|file| is_fresh(file, max_age_secs))
     {
         debug!(kind = kind.label(), files = ?database.files, "GeoIP database is fresh");
+        telemetry::age(kind.label(), &database.files);
         return Some(database);
     }
 
     match download(kind, config).await {
-        Ok(files) => Some(Database {
-            format: database.format,
-            files,
-        }),
+        Ok(files) => {
+            telemetry::attempt(kind.label(), "ok");
+            telemetry::age(kind.label(), &files);
+            Some(Database {
+                format: database.format,
+                files,
+            })
+        }
         Err(e) => {
+            telemetry::attempt(kind.label(), e.outcome());
             warn!(
                 kind = kind.label(),
                 error = %e,
@@ -456,6 +485,7 @@ async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
             // beats disabling enrichment outright.
             if database.files.iter().all(|file| file.exists()) {
                 warn!(kind = kind.label(), files = ?database.files, "using stale GeoIP database");
+                telemetry::age(kind.label(), &database.files);
                 Some(database)
             } else {
                 None
@@ -567,6 +597,70 @@ fn plan(kind: Kind, config: &GeoIpConfig) -> Result<Vec<Transfer>, GeoIpDownload
     };
 
     Ok(vec![source.transfer(&config.auto_download)?])
+}
+
+/// What acquisition reports to a metrics recorder.
+///
+/// A deployment whose downloads have failed for months still hits its cache and
+/// answers lookups, so the age gauge is the one signal that decay is visible
+/// through at all.
+#[cfg(feature = "metrics")]
+mod telemetry {
+    use std::path::Path;
+    use std::time::SystemTime;
+
+    /// Value of the `type` label on every series.
+    const TYPE: &str = "geoip";
+
+    /// Count one download attempt by how it ended.
+    pub(super) fn attempt(kind: &'static str, result: &'static str) {
+        metrics::counter!(
+            "enrichment_download_total",
+            "type" => TYPE,
+            "kind" => kind,
+            "result" => result,
+        )
+        .increment(1);
+    }
+
+    /// Report the age of the data a deployment is about to serve.
+    ///
+    /// The oldest file of the set, because a database is only as current as its
+    /// stalest half.
+    pub(super) fn age(kind: &'static str, files: &[std::path::PathBuf]) {
+        let Some(seconds) = oldest(files) else {
+            return;
+        };
+        metrics::gauge!("enrichment_database_age_seconds", "type" => TYPE, "kind" => kind)
+            .set(seconds);
+    }
+
+    /// Seconds since the least recently written file was written.
+    fn oldest(files: &[std::path::PathBuf]) -> Option<f64> {
+        files
+            .iter()
+            .filter_map(|file| age_of(file))
+            .max_by(f64::total_cmp)
+    }
+
+    /// Seconds since `file` was written, when that can be read.
+    fn age_of(file: &Path) -> Option<f64> {
+        let modified = std::fs::metadata(file).ok()?.modified().ok()?;
+        SystemTime::now()
+            .duration_since(modified)
+            .ok()
+            .map(|elapsed| elapsed.as_secs_f64())
+    }
+}
+
+/// Stand-ins, so the call sites read the same without a recorder.
+#[cfg(not(feature = "metrics"))]
+mod telemetry {
+    /// Count one download attempt by how it ended.
+    pub(super) const fn attempt(_kind: &'static str, _result: &'static str) {}
+
+    /// Report the age of the data a deployment is about to serve.
+    pub(super) const fn age(_kind: &'static str, _files: &[std::path::PathBuf]) {}
 }
 
 #[cfg(test)]

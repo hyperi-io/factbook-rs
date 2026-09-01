@@ -665,7 +665,7 @@ fn mmdb_path<'a>(
 ///
 /// The names are bare and each carries a `type` label, so one recorder can host
 /// this enricher beside others without the series colliding.
-#[cfg(feature = "metrics")]
+#[cfg(feature = "metrics-lookup")]
 mod telemetry {
     use std::time::Instant;
 
@@ -715,7 +715,7 @@ mod telemetry {
 ///
 /// The shapes match the emitting module exactly, so the call sites are identical
 /// in both builds and no clock is read when nothing is listening.
-#[cfg(not(feature = "metrics"))]
+#[cfg(not(feature = "metrics-lookup"))]
 mod telemetry {
     /// Stand-in for the timer.
     #[derive(Clone, Copy)]
@@ -794,6 +794,52 @@ mod tests {
     /// An enricher over the IPinfo database alone.
     fn ipinfo() -> GeoIp {
         GeoIp::open(Some(Path::new(IPINFO_DB)), None, CacheConfig::default()).unwrap()
+    }
+
+    #[test]
+    fn an_ipv6_address_resolves_from_the_city_database() {
+        let record = both().lookup(ip("2001:218::1")).unwrap();
+
+        assert_eq!(record.country_code.as_deref(), Some("JP"));
+        assert_eq!(record.continent_code.as_deref(), Some("AS"));
+        assert_eq!(record.network.as_deref(), Some("2001:218::/32"));
+        assert!(!record.is_private);
+    }
+
+    #[test]
+    fn an_ipv6_address_resolves_from_the_asn_database() {
+        let record = both().lookup(ip("2001:2000::1")).unwrap();
+
+        assert_eq!(record.autonomous_system_number, Some(1299));
+        assert_eq!(
+            record.autonomous_system_organization.as_deref(),
+            Some("TeliaSonera International Carrier")
+        );
+        assert_eq!(record.asn_network.as_deref(), Some("2001:2000::/20"));
+    }
+
+    #[test]
+    fn an_ipv6_address_only_one_database_holds_still_answers() {
+        // The two databases cover different v6 space, so a record filled from
+        // one half must not be discarded because the other had nothing.
+        let city_only = both().lookup(ip("2001:218::1")).unwrap();
+        assert!(city_only.country_code.is_some());
+        assert!(city_only.autonomous_system_number.is_none());
+
+        let asn_only = both().lookup(ip("2001:2000::1")).unwrap();
+        assert!(asn_only.country_code.is_none());
+        assert!(asn_only.autonomous_system_number.is_some());
+    }
+
+    #[test]
+    fn a_v6_literal_and_its_long_form_are_one_cache_entry() {
+        let geoip = both();
+        let short = geoip.lookup(ip("2001:218::1")).unwrap();
+        let long = geoip
+            .lookup(ip("2001:0218:0000:0000:0000:0000:0000:0001"))
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&short, &long));
     }
 
     #[test]
