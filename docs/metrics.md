@@ -55,7 +55,9 @@ factbook = { version = "0.1", features = ["metrics-lookup"] }
 | `enrichment_cache_size` | gauge | `type` | Entries held, against the configured capacity |
 | `enrichment_duration_seconds` | histogram | `type` | Time for one lookup, hit or miss |
 
-The hit ratio these give is what tells you whether `cache.capacity` is set sensibly. A ratio that will not climb with more capacity means the traffic is not repeating, and the cache is not the thing to tune.
+Watch the hit percentage. If it is low against data you expect repeat hits on, raise `cache.capacity` -- the working set is not fitting.
+
+If raising it does not move the percentage, the traffic is not repeating and the cache is not what to tune. Check `enrichment_duration_seconds` instead: a miss costs a database read, so a workload that is mostly misses is bounded by the reader rather than by cache size.
 
 ## Names are shared, not private
 
