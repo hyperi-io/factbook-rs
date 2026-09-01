@@ -29,7 +29,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use flate2::read::GzDecoder;
 use reqwest::{Client, RequestBuilder, StatusCode};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::verify::Guard;
 use super::{DatabaseFormat, GeoIpDownloadError};
@@ -210,6 +210,32 @@ impl Transfer {
         }
 
         let part = with_extension(&self.dest, PART_EXT);
+
+        // Two processes sharing a data directory would otherwise interleave
+        // writes into one part file. The kernel drops this lock when the
+        // process holding it dies, so a crash cannot leave it held.
+        // Never truncating: a part file already holding a prefix is what the
+        // resume continues from.
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&part)?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(GeoIpDownloadError::Busy {
+                    path: self.dest.display().to_string(),
+                });
+            }
+            // A filesystem with no lock support must not stop a lone process
+            // from downloading.
+            Err(fs::TryLockError::Error(e)) => {
+                debug!(dest = %self.dest.display(), error = %e, "file locking unavailable");
+            }
+        }
+
         info!(
             url = %self.url,
             dest = %self.dest.display(),
@@ -221,7 +247,17 @@ impl Transfer {
         // body, and the next run resumes from it rather than re-fetching tens of
         // megabytes. Only materialise writes the destination, so a part file is
         // never mistaken for a database.
-        let bytes = self.stream_with_fallback(client, &part).await?;
+        let bytes = match self.stream_with_fallback(client, &part).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                // A transfer that wrote nothing leaves no part file behind, so
+                // taking the lock does not litter the data directory.
+                if fs::metadata(&part).is_ok_and(|meta| meta.len() == 0) {
+                    let _ = fs::remove_file(&part);
+                }
+                return Err(e);
+            }
+        };
 
         if let Some(checksum_url) = self.checksum_url.clone() {
             let expected = fetch_checksum(client, &checksum_url, &self.credential).await?;

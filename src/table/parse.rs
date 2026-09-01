@@ -29,9 +29,6 @@ use serde_json::Value;
 use super::config::{Schema, TableFormat};
 use super::{Cell, TableError};
 
-/// Records a probe reads before it stops asking.
-const PROBE_RECORDS: usize = 32;
-
 /// Byte a CSV quotes a field with.
 const QUOTE: u8 = b'"';
 
@@ -74,45 +71,80 @@ pub(super) fn read(
     }
 }
 
-/// Whether the head of `path` holds rows of `format`.
+/// Whether `path` holds rows of `format`, all the way to the end.
 ///
-/// Bounded rather than exhaustive for a CSV: this runs against a staged file
-/// before it replaces the copy on disk, where the question is whether the bytes
-/// are a table at all.
+/// This runs against a staged file before it replaces the copy on disk, so a
+/// fault it does not catch is one that destroys a good database and then fails
+/// at load, with nothing left to fall back to.
 ///
 /// # Errors
 ///
-/// The errors [`read`] raises, against the head of the file rather than all of
-/// it.
+/// The errors [`read`] raises.
 pub(crate) fn probe(path: &Path, format: TableFormat) -> Result<(), TableError> {
     let reader = BufReader::new(fs::File::open(path)?);
 
     match format {
-        TableFormat::Csv { header } => {
-            let records = records(reader, Some(PROBE_RECORDS))?;
-
-            // A header and nothing under it is not a table, and neither is an
-            // empty file.
-            if records.len() <= usize::from(header) {
-                return Err(TableError::Empty);
-            }
-
-            let width = records[0].1.len();
-            for (line, fields) in &records {
-                if fields.len() != width {
-                    return Err(TableError::Malformed {
-                        line: *line,
-                        detail: format!("{} fields against {width} in the first row", fields.len()),
-                    });
-                }
-            }
-            Ok(())
-        }
+        TableFormat::Csv { header } => validate_csv(reader, header),
 
         // A JSON document has to be read whole to be known valid at all, so the
         // probe is the same read the load performs.
         TableFormat::Json => read_json(reader, &Schema::Auto).map(drop),
     }
+}
+
+/// Whether every record is as wide as the first.
+///
+/// Records are checked and dropped as they are read, so the whole file is
+/// covered without holding it in memory.
+fn validate_csv(mut reader: impl BufRead, header: bool) -> Result<(), TableError> {
+    let mut csv = Csv::new();
+    let mut width: Option<usize> = None;
+    let mut seen: usize = 0;
+
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            break;
+        }
+        let consumed = chunk.len();
+        for &byte in chunk {
+            csv.byte(byte)?;
+        }
+        reader.consume(consumed);
+        drain(&mut csv.records, &mut width, &mut seen)?;
+    }
+
+    let mut tail = csv.finish()?;
+    drain(&mut tail, &mut width, &mut seen)?;
+
+    // A header and nothing under it is not a table, and neither is an empty
+    // file.
+    if seen <= usize::from(header) {
+        return Err(TableError::Empty);
+    }
+    Ok(())
+}
+
+/// Check the records read so far against the first one's width, then drop them.
+fn drain(
+    records: &mut Vec<Record>,
+    width: &mut Option<usize>,
+    seen: &mut usize,
+) -> Result<(), TableError> {
+    for (line, fields) in records.drain(..) {
+        let expected = *width.get_or_insert(fields.len());
+        if fields.len() != expected {
+            return Err(TableError::Malformed {
+                line,
+                detail: format!(
+                    "{} fields against {expected} in the first row",
+                    fields.len()
+                ),
+            });
+        }
+        *seen += 1;
+    }
+    Ok(())
 }
 
 /// Read a CSV into columns and rows.
@@ -678,17 +710,37 @@ mod tests {
     }
 
     #[test]
-    fn a_probe_reads_only_the_head_of_a_csv() {
+    fn a_probe_reads_a_csv_to_the_end() {
         use std::fmt::Write as _;
 
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("rows.csv");
         let mut body = String::from("asn,name\n");
-        for row in 0..PROBE_RECORDS * 4 {
+        for row in 0..5_000 {
             let _ = writeln!(body, "{row},operator");
         }
-        // A fault past the probe window is the load's to find, not the guard's.
+        // Deep enough that a bounded check would admit the file, replace a good
+        // database with it, and only then fail at load.
         body.push_str("1,too,many,fields\n");
+        fs::write(&file, &body).unwrap();
+
+        let err = probe(&file, TableFormat::Csv { header: true }).unwrap_err();
+        assert!(
+            matches!(err, TableError::Malformed { line: 5002, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_probe_admits_a_long_well_formed_csv() {
+        use std::fmt::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rows.csv");
+        let mut body = String::from("asn,name\n");
+        for row in 0..5_000 {
+            let _ = writeln!(body, "{row},operator");
+        }
         fs::write(&file, &body).unwrap();
 
         probe(&file, TableFormat::Csv { header: true }).unwrap();

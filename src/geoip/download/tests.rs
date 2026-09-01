@@ -922,6 +922,32 @@ async fn maxmind_basic_auth_reaches_the_request() {
 }
 
 #[tokio::test]
+async fn a_second_writer_is_turned_away_rather_than_interleaved() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(dir.path(), GeoIpProvider::SapicsOriginAsn);
+
+    // Stand in for the other process by holding the lock it would hold. A
+    // separate open file description, which is what flock excludes on.
+    let part = dir.path().join("origin-asn.mmdb.part");
+    let held = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&part)
+        .unwrap();
+    held.lock().unwrap();
+
+    let transfer = planned(Kind::Asn, &config, &server).remove(0);
+    let err = transfer.run(&default_client()).await.unwrap_err();
+
+    assert!(matches!(err, GeoIpDownloadError::Busy { .. }), "{err:?}");
+    // Turned away before the request, so the other process keeps its quota.
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn the_ipinfo_token_rides_as_a_query_parameter() {
     let server = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();

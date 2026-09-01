@@ -22,9 +22,9 @@
 //!
 //! # No ISP or organisation
 //!
-//! Those fields live in GeoIP2-ISP, a commercial database none of the providers
-//! in [`GeoIpProvider`](super::config::GeoIpProvider) publish, so no lookup this
-//! crate can perform would populate them.
+//! Those fields live in GeoIP2-ISP, which the paid MaxMind line does fetch. The
+//! record carries no field for them, so they are read and discarded. Adding
+//! them means widening this record, not adding a provider.
 
 use std::sync::{Arc, LazyLock};
 

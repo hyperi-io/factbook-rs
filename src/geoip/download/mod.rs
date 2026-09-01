@@ -161,6 +161,13 @@ pub enum GeoIpDownloadError {
         url: String,
     },
 
+    /// Another process is already fetching this database.
+    #[error("{path} is being fetched by another process")]
+    Busy {
+        /// Destination the other process holds.
+        path: String,
+    },
+
     /// The bytes arrived intact but hold no rows of the stated format.
     #[error("{path} does not parse as the table it states: {detail}")]
     Unparseable {

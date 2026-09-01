@@ -350,7 +350,7 @@ impl<'de> Deserialize<'de> for ProviderSelection {
 /// and `Display` output -- config dumps, trace fields, error reports. Only the
 /// download call itself exposes them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AutoDownloadConfig {
     /// Download a database when the local copy is missing or stale.
     ///
@@ -428,7 +428,7 @@ impl Default for AutoDownloadConfig {
 
 /// GeoIP database provisioning configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GeoIpConfig {
     /// Provision databases at all. Defaults to true: calling
     /// [`ensure_databases`](super::ensure_databases) is the opt-in, so this is
@@ -664,6 +664,14 @@ mod tests {
         let spelt_out: ProviderSelection =
             serde_json::from_str(r#"{"city": "db_ip", "asn": {"provider": "db_ip"}}"#).unwrap();
         assert_eq!(uniform, spelt_out);
+    }
+
+    #[test]
+    fn a_misspelt_key_is_rejected_at_every_level() {
+        // Silently defaulting a misspelt key gives an operator settings they
+        // never asked for and no way to notice.
+        assert!(serde_json::from_str::<GeoIpConfig>(r#"{"enabledd": true}"#).is_err());
+        assert!(serde_json::from_str::<AutoDownloadConfig>(r#"{"max_age_dayz": 7}"#).is_err(),);
     }
 
     #[test]
