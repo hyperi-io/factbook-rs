@@ -32,7 +32,7 @@ use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
 /// Number of fields a record can carry, to size the schema map in one go.
-const FIELD_COUNT: usize = 17;
+const FIELD_COUNT: usize = 18;
 
 /// The answer for an address that cannot have a geolocation, built once and
 /// shared by every lookup that short-circuits.
@@ -139,6 +139,14 @@ pub struct GeoIpRecord {
     /// prefix from [`network`](Self::network) more often than not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asn_network: Option<CompactString>,
+
+    /// Domain the operating network is known by, where a source carries one.
+    ///
+    /// Distinct from the operator's name: `google.com` against `Google LLC`.
+    /// IPinfo publishes it beside the ASN, and MaxMind sells it as its own
+    /// edition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_domain: Option<CompactString>,
 }
 
 impl GeoIpRecord {
@@ -167,6 +175,7 @@ impl GeoIpRecord {
             is_private: true,
             network: None,
             asn_network: None,
+            as_domain: None,
         }
     }
 
@@ -222,6 +231,7 @@ impl GeoIpRecord {
         fields.push(("is_private", FieldValue::Bool(self.is_private)));
         push_str(&mut fields, "network", self.network.as_deref());
         push_str(&mut fields, "asn_network", self.asn_network.as_deref());
+        push_str(&mut fields, "as_domain", self.as_domain.as_deref());
 
         fields
     }

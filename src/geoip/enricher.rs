@@ -436,6 +436,8 @@ struct IpInfoRecord<'a> {
     asn: Option<&'a str>,
     #[serde(borrow, default)]
     as_name: Option<&'a str>,
+    #[serde(borrow, default)]
+    as_domain: Option<&'a str>,
 }
 
 /// Whether a database is written in IPinfo's schema rather than MaxMind's.
@@ -470,6 +472,7 @@ fn read_ipinfo(reader: &Reader<Mmap>, ip: IpAddr, record: &mut GeoIpRecord) -> b
     record.continent_code = found.continent_code.map(CompactString::from);
     record.autonomous_system_number = found.asn.and_then(asn_number);
     record.autonomous_system_organization = found.as_name.map(CompactString::from);
+    record.as_domain = found.as_domain.map(CompactString::from);
 
     let network = network_of(&result);
     record.network.clone_from(&network);
@@ -845,6 +848,8 @@ mod tests {
         );
         assert_eq!(record.network.as_deref(), Some("8.8.8.0/24"));
         assert_eq!(record.asn_network.as_deref(), Some("8.8.8.0/24"));
+        // The operator's domain, which is not its name.
+        assert_eq!(record.as_domain.as_deref(), Some("google.com"));
     }
 
     #[test]

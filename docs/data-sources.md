@@ -39,7 +39,7 @@ What each fills in a record, not what the upstream product sells:
 | `db_ip` | free | country, continent, city, region, coordinates | ASN, operator | none |
 | `sapics_origin_asn` | free | -- | ASN, operator | none |
 | `sapics_ip_to_asn` | free | -- | ASN, registry handle | none |
-| `ip_info` | free | country, continent | ASN, operator | token |
+| `ip_info` | free | country, continent | ASN, operator, domain | token |
 | `max_mind` | free | country, continent, city, region, coordinates, timezone | ASN, operator | account ID + licence key |
 | `max_mind` | paid | as free | ASN, operator | account ID + licence key |
 | `custom` | -- | whatever you point it at | whatever you point it at | none |
