@@ -85,10 +85,9 @@ const DEFAULT_MIN_SIZE_PERCENT: u8 = 50;
 /// [`validate`](super::download::validate) rather than guessed at.
 ///
 /// Nothing is bundled with this crate. The deploying organisation fetches from
-/// the provider's own endpoint under that provider's terms, and what those
-/// terms require -- a licence, an attribution line, a fetch ceiling -- is
-/// readable at runtime through
-/// [`source_terms`](super::download::source_terms).
+/// the provider's own endpoint, and
+/// [`source_terms`](super::download::source_terms) reports where that provider
+/// publishes its terms.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GeoIpProvider {
@@ -105,7 +104,7 @@ pub enum GeoIpProvider {
 
     /// The `origin-asn` dataset in `sapics/ip-location-db` -- ASN origins from
     /// public routing data, carrying operator names. Anonymous, undated URL,
-    /// public domain, and the widest ASN coverage of the free sources.
+    /// and the widest ASN coverage of the free sources.
     SapicsOriginAsn,
 
     /// The `iptoasn-asn` dataset in `sapics/ip-location-db` -- the same

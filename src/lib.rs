@@ -32,10 +32,9 @@
 //! # Databases are not bundled
 //!
 //! Nothing here ships a database. Files are fetched at runtime from the
-//! provider you configure, under that provider's licence -- which differs by
-//! provider, and in most cases requires attribution.
-//! [`geoip::source_terms`] reports what a given selection commits a deployer
-//! to, and is the authority the README's table defers to.
+//! provider you configure, and each publisher sets its own terms for its own
+//! data. [`geoip::source_terms`] reports where a given selection's terms are
+//! published, so they can be read at the source.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(unsafe_code)]

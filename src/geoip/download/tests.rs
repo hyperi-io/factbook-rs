@@ -1919,31 +1919,28 @@ fn every_built_in_selection_is_expressible_as_a_row() {
 }
 
 #[test]
-fn a_selection_reports_what_it_commits_the_deployer_to() {
-    // The obligation is readable at runtime, so a deployment renders its own
-    // attribution rather than someone remembering to read a table.
+fn a_selection_reports_where_its_terms_are_published() {
+    // Readable at runtime, so a deployment can find the terms that apply to
+    // what it fetched rather than someone remembering to go looking.
     let dbip = source_terms(ProviderSelection::from(GeoIpProvider::DbIp));
     assert_eq!(dbip.len(), 2);
     for terms in &dbip {
-        assert_eq!(terms.obligation.licence, "CC BY 4.0");
-        assert!(terms.obligation.attribution.is_some(), "{terms:?}");
+        assert!(terms.terms_url.starts_with("https://"), "{terms:?}");
     }
 
-    // Public-domain data owes nothing, which is the distinction that decides
-    // whether a product can ship a provider as its default.
     let sapics = source_terms(ProviderSelection::from(GeoIpProvider::SapicsOriginAsn));
     assert_eq!(sapics.len(), 1);
     assert_eq!(sapics[0].kind, "asn");
-    assert!(sapics[0].obligation.attribution.is_none());
+    assert!(sapics[0].terms_url.starts_with("https://"));
 
-    // A provider that publishes one kind reports one obligation.
+    // A provider that publishes one kind reports one entry.
     let ipinfo = source_terms(ProviderSelection::from(GeoIpProvider::IpInfo));
     assert_eq!(ipinfo.len(), 1);
     assert_eq!(ipinfo[0].kind, "city");
     assert!(ipinfo[0].min_interval.is_some());
 
-    // Nothing is fetched for an operator-supplied file, so there is no term
-    // this crate can state.
+    // Nothing is fetched for an operator-supplied file, so there is nothing to
+    // point at.
     assert!(source_terms(ProviderSelection::from(GeoIpProvider::Custom)).is_empty());
 }
 

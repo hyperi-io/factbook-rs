@@ -61,7 +61,7 @@ use fetch::Transfer;
 use source::SourceSpec;
 use verify::Guard;
 
-pub use source::{Obligation, SourceTerms, source_terms};
+pub use source::{SourceTerms, source_terms};
 
 // The provider selection and the transfer shapes are the table's inputs and
 // outputs, named here so the test module reaches them through this one.

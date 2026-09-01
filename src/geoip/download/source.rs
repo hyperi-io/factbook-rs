@@ -233,26 +233,11 @@ impl CredentialKind {
     }
 }
 
-/// What using a source's data commits the deployer to.
+/// What one selected source publishes, and where its publisher states its
+/// terms.
 ///
-/// Queryable rather than documented: a deployer has to be able to render its
-/// attribution line, not read a table in a comment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Obligation {
-    /// Licence the data is published under.
-    pub licence: &'static str,
-
-    /// Attribution that has to be displayed, where the licence requires one.
-    pub attribution: Option<&'static str>,
-
-    /// Whether the provider requires its logo shown beside the attribution.
-    pub logo_required: bool,
-
-    /// Where the provider publishes the terms.
-    pub terms_url: &'static str,
-}
-
-/// What one selected source publishes, and what it commits the deployer to.
+/// The terms themselves are the publisher's to state and the deployer's to
+/// read. This crate reports where to find them and does not interpret them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceTerms {
     /// Name of the source.
@@ -261,13 +246,13 @@ pub struct SourceTerms {
     /// Database kind it provides: `city` or `asn`.
     pub kind: &'static str,
 
-    /// What using the data commits the deployer to.
-    pub obligation: Obligation,
+    /// Where the publisher states the terms for this data.
+    pub terms_url: &'static str,
 
     /// The provider's own publish rhythm, which is the freshness default.
     pub cadence: Duration,
 
-    /// Shortest interval between fetches the provider's terms allow, where it
+    /// Shortest interval between fetches the provider asks for, where it
     /// states one.
     pub min_interval: Option<Duration>,
 }
@@ -305,11 +290,11 @@ pub(super) struct SourceSpec {
     /// The provider's own publish rhythm.
     cadence: Duration,
 
-    /// Shortest interval between fetches the provider's terms allow.
+    /// Shortest interval between fetches the provider asks for.
     min_interval: Option<Duration>,
 
-    /// What using the data commits the deployer to.
-    obligation: Obligation,
+    /// Where the publisher states the terms for this data.
+    terms_url: &'static str,
 
     /// Name the file is written under.
     file: &'static str,
@@ -420,57 +405,31 @@ impl SourceSpec {
         SourceTerms {
             name: self.name,
             kind: self.kind.label(),
-            obligation: self.obligation,
+            terms_url: self.terms_url,
             cadence: self.cadence,
             min_interval: self.min_interval,
         }
     }
 }
 
-/// DB-IP publishes the Lite databases under CC BY 4.0.
-const DB_IP_LITE: Obligation = Obligation {
-    licence: "CC BY 4.0",
-    attribution: Some("IP Geolocation by DB-IP -- https://db-ip.com"),
-    logo_required: false,
-    terms_url: "https://db-ip.com/db/lite.php",
-};
+// Where each publisher states the terms for its own data. Pointers, not
+// readings of them: what the terms mean is between the publisher and the
+// deployer, and a stale summary here would be worse than no summary.
 
-/// MaxMind requires the GeoLite2 attribution, and requires an old copy to be
-/// replaced within thirty days of a release.
-const MAXMIND_GEOLITE2: Obligation = Obligation {
-    licence: "MaxMind GeoLite EULA",
-    attribution: Some(
-        "This product includes GeoLite2 data created by MaxMind, available from \
-         https://www.maxmind.com",
-    ),
-    logo_required: false,
-    terms_url: "https://www.maxmind.com/en/geolite/eula",
-};
+/// DB-IP's page for the Lite databases.
+const DB_IP_LITE_TERMS: &str = "https://db-ip.com/db/lite.php";
 
-/// The paid line is licensed per subscription and carries no public
-/// attribution duty. A separate commercial licence covers redistribution.
-const MAXMIND_GEOIP2: Obligation = Obligation {
-    licence: "MaxMind Online EULA",
-    attribution: None,
-    logo_required: false,
-    terms_url: "https://www.maxmind.com/en/end-user-license-agreement",
-};
+/// MaxMind's terms for the free GeoLite2 line.
+const MAXMIND_GEOLITE2_TERMS: &str = "https://www.maxmind.com/en/geolite/eula";
 
-/// IPinfo publishes Lite under CC BY-SA 4.0 and asks for a link back.
-const IPINFO_LITE: Obligation = Obligation {
-    licence: "CC BY-SA 4.0",
-    attribution: Some("IP address data powered by IPinfo -- https://ipinfo.io"),
-    logo_required: false,
-    terms_url: "https://ipinfo.io/developers/ipinfo-lite-database",
-};
+/// MaxMind's terms for the paid GeoIP2 line.
+const MAXMIND_GEOIP2_TERMS: &str = "https://www.maxmind.com/en/end-user-license-agreement";
 
-/// The sapics datasets used here are public domain and owe nothing.
-const PUBLIC_DOMAIN: Obligation = Obligation {
-    licence: "PDDL 1.0",
-    attribution: None,
-    logo_required: false,
-    terms_url: "https://github.com/sapics/ip-location-db",
-};
+/// IPinfo's page for the Lite database.
+const IPINFO_LITE_TERMS: &str = "https://ipinfo.io/developers/ipinfo-lite-database";
+
+/// The sapics repository, which states the terms per dataset.
+const SAPICS_TERMS: &str = "https://github.com/sapics/ip-location-db";
 
 /// Endpoint both MaxMind lines download from, whichever edition is asked for.
 const MAXMIND_ENDPOINT: &str =
@@ -497,7 +456,7 @@ static SOURCES: &[SourceSpec] = &[
         checksum: None,
         cadence: MONTHLY,
         min_interval: None,
-        obligation: DB_IP_LITE,
+        terms_url: DB_IP_LITE_TERMS,
         file: "dbip-city-lite.mmdb",
         payload: Payload::Mmdb,
     },
@@ -515,7 +474,7 @@ static SOURCES: &[SourceSpec] = &[
         checksum: None,
         cadence: MONTHLY,
         min_interval: None,
-        obligation: DB_IP_LITE,
+        terms_url: DB_IP_LITE_TERMS,
         file: "dbip-asn-lite.mmdb",
         payload: Payload::Mmdb,
     },
@@ -536,7 +495,7 @@ static SOURCES: &[SourceSpec] = &[
         // A GeoLite account is capped at thirty downloads a day across every
         // database, so a fetch is allowed once a day per database.
         min_interval: Some(DAY),
-        obligation: MAXMIND_GEOLITE2,
+        terms_url: MAXMIND_GEOLITE2_TERMS,
         file: "GeoLite2-City.mmdb",
         payload: Payload::Mmdb,
     },
@@ -555,7 +514,7 @@ static SOURCES: &[SourceSpec] = &[
         checksum: None,
         cadence: TWICE_WEEKLY,
         min_interval: Some(DAY),
-        obligation: MAXMIND_GEOLITE2,
+        terms_url: MAXMIND_GEOLITE2_TERMS,
         file: "GeoLite2-ASN.mmdb",
         payload: Payload::Mmdb,
     },
@@ -574,7 +533,7 @@ static SOURCES: &[SourceSpec] = &[
         checksum: None,
         cadence: TWICE_WEEKLY,
         min_interval: Some(DAY),
-        obligation: MAXMIND_GEOIP2,
+        terms_url: MAXMIND_GEOIP2_TERMS,
         file: "GeoIP2-City.mmdb",
         payload: Payload::Mmdb,
     },
@@ -595,7 +554,7 @@ static SOURCES: &[SourceSpec] = &[
         checksum: None,
         cadence: TWICE_WEEKLY,
         min_interval: Some(DAY),
-        obligation: MAXMIND_GEOIP2,
+        terms_url: MAXMIND_GEOIP2_TERMS,
         file: "GeoIP2-ISP.mmdb",
         payload: Payload::Mmdb,
     },
@@ -617,7 +576,7 @@ static SOURCES: &[SourceSpec] = &[
         cadence: DAY,
         // The endpoint is capped at ten downloads a day per address.
         min_interval: Some(DAY),
-        obligation: IPINFO_LITE,
+        terms_url: IPINFO_LITE_TERMS,
         file: "ipinfo-lite.mmdb",
         payload: Payload::Mmdb,
     },
@@ -636,7 +595,7 @@ static SOURCES: &[SourceSpec] = &[
         )),
         cadence: DAY,
         min_interval: None,
-        obligation: PUBLIC_DOMAIN,
+        terms_url: SAPICS_TERMS,
         file: "origin-asn.mmdb",
         payload: Payload::Mmdb,
     },
@@ -655,7 +614,7 @@ static SOURCES: &[SourceSpec] = &[
         )),
         cadence: DAY,
         min_interval: None,
-        obligation: PUBLIC_DOMAIN,
+        terms_url: SAPICS_TERMS,
         file: "iptoasn-asn.mmdb",
         payload: Payload::Mmdb,
     },
@@ -674,12 +633,13 @@ const MAXMIND_CREDENTIAL: CredentialKind = CredentialKind::Basic {
     fields: "auto_download.maxmind_account_id and auto_download.maxmind_license_key",
 };
 
-/// Terms of every database a selection provisions.
+/// Every database a selection provisions, and where its publisher states its
+/// terms.
 ///
 /// One entry per database that will actually be fetched, so a provider that
 /// publishes only one kind contributes one entry and a selection that fetches
-/// nothing contributes none. This is how a deployment reports what it owes for
-/// the data it serves.
+/// nothing contributes none. A deployment uses this to find the terms that
+/// apply to the data it serves and read them at the source.
 ///
 /// ```
 /// use factbook::geoip::{GeoIpProvider, ProviderSelection, source_terms};
@@ -688,8 +648,7 @@ const MAXMIND_CREDENTIAL: CredentialKind = CredentialKind::Basic {
 /// let city = terms.first().unwrap();
 ///
 /// assert_eq!(city.kind, "city");
-/// assert_eq!(city.obligation.licence, "CC BY 4.0");
-/// assert!(city.obligation.attribution.is_some());
+/// assert_eq!(city.terms_url, "https://db-ip.com/db/lite.php");
 /// ```
 #[must_use]
 pub fn source_terms(selection: ProviderSelection) -> Vec<SourceTerms> {
