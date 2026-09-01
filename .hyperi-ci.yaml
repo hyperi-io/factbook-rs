@@ -1,0 +1,35 @@
+# Project:   factbook
+# File:      .hyperi-ci.yaml
+# Purpose:   HyperI CI configuration
+#
+# License:   Apache-2.0
+# Copyright: (c) 2026 HYPERI PTY LIMITED
+#
+# Override defaults with HYPERCI_* env vars.
+# Reference: config/defaults.yaml in hyperi-ci.
+
+# Category 4 (OSS): public, Apache-2.0, publishes to crates.io, no HyperI brand
+# furniture. Declared rather than inferred -- the prefix is a hint, never
+# authority.
+classification: oss
+
+language: rust
+license: Apache-2.0
+quality:
+  enabled: true
+test:
+  enabled: true
+  coverage: false
+  rust:
+    # Process-per-test isolation, rather than whatever the runner has installed.
+    nextest: true
+build:
+  enabled: true
+  strategies:
+  - native
+  rust:
+    features: all
+    targets: []
+publish:
+  enabled: true
+  target: oss

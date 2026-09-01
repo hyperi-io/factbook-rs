@@ -1,0 +1,159 @@
+# Project:   factbook
+# File:      Cargo.toml
+# Purpose:   IP enrichment: provision the databases, then look them up fast
+# Language:  TOML
+#
+# License:   Apache-2.0
+# Copyright: (c) 2026 HYPERI PTY LIMITED
+
+[package]
+name = "factbook"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "GeoIP enrichment end to end: download and auto-update the MMDB databases, then look addresses up through a cache built for skewed IP traffic."
+license = "Apache-2.0"
+repository = "https://github.com/hyperi-io/factbook-rs"
+publish = true
+keywords = ["geoip", "mmdb", "maxmind", "enrichment", "ip"]
+categories = ["network-programming", "caching", "database"]
+exclude = [".claude/", ".github/", ".hyperi-ai/", "docs/", "benches/", "scripts/"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+# The crate exists to do geoip, so the whole capability is the default. A
+# consumer that only provisions the files (it runs someone else's lookup engine)
+# takes `default-features = false, features = ["geoip-download"]` and pays for
+# no MMDB reader.
+default = ["geoip"]
+
+geoip = ["geoip-download", "geoip-lookup"]
+
+# Resolve, freshness-check and download the databases. No reader, no lookup.
+geoip-download = [
+    "dep:reqwest",
+    "dep:tokio",
+    "dep:flate2",
+    "dep:tar",
+    "dep:chrono",
+    "dep:serde_json",
+    "dep:sha2",
+]
+
+# Read and cache. `mmap` keeps the database off the heap -- GeoLite2-City is
+# around 70 MB, and a per-pod heap copy of it was the defect this crate was
+# extracted to fix. `simdutf8` speeds the string decode every lookup performs.
+geoip-lookup = [
+    "dep:maxminddb",
+    "dep:quick_cache",
+    "dep:compact_str",
+    "dep:arc-swap",
+]
+
+# Emit through the `metrics` facade. Off by default: a library should not decide
+# that its consumer has a recorder installed.
+metrics = ["dep:metrics"]
+
+# Map a record into `vrl::value::ObjectMap` for a host embedding VRL.
+#
+# Off by default because `vrl`'s build.rs runs two LALRPOP grammar builds
+# unconditionally, whatever vrl features are selected (vrl/build.rs:16-33) --
+# enabling it here would put a grammar build in front of every consumer.
+vrl = ["geoip-lookup", "dep:vrl"]
+
+[dependencies]
+serde = { version = ">=1.0.228, <2", features = ["derive"] }
+thiserror = ">=2.0.18, <3"
+tracing = ">=0.1.44, <0.2"
+
+# --- geoip-download ---
+# `default-features = false` drops reqwest's `default-tls` (native-tls +
+# openssl); rustls is the house standard. `query` is what lets the IPinfo token
+# ride on the request builder instead of being formatted into a URL that then
+# gets logged.
+reqwest = { version = ">=0.13.3, <0.14", default-features = false, features = ["json", "rustls", "query"], optional = true }
+tokio = { version = ">=1.50.0, <2", features = ["rt", "fs", "time"], optional = true }
+flate2 = { version = ">=1.1.9, <2", optional = true }
+tar = { version = ">=0.4.46, <0.5", optional = true }
+chrono = { version = ">=0.4.43, <0.5", optional = true }
+serde_json = { version = ">=1.0.149, <2", optional = true }
+# Verifies a download against the digest a provider publishes beside it, which
+# is a stronger integrity check than anything derivable from the bytes alone.
+sha2 = { version = ">=0.11.0, <0.12", optional = true }
+
+# --- geoip-lookup ---
+# 0.30.3 (2026-08-24) is also what vector-vrl's bindings resolve to, so the
+# three DFE consumers converge on one reader rather than three.
+maxminddb = { version = ">=0.30.3, <0.31", features = ["mmap", "simdutf8"], optional = true }
+# Clock-PRO/S3-FIFO with a ghost queue for recently-evicted keys. Measured
+# against moka on this record shape: better hit ratio in every cell tested, 8x
+# faster on the hit path and 6.5x less per-entry bookkeeping.
+#
+# It also serves a synchronous and an async coalescing get-or-insert from ONE
+# cache instance, which moka cannot -- moka splits them across `sync::Cache` and
+# `future::Cache`. VRL's interpreter is synchronous and dfe-loader is async, so
+# one instance serving both is what lets all four consumers share a cache.
+#
+# Never name this crate in a public signature: it is 0.x, so every upstream bump
+# would be a breaking change for factbook's consumers.
+quick_cache = { version = ">=0.7.0, <0.8", optional = true }
+# City, country, timezone and subdivision are nearly always under 24 bytes,
+# which CompactString stores inline -- no heap allocation per field per record.
+compact_str = { version = ">=0.10.0, <0.11", features = ["serde"], optional = true }
+# Lock-free reader swap, so a refresh never blocks a lookup.
+arc-swap = { version = ">=1.9.2, <2", optional = true }
+
+# --- metrics ---
+metrics = { version = ">=0.24.5, <0.25", optional = true }
+
+# --- vrl ---
+# `value` only: the rest of VRL (compiler, stdlib, diagnostics) is the host's
+# concern, not ours.
+#
+# The range spans two minors deliberately. A host embedding VRL already pins its
+# own vrl, and cargo must unify the two or `ObjectMap` is a different type on
+# each side of the seam -- so this has to cover what the hosts are on
+# (dfe-transform-vrl is at 0.34) as well as current (0.35).
+vrl = { version = ">=0.34, <0.36", default-features = false, features = ["value"], optional = true }
+
+[dev-dependencies]
+tokio = { version = ">=1.50.0, <2", features = ["full", "test-util"] }
+tempfile = ">=3.24.0, <4"
+serde_json = ">=1.0.149, <2"
+criterion = { version = ">=0.5, <0.9", features = ["html_reports"] }
+pretty_assertions = ">=1.4.1, <2"
+# Serve the provider URLs over loopback so the download tests exercise the
+# transfer, the auth shapes and the status handling, not a URL string.
+wiremock = ">=0.6.5, <0.7"
+# Declaration must match the optional dependency exactly -- two reqwest builds
+# in one graph is an E0464 on the lib test target.
+reqwest = { version = ">=0.13.3, <0.14", default-features = false, features = ["json", "rustls", "query"] }
+
+# Dependency debug info is the largest single consumer of compiler memory and
+# target-dir space in this graph, and a backtrace through a dependency is not
+# what anyone debugs. Our own crate keeps its symbols.
+[profile.dev.package."*"]
+debug = false
+
+[profile.test.package."*"]
+debug = false
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+# Suggests Duration::from_hours/from_mins/from_days -- Rust 1.99+ APIs, above
+# our MSRV, so the suggestion is unsatisfiable.
+duration_suboptimal_units = "allow"
+
+# Test and bench code does not inherit lib.rs attributes.
+doc_markdown = "allow"
+unnecessary_debug_formatting = "allow"
+redundant_closure_for_method_calls = "allow"
+items_after_statements = "allow"
+unwrap_used = "allow"
