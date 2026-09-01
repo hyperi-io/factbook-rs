@@ -73,12 +73,10 @@ metrics = ["dep:metrics"]
 # you want cache behaviour visible and can pay for it.
 metrics-lookup = ["metrics"]
 
-# Map a record into `vrl::value::ObjectMap` for a host embedding VRL.
-#
-# Off by default because `vrl`'s build.rs runs two LALRPOP grammar builds
-# unconditionally, whatever vrl features are selected (vrl/build.rs:16-33) --
-# enabling it here would put a grammar build in front of every consumer.
-vrl = ["geoip-lookup", "dep:vrl"]
+# A `vrl` feature belongs here once a host actually needs a record mapped into
+# `vrl::value::ObjectMap`. It is absent rather than declared-and-empty: adding a
+# feature later breaks nobody, and shipping one that pulls two LALRPOP grammar
+# builds while exposing no API wastes every consumer's build.
 
 # Criterion supplies its own main, so the libtest harness is off. The whole
 # target is gated on `geoip-lookup`, since with no reader there is no lookup to
@@ -140,16 +138,6 @@ arc-swap = { version = ">=1.9.2, <2", optional = true }
 
 # --- metrics ---
 metrics = { version = ">=0.24.5, <0.25", optional = true }
-
-# --- vrl ---
-# `value` only: the rest of VRL (compiler, stdlib, diagnostics) is the host's
-# concern, not ours.
-#
-# The range spans two minors deliberately. A host embedding VRL already pins its
-# own vrl, and cargo must unify the two or `ObjectMap` is a different type on
-# each side of the seam -- so this has to cover what the hosts are on
-# (dfe-transform-vrl is at 0.34) as well as current (0.35).
-vrl = { version = ">=0.34, <0.36", default-features = false, features = ["value"], optional = true }
 
 [dev-dependencies]
 tokio = { version = ">=1.50.0, <2", features = ["full", "test-util"] }

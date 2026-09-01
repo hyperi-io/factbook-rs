@@ -20,21 +20,40 @@ use serde::{Deserialize, Serialize};
 /// What a [`Secret`] renders as.
 const REDACTED: &str = "***REDACTED***";
 
-/// A string whose `Debug` and `Display` never reveal it.
+/// A string that never reveals itself except on an explicit call.
 ///
-/// Reading the value is deliberately an explicit call to [`Secret::expose`], so
-/// every use of the plaintext is greppable.
+/// `Debug`, `Display` and `Serialize` all render the redaction. Reading the
+/// value is deliberately [`Secret::expose`], so every use of the plaintext is
+/// greppable.
 ///
 /// ```
 /// use factbook::Secret;
 ///
 /// let key = Secret::from("licence-abcd");
 /// assert_eq!(format!("{key:?}"), "***REDACTED***");
+/// assert_eq!(serde_json::to_string(&key).unwrap(), "\"***REDACTED***\"");
 /// assert_eq!(key.expose(), "licence-abcd");
 /// ```
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// # Serialising does not round-trip
+///
+/// A config carrying one of these serialises with the redaction in place, so
+/// writing a config back out and reading it again loses the credential. That is
+/// the intended direction: a config is read from a secrets layer, and a dump of
+/// it is the thing that ends up in a log aggregator.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(transparent)]
 pub struct Secret(String);
+
+impl Serialize for Secret {
+    /// Writes the redaction, never the value.
+    ///
+    /// A derived implementation would put the plaintext into any config dump,
+    /// which is exactly the leak this type exists to prevent.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(REDACTED)
+    }
+}
 
 impl Secret {
     /// Read the plaintext.
@@ -122,14 +141,37 @@ mod tests {
     }
 
     #[test]
-    fn serde_round_trips_the_plaintext() {
+    fn serialising_writes_the_redaction_not_the_value() {
+        // A derived Serialize put the plaintext into any config dump, which is
+        // the leak this type exists to prevent.
         let secret = Secret::from("token-wxyz");
         let json = serde_json::to_string(&secret).unwrap();
-        assert_eq!(json, r#""token-wxyz""#);
-        assert_eq!(
-            serde_json::from_str::<Secret>(&json).unwrap().expose(),
-            "token-wxyz"
-        );
+
+        assert_eq!(json, r#""***REDACTED***""#);
+        assert!(!json.contains("token-wxyz"), "{json}");
+    }
+
+    #[test]
+    fn deserialising_reads_the_plaintext_a_secrets_layer_supplied() {
+        let secret: Secret = serde_json::from_str(r#""token-wxyz""#).unwrap();
+        assert_eq!(secret.expose(), "token-wxyz");
+    }
+
+    #[test]
+    fn a_whole_config_serialises_without_its_credentials() {
+        // The failure this guards is a consumer logging its resolved config as
+        // JSON, which the config module's own example invites.
+        let config = crate::geoip::AutoDownloadConfig {
+            maxmind_account_id: Some("account-1234".into()),
+            maxmind_license_key: Some("licence-abcd".into()),
+            ipinfo_token: Some("token-wxyz".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+
+        assert!(!json.contains("account-1234"), "{json}");
+        assert!(!json.contains("licence-abcd"), "{json}");
+        assert!(!json.contains("token-wxyz"), "{json}");
     }
 
     #[test]

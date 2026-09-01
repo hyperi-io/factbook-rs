@@ -27,7 +27,7 @@
 //! | `geoip-download` | resolve, freshness-check, download, unpack, refresh, and [`table`] |
 //! | `geoip-lookup` | mmap readers, the cache, [`GeoIpRecord`] |
 //! | `metrics` | emit through the `metrics` facade |
-//! | `vrl` | map a record into `vrl::value::ObjectMap` |
+//! | `metrics-lookup` | cache hit, miss, size and lookup duration |
 //!
 //! # Databases are not bundled
 //!

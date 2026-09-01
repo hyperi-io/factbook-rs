@@ -93,10 +93,9 @@ Each database names its own schema in its metadata, so the reader dispatches on 
 | `geoip-lookup` | mmap reader, cache | answering |
 | `metrics` *(default)* | the `metrics` facade | download outcomes and database age |
 | `metrics-lookup` | the same facade | cache hits, misses, size and lookup duration |
-| `vrl` | `vrl::value` | mapping a record for an embedded interpreter |
 
 A download-only build carries no database reader, and a lookup-only build carries no HTTP client, because neither feature lists the other's dependencies. CI checks that with a feature-matrix build rather than trusting it, which is what catches a module behind one feature quietly using a crate another feature declares. Test builds are the exception: the dev-dependencies pull an HTTP client whatever features are selected.
 
 The two metrics features split on cost. Acquisition metrics run once per database per refresh, so they are on by default and the database-age gauge is the only signal a deployment has that its downloads stopped working. Lookup metrics cost three to four times a cache hit, on the one path the crate exists to make fast, so they are opt-in. Details: [metrics.md](metrics.md).
 
-`vrl` is off because its build script runs two grammar builds whatever features are selected, and enabling it here would put those in front of every consumer.
+There is deliberately no VRL feature yet. A host embedding VRL will want a record mapped into its value type, but declaring the feature before the code exists pulls two grammar builds into every consumer's build and returns no API. Adding it later breaks nobody.
