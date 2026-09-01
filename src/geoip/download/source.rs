@@ -28,6 +28,7 @@ use crate::Secret;
 use crate::geoip::config::{
     AutoDownloadConfig, GeoIpProvider, ProviderChoice, ProviderSelection, ProviderTier,
 };
+use crate::table::{Index, Schema, TableFormat};
 
 /// A day, the unit every cadence below is a multiple of.
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -97,39 +98,43 @@ fn dated(template: &str, month: DateTime<Utc>) -> String {
     template.replace(MONTH, &month.format("%Y-%m").to_string())
 }
 
-/// What the fetched bytes mean, and the files they become.
+/// What the fetched bytes mean.
 ///
 /// This is the axis acquisition does not predict, so it is stated rather than
-/// inferred from the URL or the archive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Payload {
-    /// MaxMind DB binary format, published as one file.
-    Mmdb {
-        /// Name the file is written under.
-        file: &'static str,
+/// inferred from the URL or the archive. The file name is not here: what to
+/// call the bytes is a property of where they are being put, not of what they
+/// mean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Payload {
+    /// MaxMind DB binary format, read by an MMDB reader.
+    Mmdb,
+
+    /// Rows and columns, read into a [`Table`](crate::table::Table).
+    ///
+    /// The three fields are the whole interpretation: how the rows are
+    /// encoded, where their column names come from, and which key reaches
+    /// them.
+    Table {
+        /// How the rows are encoded.
+        format: TableFormat,
+
+        /// Where the column names come from.
+        schema: Schema,
+
+        /// Key the rows are reachable by.
+        index: Index,
     },
 }
 
 impl Payload {
     /// Format a consumer picks its reader by.
-    const fn format(self) -> DatabaseFormat {
+    pub(crate) const fn format(&self) -> DatabaseFormat {
         match self {
-            Self::Mmdb { .. } => DatabaseFormat::Mmdb,
-        }
-    }
-
-    /// Name the file is written under.
-    const fn file(self) -> &'static str {
-        match self {
-            Self::Mmdb { file } => file,
-        }
-    }
-
-    /// Product id the provider names the file by, which is the file without
-    /// the extension its format takes.
-    fn edition(self) -> &'static str {
-        match self {
-            Self::Mmdb { file } => file.strip_suffix(".mmdb").unwrap_or(file),
+            Self::Mmdb => DatabaseFormat::Mmdb,
+            Self::Table { format, .. } => match format {
+                TableFormat::Csv { .. } => DatabaseFormat::Csv,
+                TableFormat::Json => DatabaseFormat::Json,
+            },
         }
     }
 }
@@ -306,7 +311,10 @@ pub(super) struct SourceSpec {
     /// What using the data commits the deployer to.
     obligation: Obligation,
 
-    /// What the bytes mean, and the files they become.
+    /// Name the file is written under.
+    file: &'static str,
+
+    /// What the bytes mean.
     payload: Payload,
 }
 
@@ -362,10 +370,14 @@ impl SourceSpec {
     pub(super) fn database(&'static self) -> DatabaseSpec {
         DatabaseSpec {
             format: self.payload.format(),
-            names: match &self.payload {
-                Payload::Mmdb { file } => slice::from_ref(file),
-            },
+            names: slice::from_ref(&self.file),
         }
+    }
+
+    /// Product id the provider names the file by, which is the file without
+    /// the extension its format takes.
+    fn edition(&'static self) -> &'static str {
+        self.file.strip_suffix(".mmdb").unwrap_or(self.file)
     }
 
     /// The transfer that fetches this source into `auto.data_dir`.
@@ -378,14 +390,14 @@ impl SourceSpec {
         &'static self,
         auto: &AutoDownloadConfig,
     ) -> Result<Transfer, GeoIpDownloadError> {
-        let edition = self.payload.edition();
+        let edition = self.edition();
         let (url, fallback_url) = self.url.resolve(edition);
 
         Ok(Transfer {
             url,
             fallback_url,
             checksum_url: self.checksum.map(|checksum| checksum.resolve(edition).0),
-            dest: auto.data_dir.join(self.payload.file()),
+            dest: auto.data_dir.join(self.file),
             archive: self.archive,
             format: self.payload.format(),
             credential: self.credential.resolve(self.provider.label(), auto)?,
@@ -486,9 +498,8 @@ static SOURCES: &[SourceSpec] = &[
         cadence: MONTHLY,
         min_interval: None,
         obligation: DB_IP_LITE,
-        payload: Payload::Mmdb {
-            file: "dbip-city-lite.mmdb",
-        },
+        file: "dbip-city-lite.mmdb",
+        payload: Payload::Mmdb,
     },
     SourceSpec {
         provider: GeoIpProvider::DbIp,
@@ -505,9 +516,8 @@ static SOURCES: &[SourceSpec] = &[
         cadence: MONTHLY,
         min_interval: None,
         obligation: DB_IP_LITE,
-        payload: Payload::Mmdb {
-            file: "dbip-asn-lite.mmdb",
-        },
+        file: "dbip-asn-lite.mmdb",
+        payload: Payload::Mmdb,
     },
     SourceSpec {
         provider: GeoIpProvider::MaxMind,
@@ -527,9 +537,8 @@ static SOURCES: &[SourceSpec] = &[
         // database, so a fetch is allowed once a day per database.
         min_interval: Some(DAY),
         obligation: MAXMIND_GEOLITE2,
-        payload: Payload::Mmdb {
-            file: "GeoLite2-City.mmdb",
-        },
+        file: "GeoLite2-City.mmdb",
+        payload: Payload::Mmdb,
     },
     SourceSpec {
         provider: GeoIpProvider::MaxMind,
@@ -547,9 +556,8 @@ static SOURCES: &[SourceSpec] = &[
         cadence: TWICE_WEEKLY,
         min_interval: Some(DAY),
         obligation: MAXMIND_GEOLITE2,
-        payload: Payload::Mmdb {
-            file: "GeoLite2-ASN.mmdb",
-        },
+        file: "GeoLite2-ASN.mmdb",
+        payload: Payload::Mmdb,
     },
     SourceSpec {
         provider: GeoIpProvider::MaxMind,
@@ -567,9 +575,8 @@ static SOURCES: &[SourceSpec] = &[
         cadence: TWICE_WEEKLY,
         min_interval: Some(DAY),
         obligation: MAXMIND_GEOIP2,
-        payload: Payload::Mmdb {
-            file: "GeoIP2-City.mmdb",
-        },
+        file: "GeoIP2-City.mmdb",
+        payload: Payload::Mmdb,
     },
     SourceSpec {
         provider: GeoIpProvider::MaxMind,
@@ -589,9 +596,8 @@ static SOURCES: &[SourceSpec] = &[
         cadence: TWICE_WEEKLY,
         min_interval: Some(DAY),
         obligation: MAXMIND_GEOIP2,
-        payload: Payload::Mmdb {
-            file: "GeoIP2-ISP.mmdb",
-        },
+        file: "GeoIP2-ISP.mmdb",
+        payload: Payload::Mmdb,
     },
     SourceSpec {
         provider: GeoIpProvider::IpInfo,
@@ -612,9 +618,8 @@ static SOURCES: &[SourceSpec] = &[
         // The endpoint is capped at ten downloads a day per address.
         min_interval: Some(DAY),
         obligation: IPINFO_LITE,
-        payload: Payload::Mmdb {
-            file: "ipinfo-lite.mmdb",
-        },
+        file: "ipinfo-lite.mmdb",
+        payload: Payload::Mmdb,
     },
     SourceSpec {
         provider: GeoIpProvider::SapicsOriginAsn,
@@ -632,9 +637,8 @@ static SOURCES: &[SourceSpec] = &[
         cadence: DAY,
         min_interval: None,
         obligation: PUBLIC_DOMAIN,
-        payload: Payload::Mmdb {
-            file: "origin-asn.mmdb",
-        },
+        file: "origin-asn.mmdb",
+        payload: Payload::Mmdb,
     },
     SourceSpec {
         provider: GeoIpProvider::SapicsIpToAsn,
@@ -652,9 +656,8 @@ static SOURCES: &[SourceSpec] = &[
         cadence: DAY,
         min_interval: None,
         obligation: PUBLIC_DOMAIN,
-        payload: Payload::Mmdb {
-            file: "iptoasn-asn.mmdb",
-        },
+        file: "iptoasn-asn.mmdb",
+        payload: Payload::Mmdb,
     },
 ];
 

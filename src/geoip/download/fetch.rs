@@ -75,7 +75,7 @@ const MARKUP_HEAD_BYTES: usize = 64;
 
 /// How the downloaded bytes are packaged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Archive {
+pub(crate) enum Archive {
     /// The body is the database file itself.
     Raw,
     /// The body is a gzip stream wrapping the database file.
@@ -89,7 +89,7 @@ pub(super) enum Archive {
 /// `Debug` is hand-written: a derived one would print the secret into any error
 /// report or trace that formats a request plan.
 #[derive(Clone)]
-pub(super) enum Credential {
+pub(crate) enum Credential {
     /// Anonymous download.
     None,
     /// HTTP basic auth (MaxMind account id + licence key).
@@ -147,7 +147,7 @@ impl Credential {
 ///
 /// Cloning an injected client is cheap -- it is a handle over a shared
 /// connection pool -- and it keeps the caller's proxy, root store and timeouts.
-pub(super) fn client(
+pub(crate) fn client(
     injected: Option<&Client>,
     connect_timeout: Duration,
     read_timeout: Duration,
@@ -170,20 +170,20 @@ pub(super) fn client(
 
 /// One database transfer: where from, where to, and how it is packaged.
 #[derive(Debug)]
-pub(super) struct Transfer {
-    pub(super) url: String,
+pub(crate) struct Transfer {
+    pub(crate) url: String,
     /// URL tried when `url` returns 404, for a provider that dates its files
     /// and has not published the current one yet.
-    pub(super) fallback_url: Option<String>,
+    pub(crate) fallback_url: Option<String>,
     /// URL of the digest the provider publishes beside the file, where it
     /// publishes one.
-    pub(super) checksum_url: Option<String>,
-    pub(super) dest: PathBuf,
-    pub(super) archive: Archive,
+    pub(crate) checksum_url: Option<String>,
+    pub(crate) dest: PathBuf,
+    pub(crate) archive: Archive,
     /// Format of the file this transfer produces, which decides how its
     /// contents are checked.
-    pub(super) format: DatabaseFormat,
-    pub(super) credential: Credential,
+    pub(crate) format: DatabaseFormat,
+    pub(crate) credential: Credential,
 }
 
 impl Transfer {
@@ -192,7 +192,7 @@ impl Transfer {
     /// This is the shape the transport, archive and status cases are asserted
     /// against, where the bodies are stand-ins rather than databases.
     #[cfg(test)]
-    pub(super) async fn run(self, client: &Client) -> Result<PathBuf, GeoIpDownloadError> {
+    pub(crate) async fn run(self, client: &Client) -> Result<PathBuf, GeoIpDownloadError> {
         self.run_guarded(client, Guard::OFF).await
     }
 
@@ -200,7 +200,7 @@ impl Transfer {
     /// a staged file the guard will not admit.
     ///
     /// Returns the destination path on success.
-    pub(super) async fn run_guarded(
+    pub(crate) async fn run_guarded(
         self,
         client: &Client,
         guard: Guard,
@@ -560,7 +560,7 @@ fn holds_a_database(path: &Path, format: DatabaseFormat) -> Result<bool, io::Err
 
         // Text has no marker to require, so the check is the other way round:
         // reject the markup an error or login page opens with.
-        DatabaseFormat::Csv => {
+        DatabaseFormat::Csv | DatabaseFormat::Json => {
             let mut head = vec![0u8; MARKUP_HEAD_BYTES];
             let read = io::Read::read(&mut fs::File::open(path)?, &mut head)?;
             let head = head[..read].to_ascii_lowercase();

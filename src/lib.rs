@@ -15,12 +15,16 @@
 //! address costs a full database traversal every time it appears. This crate is
 //! both halves.
 //!
+//! Acquisition turns out not to be a geo concern at all, so [`table`] opens the
+//! same fetch-verify-replace path to any CSV or JSON a deployment names in its
+//! own config, indexed by an address or by any column it has.
+//!
 //! # Features
 //!
 //! | feature | adds |
 //! |---|---|
 //! | `geoip` *(default)* | `geoip-download` + `geoip-lookup` |
-//! | `geoip-download` | resolve, freshness-check, download, unpack, refresh |
+//! | `geoip-download` | resolve, freshness-check, download, unpack, refresh, and [`table`] |
 //! | `geoip-lookup` | mmap readers, the cache, [`GeoIpRecord`] |
 //! | `metrics` | emit through the `metrics` facade |
 //! | `vrl` | map a record into `vrl::value::ObjectMap` |
@@ -48,6 +52,12 @@
     doc(cfg(any(feature = "geoip-download", feature = "geoip-lookup")))
 )]
 pub mod geoip;
+
+// Acquisition, not geography: a table rides the download stack and needs no
+// MMDB reader, so it is gated with the half of the crate that fetches.
+#[cfg(feature = "geoip-download")]
+#[cfg_attr(docsrs, doc(cfg(feature = "geoip-download")))]
+pub mod table;
 
 pub mod secret;
 

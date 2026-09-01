@@ -42,9 +42,11 @@
 //! # }
 //! ```
 
-mod fetch;
-mod source;
-mod verify;
+// Acquisition is not a geoip concern: `crate::table` fetches a user-supplied
+// source through the same transfer, guard and interpretation types.
+pub(crate) mod fetch;
+pub(crate) mod source;
+pub(crate) mod verify;
 
 use std::fs;
 use std::io;
@@ -69,7 +71,7 @@ use super::config::{GeoIpProvider, ProviderTier};
 use fetch::{Archive, Credential};
 
 /// Seconds in a day, for the staleness comparison.
-const SECS_PER_DAY: u64 = 86_400;
+pub(crate) const SECS_PER_DAY: u64 = 86_400;
 
 /// Errors raised while provisioning a database.
 ///
@@ -157,6 +159,15 @@ pub enum GeoIpDownloadError {
     NotADatabase {
         /// What was being fetched.
         url: String,
+    },
+
+    /// The bytes arrived intact but hold no rows of the stated format.
+    #[error("{path} does not parse as the table it states: {detail}")]
+    Unparseable {
+        /// File that was being replaced.
+        path: String,
+        /// What the parser refused it for.
+        detail: String,
     },
 
     /// The provider rejected the credential that was sent.
@@ -252,9 +263,12 @@ pub enum DatabaseFormat {
     #[default]
     Mmdb,
 
-    /// Comma-separated address ranges, published as an IPv4 file and an IPv6
-    /// file that together make one database.
+    /// Comma-separated rows, published as one file per address family for a
+    /// geo database and as a single file for a table.
     Csv,
+
+    /// JSON rows, published as one file.
+    Json,
 }
 
 /// One provisioned database.
@@ -492,7 +506,7 @@ pub fn validate(config: &GeoIpConfig) -> Result<(), GeoIpDownloadError> {
 }
 
 /// Whether `path` exists and was modified within `max_age_secs`.
-fn is_fresh(path: &Path, max_age_secs: u64) -> bool {
+pub(crate) fn is_fresh(path: &Path, max_age_secs: u64) -> bool {
     let Ok(metadata) = fs::metadata(path) else {
         return false;
     };

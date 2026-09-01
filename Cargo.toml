@@ -64,6 +64,14 @@ metrics = ["dep:metrics"]
 # enabling it here would put a grammar build in front of every consumer.
 vrl = ["geoip-lookup", "dep:vrl"]
 
+# Criterion supplies its own main, so the libtest harness is off. The whole
+# target is gated on `geoip-lookup`, since with no reader there is no lookup to
+# measure -- `cargo bench --no-default-features` then compiles nothing here.
+[[bench]]
+name = "geoip_lookup"
+harness = false
+required-features = ["geoip-lookup"]
+
 [dependencies]
 serde = { version = ">=1.0.228, <2", features = ["derive"] }
 thiserror = ">=2.0.18, <3"

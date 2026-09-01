@@ -40,9 +40,9 @@ appearance rather than starting from nothing.
 
 Three details follow from the same reasoning:
 
-- **A hit hands back an `Arc<GeoIpRecord>`, not a copy.** A record is mostly
-  optional strings, so returning an owned one means up to ten allocations to
-  serve something already in memory.
+- **A hit hands back an `Arc<GeoIpRecord>`, not a copy.** Returning an owned
+  record measures a quarter again on top of every hit -- 139 ns against 111 ns
+  -- to reproduce something already in memory.
 - **The key is an `IpAddr`, not the text of one.** 17 bytes, `Copy`, no
   allocation and no string hashing per lookup -- and `::1` and
   `0:0:0:0:0:0:0:1` stop being two entries for one address.

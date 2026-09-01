@@ -28,6 +28,7 @@ use std::path::Path;
 
 use super::{DatabaseFormat, GeoIpDownloadError, Kind};
 use crate::geoip::config::AutoDownloadConfig;
+use crate::table::TableFormat;
 
 #[cfg(feature = "geoip-lookup")]
 use std::net::{IpAddr, Ipv4Addr};
@@ -44,9 +45,13 @@ const PERCENT: u64 = 100;
 /// Carried by value: it is two settings the operator chose, resolved once per
 /// download rather than re-read per check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Guard {
+pub(crate) struct Guard {
     /// Kind whose field a probe requires, absent when content is not checked.
     probe: Option<Kind>,
+
+    /// Format a staged table must parse as, absent when content is not checked
+    /// or the payload is not a table.
+    parses: Option<TableFormat>,
 
     /// Smallest percentage of the copy on disk a replacement may be, zero for
     /// no floor.
@@ -59,6 +64,7 @@ impl Guard {
     #[cfg(test)]
     pub(super) const OFF: Self = Self {
         probe: None,
+        parses: None,
         min_size_percent: 0,
     };
 
@@ -67,6 +73,23 @@ impl Guard {
         Self {
             probe: if auto.verify_content {
                 Some(kind)
+            } else {
+                None
+            },
+            parses: None,
+            min_size_percent: auto.min_size_percent,
+        }
+    }
+
+    /// The guard the operator's settings ask for on a table.
+    ///
+    /// A table has no address to probe, so the content question it answers is
+    /// whether the bytes hold rows of the format the source states.
+    pub(crate) const fn for_table(format: TableFormat, auto: &AutoDownloadConfig) -> Self {
+        Self {
+            probe: None,
+            parses: if auto.verify_content {
+                Some(format)
             } else {
                 None
             },
@@ -82,8 +105,10 @@ impl Guard {
     /// # Errors
     ///
     /// [`GeoIpDownloadError::Undersized`] when the replacement is a fraction of
-    /// the copy it would replace, or [`GeoIpDownloadError::Unpopulated`] when it
-    /// resolves nothing for the field its kind exists to carry.
+    /// the copy it would replace, [`GeoIpDownloadError::Unpopulated`] when it
+    /// resolves nothing for the field its kind exists to carry, or
+    /// [`GeoIpDownloadError::Unparseable`] when a table holds no rows of the
+    /// format it states.
     pub(super) fn admit(
         self,
         staged: &Path,
@@ -94,6 +119,10 @@ impl Guard {
 
         if let Some(kind) = self.probe {
             probe(staged, dest, kind, format)?;
+        }
+
+        if let Some(table) = self.parses {
+            parses(staged, dest, table)?;
         }
 
         Ok(())
@@ -231,6 +260,18 @@ fn probe(
         "no lookup engine is compiled in, so the staged database is not probed"
     );
     Ok(())
+}
+
+/// Read the head of the staged file and require rows of the stated format.
+///
+/// Bounded rather than exhaustive: this runs before the rename, where the
+/// question is whether the bytes are a table at all, and a fault deeper in the
+/// file is reported by the load that follows.
+fn parses(staged: &Path, dest: &Path, format: TableFormat) -> Result<(), GeoIpDownloadError> {
+    crate::table::probe(staged, format).map_err(|e| GeoIpDownloadError::Unparseable {
+        path: dest.display().to_string(),
+        detail: e.to_string(),
+    })
 }
 
 /// Whether the database answers `address` with the field its kind exists to
