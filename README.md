@@ -42,14 +42,20 @@ downloads what is missing or stale and opens it behind a cache:
 
 ```rust,no_run
 use factbook::geoip::{
-    CacheConfig, GeoIp, GeoIpConfig, GeoIpProvider, ProviderSelection, ensure_databases,
+    AutoDownloadConfig, CacheConfig, GeoIp, GeoIpConfig, GeoIpProvider, ProviderSelection,
+    ensure_databases,
 };
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let mut config = GeoIpConfig::default();
-config.provider = ProviderSelection::from(GeoIpProvider::MaxMind);
-config.auto_download.maxmind_account_id = Some("123456".into());
-config.auto_download.maxmind_license_key = Some("your-licence-key".into());
+let config = GeoIpConfig {
+    provider: ProviderSelection::from(GeoIpProvider::MaxMind),
+    auto_download: AutoDownloadConfig {
+        maxmind_account_id: Some("123456".into()),
+        maxmind_license_key: Some("your-licence-key".into()),
+        ..AutoDownloadConfig::default()
+    },
+    ..GeoIpConfig::default()
+};
 
 let databases = ensure_databases(&config).await?;
 let geoip = GeoIp::from_databases(&databases, CacheConfig::default())?;
