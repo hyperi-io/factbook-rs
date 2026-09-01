@@ -60,14 +60,19 @@ pub enum Schema {
 
 /// Key the rows are reachable by.
 ///
-/// Longest-prefix matching over CIDR ranges is deliberately not here: it needs
-/// a trie rather than a map, which is its own design with its own performance
-/// argument, and adding the variant later breaks nothing that this states now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Index {
     /// An IP address, in whichever column holds addresses.
     Ip,
+
+    /// A CIDR range, in whichever column holds ranges.
+    ///
+    /// An address is answered by the most specific range containing it, so a
+    /// `/24` wins over the `/8` around it. A bare address counts as the range
+    /// holding only itself, because publishers mix single hosts into a prefix
+    /// list.
+    Prefix,
 
     /// The exact value of a named column.
     Column(String),

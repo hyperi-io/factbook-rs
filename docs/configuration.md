@@ -62,7 +62,7 @@ A source factbook has no provider row for is named directly.
 | `url` | string | required | Where to fetch it |
 | `file` | string | required | Name it is written under, inside `data_dir` |
 | `format` | `csv` or `json` | required | How rows are encoded |
-| `index` | `ip` or `{column: name}` | required | The key that reaches a row |
+| `index` | `ip`, `prefix` or `{column: name}` | required | The key that reaches a row |
 | `checksum_url` | string | unset | A digest published beside the file, verified before the file is admitted |
 | `archive` | `raw` or `gzip` | `raw` | How the fetched bytes are packaged |
 | `schema` | `auto` or `{named: [...]}` | `auto` | Where column names come from |
@@ -91,6 +91,19 @@ schema:
 index:
   column: asn
 ```
+
+### Reaching a row by CIDR range
+
+`index: prefix` keys the rows by range and answers an address with the most specific range containing it, so a `/24` wins over the `/8` around it. A bare address counts as the range holding only itself, because publishers mix single hosts into a prefix list.
+
+```yaml
+url: https://example.net/announcements.csv
+file: announcements.csv
+format: csv
+index: prefix
+```
+
+The column is found the same way `ip` finds one -- a conventional name (`prefix`, `network`, `cidr`, `range`, `subnet`) is preferred, and a source using none is sampled instead. Name it with `index: {column: ...}` when neither works.
 
 ### How the formats differ on a bad row
 

@@ -41,6 +41,8 @@ geoip-download = [
     "dep:chrono",
     "dep:serde_json",
     "dep:sha2",
+    "dep:prefix-trie",
+    "dep:ipnet",
 ]
 
 # Read and cache. `mmap` keeps the database off the heap -- GeoLite2-City is
@@ -102,6 +104,14 @@ serde_json = { version = ">=1.0.149, <2", optional = true }
 # Verifies a download against the digest a provider publishes beside it, which
 # is a stronger integrity check than anything derivable from the bytes alone.
 sha2 = { version = ">=0.11.0, <0.12", optional = true }
+
+# Longest-prefix matching for a table keyed by CIDR ranges. A prefix trie is a
+# real data structure with a real performance argument, and this is the
+# maintained one -- `ipnet-trie` is a thin wrapper over an older release of it.
+prefix-trie = { version = ">=0.10.1, <0.11", default-features = false, features = ["ipnet"], optional = true }
+# The CIDR type and its parser, neither of which std has. Every one of its own
+# dependencies is optional, so it arrives on its own.
+ipnet = { version = ">=2.12.1, <3", default-features = false, optional = true }
 
 # --- geoip-lookup ---
 # 0.30.3 (2026-08-24) is also what vector-vrl's bindings resolve to, so the

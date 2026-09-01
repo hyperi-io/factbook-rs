@@ -74,6 +74,8 @@ use std::path::{Path, PathBuf};
 use std::slice;
 use std::time::Duration;
 
+use ipnet::IpNet;
+use prefix_trie::joint::JointPrefixMap;
 use tracing::{debug, warn};
 
 use crate::geoip::config::AutoDownloadConfig;
@@ -88,6 +90,9 @@ pub(crate) use parse::probe;
 
 /// Column names an [`Index::Ip`] source is likely to have written, lowercase.
 const ADDRESS_COLUMNS: [&str; 5] = ["ip", "ip_address", "ipaddress", "address", "addr"];
+
+/// Column names a CIDR-keyed source is likely to have written, lowercase.
+const PREFIX_COLUMNS: [&str; 5] = ["prefix", "network", "cidr", "range", "subnet"];
 
 /// Rows sampled when working out which column holds addresses.
 const ADDRESS_SAMPLE: usize = 64;
@@ -169,6 +174,13 @@ pub enum TableError {
         columns: String,
     },
 
+    /// No column holds CIDR ranges.
+    #[error("no column holds CIDR ranges; name one with index.column instead. columns: {columns}")]
+    NoPrefixColumn {
+        /// Columns the source actually has.
+        columns: String,
+    },
+
     /// The payload fetched is not a table.
     #[error("the source's payload is not a table")]
     NotATable,
@@ -182,6 +194,10 @@ enum Keys {
 
     /// Filed under a parsed address.
     Address(HashMap<IpAddr, Vec<usize>>),
+
+    /// Filed under a CIDR range, reached by the longest one containing an
+    /// address.
+    Prefix(Box<JointPrefixMap<IpNet, Vec<usize>>>),
 }
 
 /// A tabular source, in memory and indexed.
@@ -402,6 +418,11 @@ impl Table {
                     columns: columns.join(", "),
                 })?
             }
+            Index::Prefix => {
+                prefix_column(&columns, &rows).ok_or_else(|| TableError::NoPrefixColumn {
+                    columns: columns.join(", "),
+                })?
+            }
         };
 
         let mut reachable = 0;
@@ -425,6 +446,18 @@ impl Table {
                     }
                 }
                 Keys::Address(filed)
+            }
+            Index::Prefix => {
+                let mut filed: JointPrefixMap<IpNet, Vec<usize>> = JointPrefixMap::default();
+                for (at, row) in rows.iter().enumerate() {
+                    if let Some(prefix) = cell(row, key_column).and_then(as_prefix) {
+                        // A repeated range keeps every row, the same as a
+                        // repeated text key does.
+                        filed.entry(prefix).or_default().push(at);
+                        reachable += 1;
+                    }
+                }
+                Keys::Prefix(Box::new(filed))
             }
         };
 
@@ -451,14 +484,21 @@ impl Table {
     fn positions_of(&self, key: &str) -> &[usize] {
         match &self.keys {
             Keys::Text(filed) => filed.get(key).map_or(NO_ROWS, Vec::as_slice),
-            Keys::Address(_) => NO_ROWS,
+            Keys::Address(_) | Keys::Prefix(_) => NO_ROWS,
         }
     }
 
     /// Where an address leads.
+    ///
+    /// An exact index answers the address itself; a prefix index answers the
+    /// most specific range that contains it, so a `/24` wins over the `/8`
+    /// around it.
     fn positions_at(&self, address: IpAddr) -> &[usize] {
         match &self.keys {
             Keys::Address(filed) => filed.get(&address).map_or(NO_ROWS, Vec::as_slice),
+            Keys::Prefix(filed) => filed
+                .get_lpm(&IpNet::from(address))
+                .map_or(NO_ROWS, |(_, rows)| rows.as_slice()),
             Keys::Text(_) => NO_ROWS,
         }
     }
@@ -622,6 +662,48 @@ fn cell(cells: &[Cell], at: usize) -> Option<&str> {
 /// A cell as an address, when it is one.
 fn as_address(text: &str) -> Option<IpAddr> {
     text.parse().ok()
+}
+
+/// A cell as a CIDR range, when it is one.
+///
+/// A bare address is accepted as the range holding only itself, because
+/// publishers mix single hosts into a prefix list.
+fn as_prefix(text: &str) -> Option<IpNet> {
+    text.parse()
+        .ok()
+        .or_else(|| as_address(text).map(IpNet::from))
+}
+
+/// Which column an [`Index::Prefix`] source is keyed by.
+fn prefix_column(columns: &[String], rows: &[Vec<Cell>]) -> Option<usize> {
+    let named = columns
+        .iter()
+        .position(|column| PREFIX_COLUMNS.contains(&column.to_ascii_lowercase().as_str()));
+
+    if let Some(at) = named
+        && holds_prefixes(rows, at)
+    {
+        return Some(at);
+    }
+
+    (0..columns.len()).find(|&at| holds_prefixes(rows, at))
+}
+
+/// Whether the sampled values of a column are all CIDR ranges.
+fn holds_prefixes(rows: &[Vec<Cell>], at: usize) -> bool {
+    let mut seen = 0;
+
+    for row in rows.iter().take(ADDRESS_SAMPLE) {
+        let Some(text) = cell(row, at) else {
+            continue;
+        };
+        if as_prefix(text).is_none() {
+            return false;
+        }
+        seen += 1;
+    }
+
+    seen > 0
 }
 
 /// Which column an [`Index::Ip`] source is keyed by.

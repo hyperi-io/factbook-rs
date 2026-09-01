@@ -237,6 +237,91 @@ fn a_v6_only_column_is_detected_under_an_unconventional_name() {
 }
 
 #[test]
+fn a_prefix_index_answers_with_the_most_specific_range() {
+    // A prefix list is layered on purpose -- a broad allocation with more
+    // specific announcements inside it -- so the narrow one has to win.
+    let body = "prefix,operator\n\
+                8.0.0.0/8,LEVEL3\n\
+                8.8.8.0/24,GOOGLE\n\
+                8.8.0.0/16,GOOGLE-WIDE\n";
+    let table = from_csv(body, &Index::Prefix).unwrap();
+
+    assert_eq!(table.key_column(), "prefix");
+    assert_eq!(
+        table
+            .get_by_address(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)))
+            .unwrap()
+            .get("operator"),
+        Some("GOOGLE")
+    );
+    assert_eq!(
+        table
+            .get_by_address(IpAddr::V4(Ipv4Addr::new(8, 8, 9, 1)))
+            .unwrap()
+            .get("operator"),
+        Some("GOOGLE-WIDE")
+    );
+    assert_eq!(
+        table
+            .get_by_address(IpAddr::V4(Ipv4Addr::new(8, 9, 0, 1)))
+            .unwrap()
+            .get("operator"),
+        Some("LEVEL3")
+    );
+    // Outside every range, rather than falling back to the broadest.
+    assert!(
+        table
+            .get_by_address(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)))
+            .is_none()
+    );
+}
+
+#[test]
+fn a_prefix_index_covers_ipv6_and_bare_addresses() {
+    let body = "cidr,label\n\
+                2606:4700::/32,cloudflare\n\
+                2606:4700:4700::/48,resolver\n\
+                1.1.1.1,single-host\n";
+    let table = from_csv(body, &Index::Prefix).unwrap();
+
+    assert_eq!(
+        table
+            .get_by_address("2606:4700:4700::1111".parse().unwrap())
+            .unwrap()
+            .get("label"),
+        Some("resolver")
+    );
+    assert_eq!(
+        table
+            .get_by_address("2606:4700:1::1".parse().unwrap())
+            .unwrap()
+            .get("label"),
+        Some("cloudflare")
+    );
+    // A bare address is the range holding only itself.
+    assert_eq!(
+        table
+            .get_by_address(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))
+            .unwrap()
+            .get("label"),
+        Some("single-host")
+    );
+    assert!(
+        table
+            .get_by_address(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2)))
+            .is_none()
+    );
+}
+
+#[test]
+fn a_source_with_no_ranges_is_refused_rather_than_guessed_at() {
+    let err = from_csv(NETWORKS, &Index::Prefix).unwrap_err();
+
+    assert!(matches!(err, TableError::NoPrefixColumn { .. }), "{err:?}");
+    assert!(err.to_string().contains("index.column"), "{err}");
+}
+
+#[test]
 fn a_source_with_no_addresses_is_refused_rather_than_guessed_at() {
     let err = from_csv(NETWORKS, &Index::Ip).unwrap_err();
 
