@@ -424,7 +424,7 @@ async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
     // MMDB because that is the format a single operator-supplied file takes.
     if let Some(path) = kind.explicit_path(config) {
         let files = vec![path.clone()];
-        telemetry::age(kind.label(), &files);
+        telemetry::age(kind.label(), &files, config.auto_download.age_from_source);
         return Some(Database {
             format: DatabaseFormat::Mmdb,
             files,
@@ -445,7 +445,11 @@ async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
         if !database.files.iter().all(|file| file.exists()) {
             return None;
         }
-        telemetry::age(kind.label(), &database.files);
+        telemetry::age(
+            kind.label(),
+            &database.files,
+            config.auto_download.age_from_source,
+        );
         return Some(database);
     }
 
@@ -460,14 +464,18 @@ async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
         .all(|file| is_fresh(file, max_age_secs))
     {
         debug!(kind = kind.label(), files = ?database.files, "GeoIP database is fresh");
-        telemetry::age(kind.label(), &database.files);
+        telemetry::age(
+            kind.label(),
+            &database.files,
+            config.auto_download.age_from_source,
+        );
         return Some(database);
     }
 
     match download(kind, config).await {
         Ok(files) => {
             telemetry::attempt(kind.label(), "ok");
-            telemetry::age(kind.label(), &files);
+            telemetry::age(kind.label(), &files, config.auto_download.age_from_source);
             Some(Database {
                 format: database.format,
                 files,
@@ -485,7 +493,11 @@ async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
             // beats disabling enrichment outright.
             if database.files.iter().all(|file| file.exists()) {
                 warn!(kind = kind.label(), files = ?database.files, "using stale GeoIP database");
-                telemetry::age(kind.label(), &database.files);
+                telemetry::age(
+                    kind.label(),
+                    &database.files,
+                    config.auto_download.age_from_source,
+                );
                 Some(database)
             } else {
                 None
@@ -627,29 +639,49 @@ mod telemetry {
     ///
     /// The oldest file of the set, because a database is only as current as its
     /// stalest half.
-    pub(super) fn age(kind: &'static str, files: &[std::path::PathBuf]) {
-        let Some(seconds) = oldest(files) else {
+    pub(super) fn age(kind: &'static str, files: &[std::path::PathBuf], from_source: bool) {
+        let seconds = files
+            .iter()
+            .filter_map(|file| age_of(file, from_source))
+            .max_by(f64::total_cmp);
+        let Some(seconds) = seconds else {
             return;
         };
         metrics::gauge!("enrichment_database_age_seconds", "type" => TYPE, "kind" => kind)
             .set(seconds);
     }
 
-    /// Seconds since the least recently written file was written.
-    fn oldest(files: &[std::path::PathBuf]) -> Option<f64> {
-        files
-            .iter()
-            .filter_map(|file| age_of(file))
-            .max_by(f64::total_cmp)
-    }
-
-    /// Seconds since `file` was written, when that can be read.
-    fn age_of(file: &Path) -> Option<f64> {
-        let modified = std::fs::metadata(file).ok()?.modified().ok()?;
+    /// Seconds since `file`'s data was built, or since it was written here.
+    fn age_of(file: &Path, from_source: bool) -> Option<f64> {
+        let stamp = from_source
+            .then(|| built_at(file))
+            .flatten()
+            .or_else(|| written_at(file))?;
         SystemTime::now()
-            .duration_since(modified)
+            .duration_since(stamp)
             .ok()
             .map(|elapsed| elapsed.as_secs_f64())
+    }
+
+    /// When the publisher built the database, which it stamps into the file.
+    #[cfg(feature = "geoip-lookup")]
+    fn built_at(file: &Path) -> Option<SystemTime> {
+        crate::geoip::enricher::open_reader(file)
+            .ok()?
+            .metadata()
+            .build_time()
+            .ok()
+    }
+
+    /// Without a reader there is nothing to read the stamp out of.
+    #[cfg(not(feature = "geoip-lookup"))]
+    const fn built_at(_file: &Path) -> Option<SystemTime> {
+        None
+    }
+
+    /// When the file was last written here.
+    fn written_at(file: &Path) -> Option<SystemTime> {
+        std::fs::metadata(file).ok()?.modified().ok()
     }
 }
 
@@ -660,7 +692,12 @@ mod telemetry {
     pub(super) const fn attempt(_kind: &'static str, _result: &'static str) {}
 
     /// Report the age of the data a deployment is about to serve.
-    pub(super) const fn age(_kind: &'static str, _files: &[std::path::PathBuf]) {}
+    pub(super) const fn age(
+        _kind: &'static str,
+        _files: &[std::path::PathBuf],
+        _from_source: bool,
+    ) {
+    }
 }
 
 #[cfg(test)]

@@ -36,6 +36,7 @@ Setting a path bypasses the provider for that half only. The other half still pr
 | `read_timeout_secs` | u64 | `60` | Idle bound, not a whole-request budget, so a slow transfer is not cut off for being slow |
 | `verify_content` | bool | `true` | Check that a download is the kind of thing it claims to be |
 | `min_size_percent` | u8 | `50` | Refuse a replacement below this fraction of the copy on disk. Zero disables the floor |
+| `age_from_source` | bool | `true` | Report database age from the publisher's build stamp rather than the local write time. Metric only; freshness still counts from the write |
 
 There is deliberately no total request timeout. A whole-request budget puts a ceiling on the link speed a deployment is allowed to have, which fails a slow but healthy transfer. The idle bound fails a stalled one inside a minute and lets a progressing one finish.
 

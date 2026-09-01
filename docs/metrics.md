@@ -14,13 +14,17 @@ Everything factbook emits, through the [`metrics`](https://crates.io/crates/metr
 
 Alert it against the provider's own cadence: daily sources under a couple of days, monthly ones under a couple of months.
 
+It counts from the timestamp the publisher stamped into the database, not from when the file landed here. Those differ by however long the copy sat published before anyone fetched it -- a monthly database downloaded this morning is not new data. Set `auto_download.age_from_source: false` for a publisher whose stamp cannot be trusted, and the gauge falls back to time since the local write.
+
+Freshness is a separate question and still counts from the local write, so a database whose build stamp predates the staleness window is not re-fetched on every run.
+
 ## Acquisition, on by default
 
 The `metrics` feature is in the default set. It runs once per database per refresh, so the cost is a `stat` on a daily or monthly cadence.
 
 | metric | type | labels | what it says |
 |---|---|---|---|
-| `enrichment_database_age_seconds` | gauge | `type`, `kind` | Seconds since the database was written. The oldest file of a set, because a database is only as current as its stalest half |
+| `enrichment_database_age_seconds` | gauge | `type`, `kind` | Seconds since the publisher built the database. The oldest file of a set, because a database is only as current as its stalest half |
 | `enrichment_download_total` | counter | `type`, `kind`, `result` | One per download attempt, by how it ended |
 
 `kind` is `city` or `asn`. `type` is `geoip` on every series.

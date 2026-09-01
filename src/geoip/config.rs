@@ -407,6 +407,19 @@ pub struct AutoDownloadConfig {
     /// shipping a stub. A first download has nothing to compare against and is
     /// always accepted.
     pub min_size_percent: u8,
+
+    /// Report database age from the publisher's own build timestamp rather
+    /// than from when the file was written here.
+    ///
+    /// On by default, because the two differ by however long the copy sat
+    /// unpublished plus however long before it was fetched -- a monthly
+    /// database downloaded today is not new data. Turn it off for a publisher
+    /// whose stamp cannot be trusted; the age then reports time since fetch.
+    ///
+    /// Only the metric reads it. Freshness still counts from the local write,
+    /// so a database whose build stamp is older than the staleness window is
+    /// not re-fetched on every run.
+    pub age_from_source: bool,
 }
 
 impl Default for AutoDownloadConfig {
@@ -422,6 +435,7 @@ impl Default for AutoDownloadConfig {
             read_timeout_secs: DEFAULT_READ_TIMEOUT_SECS,
             verify_content: true,
             min_size_percent: DEFAULT_MIN_SIZE_PERCENT,
+            age_from_source: true,
         }
     }
 }

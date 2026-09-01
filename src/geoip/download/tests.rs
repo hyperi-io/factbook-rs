@@ -921,6 +921,30 @@ async fn maxmind_basic_auth_reaches_the_request() {
     }
 }
 
+#[cfg(feature = "geoip-lookup")]
+#[test]
+fn a_database_carries_when_it_was_built_not_when_it_was_fetched() {
+    // The age metric reads the publisher's stamp because the two diverge by
+    // however long the copy sat published before anyone fetched it.
+    let path = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/GeoLite2-City-Test.mmdb"
+    ));
+
+    let built = crate::geoip::enricher::open_reader(path)
+        .unwrap()
+        .metadata()
+        .build_time()
+        .unwrap();
+    let written = fs::metadata(path).unwrap().modified().unwrap();
+
+    let gap = written.duration_since(built).unwrap();
+    assert!(
+        gap > Duration::from_secs(30 * SECS_PER_DAY),
+        "built and fetched are {gap:?} apart"
+    );
+}
+
 #[test]
 fn a_refused_download_is_counted_apart_from_one_that_never_arrived() {
     // Bytes that arrived and were rejected mean the provider published
