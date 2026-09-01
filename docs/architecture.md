@@ -32,15 +32,19 @@ Nothing passes a record between the halves. Acquisition finishes when the file i
 
 ## The atomic rename is what makes the memory map safe
 
-A reader holds a memory map of the file. Writing a refresh into that file in place would change bytes underneath a live mapping, which is undefined behaviour rather than a race that shows up as a wrong answer. Downloading to a `.part` file and renaming means the mapped inode is never written to: the old reader keeps answering from the old inode until something reopens it.
+A reader holds a memory map of the file. Writing a refresh into that file in place changes bytes underneath a live mapping, which is undefined behaviour. Downloading to a `.part` file and renaming means the mapped inode is never written to, so the old reader keeps answering from it until something reopens it.
 
-That something is `refresh_if_changed`, which stats each file, reopens whichever moved, and swaps the reader set in one atomic store. Nothing starts a timer -- a library that spawns its own thread imposes that thread on every consumer, so the schedule belongs to the caller.
+`refresh_if_changed` is that something. It stats each file, reopens whichever moved, and swaps the reader set in one atomic store. Nothing starts a timer -- a library that spawns its own thread imposes that thread on every consumer, so the schedule belongs to the caller.
 
-Nothing dangles if a process dies mid-update. The transfer takes an advisory lock on the file it is writing, so two processes sharing a data directory cannot interleave writes into it, and the kernel releases that lock when the process holding it goes away. A second process finding the lock held is turned away before it makes a request, so it spends none of the provider's quota and reads what is already on disk. A panic while the reader set is being swapped is handled the same way: the guarded state is a path and a timestamp, so a poisoned lock is recovered rather than failing every refresh from then on.
+Nothing dangles if a process dies mid-update:
+
+- The transfer holds an advisory lock on the file it writes, so two processes sharing a data directory cannot interleave into it. The kernel releases that lock when the process holding it goes away.
+- A second process finding the lock held is turned away before it makes a request, so it spends none of the provider's quota and reads what is on disk.
+- A panic while the readers are being swapped poisons a lock guarding a path and a timestamp. It is recovered rather than failing every refresh from then on.
 
 ## A refusal keeps the previous database
 
-Verification runs against the staged file, before the rename. A file that fails is deleted and the copy already in place keeps being served. The ordering is what makes that work: a bad file at the destination would carry a fresh modification time, so the freshness check would never replace it and the deployment would serve rubbish until someone noticed.
+Verification runs against the staged file, before the rename. A file that fails is deleted and the copy already in place keeps being served. The ordering matters: a bad file at the destination carries a fresh modification time, so the freshness check would never replace it.
 
 Five checks, in the order they run:
 
@@ -61,11 +65,11 @@ flowchart LR
     X --> P[previous database keeps serving]
 ```
 
-The digest is fetched only where a publisher publishes one, and it is the expensive check rather than the cheap one -- a full read and hash of the whole archive. The last two belong to the guard, which runs the volume floor first because two `stat` calls cost less than mapping a database.
+The digest runs only where a publisher publishes one, and it is the expensive check: a full read and hash of the archive. The last two belong to the guard, which runs the volume floor first because two `stat` calls cost less than mapping a database.
 
 ## The cache is keyed on the address, not its text
 
-A record is reached through a cache in front of the reader. Reference lookups are heavily frequency-biased, so most traffic is repeats and the cache removes a database traversal for each one.
+Reference lookups are heavily frequency-biased, so most traffic is repeats. The cache removes a database traversal for each one.
 
 Three consequences shape the record type:
 
@@ -79,7 +83,7 @@ Cached answers are cleared when the reader set is swapped rather than aged out o
 
 Providers disagree about how a record is written. MaxMind nests, and DB-IP and sapics follow it. IPinfo is flat and writes an autonomous system number as text with an `AS` prefix.
 
-Each database names its own schema in its metadata, so the reader dispatches on the file rather than on config. A pre-seeded or mounted file is handled the same as a downloaded one, and nothing has to be threaded through from the downloader. Every schema lands on the same flat record, which is what lets answers from different sources be merged.
+Each database names its own schema in its metadata, so the reader dispatches on the file rather than on config. A pre-seeded or mounted file is handled the same as a downloaded one. Every schema lands on the same flat record, which is what lets answers from different sources merge.
 
 ## Features draw the dependency line
 

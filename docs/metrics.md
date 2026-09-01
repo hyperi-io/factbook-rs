@@ -10,9 +10,9 @@ Everything factbook emits, through the [`metrics`](https://crates.io/crates/metr
 
 ## Watch the database age above all else
 
-`enrichment_database_age_seconds` is the metric that catches the failure nobody notices. A deployment whose downloads have been failing for months keeps answering: the cache still hits, lookups still return records, and the only complaint is a warn line in a log nobody reads. The data is just old, and quietly wrong about anything that moved.
+`enrichment_database_age_seconds` is the one to alert on. When downloads stop working, nothing else shows it. Lookups keep returning records, they are just increasingly wrong.
 
-Alert on it against the provider's own publish cadence -- daily sources should sit under a couple of days, monthly ones under a couple of months.
+Alert it against the provider's own cadence: daily sources under a couple of days, monthly ones under a couple of months.
 
 ## Acquisition, on by default
 
@@ -34,7 +34,7 @@ The `metrics` feature is in the default set. It runs once per database per refre
 | `failed` | Bytes never arrived | the network, the endpoint, or the credential |
 | `busy` | Another process holds the lock on the file | expected where several processes share a data directory; sustained means one is stuck |
 
-`refused` and `failed` are worth separating because they need different people. A `refused` run means the provider shipped a login page, a stub, or a database that answers nothing -- factbook did its job and kept the old file. A `failed` run never got that far.
+Separate the two when you alert. `refused` is the provider's problem: it shipped a login page, a stub, or a database that answers nothing, and the old file is still in place. `failed` is yours.
 
 ## Lookup, off by default
 
@@ -55,7 +55,7 @@ The hit ratio these give is what tells you whether `cache.capacity` is set sensi
 
 ## Names are shared, not private
 
-These four lookup names match the descriptors an existing consumer already registers, so the series land in the group it has rather than beside it. A rename here would not fail loudly -- the metric would simply be recorded without its description and appear as a stranger. Treat the names as a contract.
+These four lookup names match descriptors a consumer already registers, so the series land in the group it has rather than beside it. Renaming one does not fail loudly: it records without a description and shows up as an unrelated series. Treat the names as a contract.
 
 ## Turning it all off
 
