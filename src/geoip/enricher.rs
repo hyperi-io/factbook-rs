@@ -48,7 +48,6 @@
 //! # }
 //! ```
 
-use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -342,24 +341,13 @@ impl GeoIp {
 
     /// Look a batch of addresses up, answers in the order they were given.
     ///
-    /// Repeats within the batch are resolved once, which pays only when the
-    /// reads behind them are expensive. Against a warm cache the dedup map
-    /// costs more than the probes it saves, and calling [`Self::lookup`] in a
-    /// loop measured faster; [`Self::lookup`] caches, so the loop is the right
-    /// default and this is for a cold one.
+    /// A repeat costs a cache hit rather than a second database read, because
+    /// [`Self::lookup`] caches the first one. Deduplicating the batch first was
+    /// measurably slower both warm and cold: it duplicates what the cache
+    /// already does and pays an allocation for it.
     #[must_use]
     pub fn lookup_many(&self, ips: &[IpAddr]) -> Vec<Option<Arc<GeoIpRecord>>> {
-        // Sized to the batch rather than grown into it: a flush of twenty
-        // thousand rows would otherwise rehash the map on the way up.
-        let mut resolved: HashMap<IpAddr, Option<Arc<GeoIpRecord>>> =
-            HashMap::with_capacity(ips.len());
-        for &ip in ips {
-            resolved.entry(ip).or_insert_with(|| self.lookup(ip));
-        }
-
-        ips.iter()
-            .map(|ip| resolved.get(ip).cloned().flatten())
-            .collect()
+        ips.iter().map(|&ip| self.lookup(ip)).collect()
     }
 
     /// Answers currently held in the cache.
