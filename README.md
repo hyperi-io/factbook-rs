@@ -73,11 +73,27 @@ than as literals.
 
 **With no account at all**, drop the credentials and the provider line:
 `GeoIpConfig::default()` selects DB-IP Lite for location and sapics
-`origin-asn` for networks, which is the best pair that asks for no signup. The
-two halves default separately because no single no-credential provider does
-both well -- DB-IP is the only city source needing no login, and `origin-asn`
-publishes daily against DB-IP's monthly, covers more of the address space, and
-ships a digest beside the file that DB-IP does not.
+`origin-asn` for networks. That pair is not a compromise -- measured over
+200,000 uniformly drawn routable addresses, it answers for *more* of the
+address space than the free tier you need an account for:
+
+| source | ASN | country |
+|---|---|---|
+| sapics `origin-asn` *(default)* | **94.77%** | -- |
+| IPinfo Lite | 84.49% | 99.83% |
+| MaxMind GeoLite2 | 84.15% | 99.46% |
+| DB-IP Lite *(default for country)* | 83.70% | **99.88%** |
+
+The two halves default separately because no single no-credential provider does
+both well. Where both a source and MaxMind answer, they agree on the network
+98.8-99.7% of the time; `origin-asn` sits at the bottom of that range and at the
+top of the coverage one, which is the right side of the trade. Part of the
+disagreement is method rather than error -- it reports the origin observed in
+BGP where MaxMind reports a registry view.
+
+Uniform draws are not traffic-weighted, and live traffic concentrates where
+every source does better. The number that matters for a default is where it
+would leave you blind.
 
 The same thing in config, which is how most deployments say it:
 

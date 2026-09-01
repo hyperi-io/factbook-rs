@@ -224,7 +224,7 @@ impl Transfer {
         let bytes = self.stream_with_fallback(client, &part).await?;
 
         if let Some(checksum_url) = self.checksum_url.clone() {
-            let expected = fetch_checksum(client, &checksum_url).await?;
+            let expected = fetch_checksum(client, &checksum_url, &self.credential).await?;
             let checked = part.clone();
             let actual = tokio::task::spawn_blocking(move || sha256_of(&checked)).await??;
             if actual != expected {
@@ -484,9 +484,16 @@ const fn rate_kib_per_sec(written: u64, elapsed: Duration) -> u64 {
 ///
 /// The body is `sha256sum` output -- the digest, then the file name -- so only
 /// the first field is read.
-async fn fetch_checksum(client: &Client, url: &str) -> Result<String, GeoIpDownloadError> {
-    let response = client
-        .get(url)
+///
+/// The credential is applied here too: MaxMind gates its digest behind the same
+/// account as the database.
+async fn fetch_checksum(
+    client: &Client,
+    url: &str,
+    credential: &Credential,
+) -> Result<String, GeoIpDownloadError> {
+    let response = credential
+        .apply(client.get(url))
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;

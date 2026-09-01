@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
@@ -83,9 +83,15 @@ fn default_client() -> reqwest::Client {
 }
 
 /// The same URL, served by a local mock instead of the provider.
+///
+/// The query is kept: MaxMind's archive and its digest share a path and differ
+/// only by `suffix`.
 fn at_server(server: &MockServer, url: &str) -> String {
-    let path = reqwest::Url::parse(url).unwrap().path().to_string();
-    format!("{}{path}", server.uri())
+    let parsed = reqwest::Url::parse(url).unwrap();
+    match parsed.query() {
+        Some(query) => format!("{}{}?{query}", server.uri(), parsed.path()),
+        None => format!("{}{}", server.uri(), parsed.path()),
+    }
 }
 
 /// The transfers plan() built, aimed at a local server.
@@ -874,11 +880,22 @@ async fn maxmind_basic_auth_reaches_the_request() {
     let dir = tempfile::tempdir().unwrap();
     let config = credentialled(dir.path(), GeoIpProvider::MaxMind);
 
+    let archive = tar_gz("GeoLite2-City.mmdb", &mmdb_body(b"city database"));
+    let digest = sha256_hex(&archive);
+
+    // The digest is of the ARCHIVE, which is what the part file holds when the
+    // check runs.
     Mock::given(method("GET"))
+        .and(query_param("suffix", "tar.gz.sha256"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(tar_gz("GeoLite2-City.mmdb", &mmdb_body(b"city database"))),
+                .set_body_string(format!("{digest}  GeoLite2-City_20260901.tar.gz\n")),
         )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(query_param("suffix", "tar.gz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(archive))
         .mount(&server)
         .await;
 
@@ -888,17 +905,20 @@ async fn maxmind_basic_auth_reaches_the_request() {
     assert_eq!(dest, dir.path().join("GeoLite2-City.mmdb"));
     assert_eq!(fs::read(&dest).unwrap(), mmdb_body(b"city database"));
 
+    // The archive and the digest, and MaxMind gates both on the same account.
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 1);
-    // base64 of "123456:secret-key" -- both halves of the credential are on the
-    // wire, and neither is anywhere in the URL.
-    assert_eq!(
-        requests[0].headers.get("authorization").unwrap(),
-        "Basic MTIzNDU2OnNlY3JldC1rZXk="
-    );
-    let url = requests[0].url.as_str();
-    assert!(!url.contains("123456"), "{url}");
-    assert!(!url.contains("secret-key"), "{url}");
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        // base64 of "123456:secret-key" -- both halves of the credential are on
+        // the wire, and neither is anywhere in the URL.
+        assert_eq!(
+            request.headers.get("authorization").unwrap(),
+            "Basic MTIzNDU2OnNlY3JldC1rZXk="
+        );
+        let url = request.url.as_str();
+        assert!(!url.contains("123456"), "{url}");
+        assert!(!url.contains("secret-key"), "{url}");
+    }
 }
 
 #[tokio::test]

@@ -435,6 +435,11 @@ const SAPICS_TERMS: &str = "https://github.com/sapics/ip-location-db";
 const MAXMIND_ENDPOINT: &str =
     "https://download.maxmind.com/geoip/databases/{edition}/download?suffix=tar.gz";
 
+/// Digest of that archive, published at the same endpoint and gated on the same
+/// account.
+const MAXMIND_CHECKSUM_ENDPOINT: &str =
+    "https://download.maxmind.com/geoip/databases/{edition}/download?suffix=tar.gz.sha256";
+
 /// Every database this crate can fetch.
 ///
 /// A provider is expressible here or it is not supported: a shape the table
@@ -490,7 +495,9 @@ static SOURCES: &[SourceSpec] = &[
         archive: Archive::TarGz {
             member: "GeoLite2-City.mmdb",
         },
-        checksum: None,
+        checksum: Some(UrlStrategy::Edition {
+            endpoint: MAXMIND_CHECKSUM_ENDPOINT,
+        }),
         cadence: TWICE_WEEKLY,
         // A GeoLite account is capped at thirty downloads a day across every
         // database, so a fetch is allowed once a day per database.
@@ -511,7 +518,9 @@ static SOURCES: &[SourceSpec] = &[
         archive: Archive::TarGz {
             member: "GeoLite2-ASN.mmdb",
         },
-        checksum: None,
+        checksum: Some(UrlStrategy::Edition {
+            endpoint: MAXMIND_CHECKSUM_ENDPOINT,
+        }),
         cadence: TWICE_WEEKLY,
         min_interval: Some(DAY),
         terms_url: MAXMIND_GEOLITE2_TERMS,
@@ -530,7 +539,9 @@ static SOURCES: &[SourceSpec] = &[
         archive: Archive::TarGz {
             member: "GeoIP2-City.mmdb",
         },
-        checksum: None,
+        checksum: Some(UrlStrategy::Edition {
+            endpoint: MAXMIND_CHECKSUM_ENDPOINT,
+        }),
         cadence: TWICE_WEEKLY,
         min_interval: Some(DAY),
         terms_url: MAXMIND_GEOIP2_TERMS,
@@ -551,7 +562,9 @@ static SOURCES: &[SourceSpec] = &[
         archive: Archive::TarGz {
             member: "GeoIP2-ISP.mmdb",
         },
-        checksum: None,
+        checksum: Some(UrlStrategy::Edition {
+            endpoint: MAXMIND_CHECKSUM_ENDPOINT,
+        }),
         cadence: TWICE_WEEKLY,
         min_interval: Some(DAY),
         terms_url: MAXMIND_GEOIP2_TERMS,
