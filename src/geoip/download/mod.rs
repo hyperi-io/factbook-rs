@@ -168,6 +168,15 @@ pub enum GeoIpDownloadError {
         path: String,
     },
 
+    /// The credential was accepted and this database still refused.
+    #[error(
+        "{url} accepted the credential and refused the database; the account has no entitlement to it, so check the tier selected against the products the account holds"
+    )]
+    NotEntitled {
+        /// URL that refused.
+        url: String,
+    },
+
     /// The bytes arrived intact but hold no rows of the stated format.
     #[error("{path} does not parse as the table it states: {detail}")]
     Unparseable {
@@ -248,6 +257,7 @@ impl GeoIpDownloadError {
             Self::CredentialRejected { .. }
             | Self::MissingCredential { .. }
             | Self::NoDatabases { .. }
+            | Self::NotEntitled { .. }
             | Self::UnsupportedTier { .. } => true,
             // 408 is the server inviting a retry; the rest of the 4xx range is
             // about this request and will answer the same way again.
@@ -267,6 +277,7 @@ impl GeoIpDownloadError {
     pub const fn outcome(&self) -> &'static str {
         match self {
             Self::Busy { .. } => "busy",
+            Self::NotEntitled { .. } => "unentitled",
             Self::ChecksumMismatch { .. }
             | Self::MalformedChecksum { .. }
             | Self::NotADatabase { .. }

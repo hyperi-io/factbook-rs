@@ -471,13 +471,23 @@ fn refused(
         };
     }
 
-    let rejects_credential = status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN;
-    if let (true, Some(fields)) = (rejects_credential, credential.fields()) {
-        return GeoIpDownloadError::CredentialRejected {
-            url: url.to_string(),
-            status: status.as_u16(),
-            fields,
-        };
+    // A provider that authenticated the request and then refused this database
+    // is answering a different question from one that refused the credential.
+    // MaxMind separates them: 401 for a bad licence key, 403 for a valid
+    // account with no entitlement to the edition asked for.
+    if let Some(fields) = credential.fields() {
+        if status == StatusCode::UNAUTHORIZED {
+            return GeoIpDownloadError::CredentialRejected {
+                url: url.to_string(),
+                status: status.as_u16(),
+                fields,
+            };
+        }
+        if status == StatusCode::FORBIDDEN {
+            return GeoIpDownloadError::NotEntitled {
+                url: url.to_string(),
+            };
+        }
     }
 
     GeoIpDownloadError::UnexpectedStatus {

@@ -1056,10 +1056,10 @@ async fn a_403_is_reported_rather_than_written_out() {
     let dest = transfer.dest.clone();
     let err = transfer.run(&default_client()).await.unwrap_err();
 
-    // A credentialled request refused with 403 is reported against the config
-    // field rather than as a bare status.
+    // 403 means the credential was accepted and this database refused, so the
+    // operator is pointed at the entitlement rather than at their key.
     assert!(
-        matches!(&err, GeoIpDownloadError::CredentialRejected { url, status: 403, .. } if *url == endpoint),
+        matches!(&err, GeoIpDownloadError::NotEntitled { url } if *url == endpoint),
         "{err:?}"
     );
     assert!(!dest.exists());
@@ -1596,38 +1596,66 @@ async fn a_login_page_answered_with_200_is_not_written_out() {
 
 #[tokio::test]
 async fn a_rejected_credential_names_the_config_fields() {
-    // 401 and 403 are the provider's answer about the credential, so the report
+    // 401 is the provider's answer about the credential itself, so the report
     // is the field an operator has to fix rather than a bare status.
-    for status in [401u16, 403] {
-        let server = MockServer::start().await;
-        let dir = tempfile::tempdir().unwrap();
-        let config = credentialled(dir.path(), GeoIpProvider::MaxMind);
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = credentialled(dir.path(), GeoIpProvider::MaxMind);
 
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(status))
-            .mount(&server)
-            .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
 
-        let transfer = planned(Kind::City, &config, &server).remove(0);
-        let err = transfer.run(&default_client()).await.unwrap_err();
-        let message = err.to_string();
+    let transfer = planned(Kind::City, &config, &server).remove(0);
+    let err = transfer.run(&default_client()).await.unwrap_err();
+    let message = err.to_string();
 
-        assert!(
-            matches!(err, GeoIpDownloadError::CredentialRejected { .. }),
-            "{err:?}"
-        );
-        assert!(err.is_permanent(), "{err:?}");
-        assert!(
-            message.contains("auto_download.maxmind_account_id"),
-            "{message}"
-        );
-        assert!(
-            message.contains("auto_download.maxmind_license_key"),
-            "{message}"
-        );
-        // The credential itself is never in the report.
-        assert!(!message.contains("secret-key"), "{message}");
-    }
+    assert!(
+        matches!(err, GeoIpDownloadError::CredentialRejected { .. }),
+        "{err:?}"
+    );
+    assert!(err.is_permanent(), "{err:?}");
+    assert!(
+        message.contains("auto_download.maxmind_account_id"),
+        "{message}"
+    );
+    assert!(
+        message.contains("auto_download.maxmind_license_key"),
+        "{message}"
+    );
+    // The credential itself is never in the report.
+    assert!(!message.contains("secret-key"), "{message}");
+}
+
+#[tokio::test]
+async fn an_unentitled_edition_is_not_reported_as_a_bad_credential() {
+    // MaxMind answers 401 for a licence key it will not accept and 403 for an
+    // account that has no claim on the edition asked for. Reporting both as a
+    // credential fault sends an operator to check a key that is already right.
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = credentialled(dir.path(), GeoIpProvider::MaxMind);
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+
+    let transfer = planned(Kind::City, &config, &server).remove(0);
+    let err = transfer.run(&default_client()).await.unwrap_err();
+    let message = err.to_string();
+
+    assert!(
+        matches!(err, GeoIpDownloadError::NotEntitled { .. }),
+        "{err:?}"
+    );
+    // Retrying spends the provider's quota and cannot change the answer.
+    assert!(err.is_permanent(), "{err:?}");
+    assert_eq!(err.outcome(), "unentitled");
+    assert!(message.contains("entitlement"), "{message}");
+    assert!(!message.contains("maxmind_license_key"), "{message}");
+    assert!(!message.contains("secret-key"), "{message}");
 }
 
 #[tokio::test]

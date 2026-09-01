@@ -37,6 +37,7 @@ The `metrics` feature is in the default set. It runs once per database per refre
 | `refused` | Bytes arrived and a check rejected them | the provider published something bad; the previous file is still being served |
 | `failed` | Bytes never arrived | the network, the endpoint, or the credential |
 | `busy` | Another process holds the lock on the file | expected where several processes share a data directory; sustained means one is stuck |
+| `unentitled` | The credential was accepted and the database refused | the account has no claim on the edition selected; check the tier against the account's products, not the key |
 
 Separate the two when you alert. `refused` is the provider's problem: it shipped a login page, a stub, or a database that answers nothing, and the old file is still in place. `failed` is yours.
 
