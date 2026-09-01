@@ -342,9 +342,11 @@ impl GeoIp {
 
     /// Look a batch of addresses up, answers in the order they were given.
     ///
-    /// Repeats within the batch are resolved once. A batch of events from one
-    /// noisy source is the common shape, and deduplicating before the cache is
-    /// touched turns it into a single lookup.
+    /// Repeats within the batch are resolved once, which pays only when the
+    /// reads behind them are expensive. Against a warm cache the dedup map
+    /// costs more than the probes it saves, and calling [`Self::lookup`] in a
+    /// loop measured faster; [`Self::lookup`] caches, so the loop is the right
+    /// default and this is for a cold one.
     #[must_use]
     pub fn lookup_many(&self, ips: &[IpAddr]) -> Vec<Option<Arc<GeoIpRecord>>> {
         // Sized to the batch rather than grown into it: a flush of twenty

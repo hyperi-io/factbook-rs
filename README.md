@@ -180,25 +180,33 @@ appearance rather than starting from nothing.
 
 | path | cost | against |
 |---|---|---|
-| cache hit | 111 ns | -- |
-| cold read, key present | 2,552 ns | cache worth **23x** |
-| cold read, key absent | 1,060 ns | negative caching worth **9.5x** |
-| private or reserved address | 14.3 ns | **7.75x** cheaper than a hit |
-| batch lookup, warm | 59.2 ns/row | **1.91x** faster than repeated single |
+| cache hit | 27-37 ns | -- |
+| private or reserved address | 17-19 ns | about **2x** cheaper than a hit |
+| cold read, key present | 2.4-2.7 µs | cache worth roughly **65-100x** |
+| owned record instead of an `Arc` | 69-90 ns | about **2.4x** the cost of a hit |
 
-Three details follow from the same reasoning:
+Ranges are the spread across two runs of the default feature set on one loaded
+machine, not a leaderboard entry. Take the ratios, treat the absolutes as
+indicative, and measure your own traffic.
 
-- **A hit hands back an `Arc`, not a copy.** Returning an owned record measures
-  a quarter again on top of every hit -- 139 ns against 111 ns -- to reproduce
-  something already in memory.
+**Measure with the features you ship.** Enabling `metrics` puts two
+`Instant::now()` calls on the hit path and costs roughly 3-4x there, which is
+enough to invert the ratios above. It is off by default for that reason.
+
+Two details follow from the same reasoning:
+
+- **A hit hands back an `Arc`, not a copy.** Returning an owned record costs
+  about two and a half times a hit, to reproduce something already in memory.
 - **The key is an `IpAddr`, not the text of one.** 17 bytes, `Copy`, no
   allocation and no string hashing per lookup -- and `::1` and
   `0:0:0:0:0:0:0:1` stop being two entries for one address.
-- **Private and reserved ranges never reach the cache.** They cannot have an
-  answer, so they short-circuit to a shared constant.
 
-Batching deduplicates cache probes rather than database reads -- a single
-`lookup` already caches, so both paths do the same number of reads.
+**`lookup_many` is not a fast path for warm data.** It deduplicates a batch
+through a map before reading, which pays only when the reads behind it are
+expensive: on a cold cache it comes out ahead, and on a warm one it measured
+1.4-1.7x *slower* than just calling `lookup` in a loop. `lookup` already
+caches, so the loop is the right default and the batch call is for the cold
+case.
 
 ### It keeps itself current, safely
 
