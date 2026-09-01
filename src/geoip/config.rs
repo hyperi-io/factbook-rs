@@ -37,6 +37,11 @@
 //!     # slow but progressing transfer.
 //!     connect_timeout_secs: 30
 //!     read_timeout_secs: 60
+//!     # A download that parses but answers nothing is refused, as is one a
+//!     # fraction of the size of the copy it would replace. Both are advisory:
+//!     # turn either off for a database this crate models badly.
+//!     verify_content: true
+//!     min_size_percent: 50
 //!     # Credentials are Secret: redacted in Debug and Display. Supply them
 //!     # through the secrets layer, not as literals.
 //!     maxmind_account_id: null
@@ -62,28 +67,28 @@ const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
 /// Default seconds a transfer may go without receiving any bytes.
 const DEFAULT_READ_TIMEOUT_SECS: u64 = 60;
 
+/// Default floor, as a percentage of the copy it replaces, under which a
+/// downloaded database is refused.
+///
+/// Provider builds move by single-digit percentages month to month, and a
+/// rebuild that genuinely halves a database is not something any of the modelled
+/// providers has done, so half leaves a wide margin over normal variation while
+/// still catching a stub or a partial build.
+const DEFAULT_MIN_SIZE_PERCENT: u8 = 50;
+
 /// Source of the databases.
 ///
 /// The tier is a separate axis -- see [`ProviderTier`] -- so this names the
-/// provider, not one of its products. Only the combinations in the table are
-/// modelled; anything else is reported by
+/// provider, not one of its products. Which provider, tier and database kind
+/// combinations are modelled is data rather than documentation: a selection the
+/// source table has no row for is reported by
 /// [`validate`](super::download::validate) rather than guessed at.
 ///
-/// | Variant | Tier | Auth | City | ASN | What the deployer owes |
-/// |---|---|---|---|---|---|
-/// | [`DbIp`](Self::DbIp) | free (Lite) | none | yes | yes | CC BY 4.0 attribution |
-/// | [`MaxMind`](Self::MaxMind) | free (GeoLite2) | HTTP basic | yes | yes | MaxMind EULA, and its attribution |
-/// | [`MaxMind`](Self::MaxMind) | paid (GeoIP2) | HTTP basic | yes | ISP | MaxMind EULA |
-/// | [`IpInfo`](Self::IpInfo) | free (Lite) | token | yes | no | IPinfo terms, and its attribution |
-/// | [`SapicsOriginAsn`](Self::SapicsOriginAsn) | free | none | no | yes | nothing (PDDL) |
-/// | [`SapicsIpToAsn`](Self::SapicsIpToAsn) | free | none | no | yes | nothing (PDDL) |
-/// | [`Custom`](Self::Custom) | n/a | n/a | explicit path | explicit path | whatever the file came under |
-///
-/// Every provider here publishes MMDB. Nothing is bundled with this crate: the
-/// deploying organisation fetches from the provider's own endpoint under that
-/// provider's terms, so the last column is the obligation it takes on -- an
-/// attribution line in its own interface for the CC BY and vendor-terms rows,
-/// nothing at all for the public-domain ones.
+/// Nothing is bundled with this crate. The deploying organisation fetches from
+/// the provider's own endpoint under that provider's terms, and what those
+/// terms require -- a licence, an attribution line, a fetch ceiling -- is
+/// readable at runtime through
+/// [`source_terms`](super::download::source_terms).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GeoIpProvider {
@@ -110,6 +115,21 @@ pub enum GeoIpProvider {
 
     /// Caller supplies the database paths directly; nothing is downloaded.
     Custom,
+}
+
+impl GeoIpProvider {
+    /// Label used in error messages and log fields.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DbIp => "DbIp",
+            Self::MaxMind => "MaxMind",
+            Self::IpInfo => "IpInfo",
+            Self::SapicsOriginAsn => "SapicsOriginAsn",
+            Self::SapicsIpToAsn => "SapicsIpToAsn",
+            Self::Custom => "Custom",
+        }
+    }
 }
 
 /// Which product line of a provider to take a database from.
@@ -348,6 +368,27 @@ pub struct AutoDownloadConfig {
     /// link impossible rather than slow. A connection that has stopped
     /// delivering still fails inside this window.
     pub read_timeout_secs: u64,
+
+    /// Refuse a downloaded database that resolves nothing for a well-known
+    /// address.
+    ///
+    /// A file can be a structurally valid database, match the digest its
+    /// provider published and still answer nothing: `dbip-asn` ships a valid
+    /// database whose operator-name column is blank on every row. Set it false
+    /// for a database whose schema this crate models badly, which gives up this
+    /// check alone.
+    ///
+    /// Reading the file needs the lookup engine, so a build without
+    /// `geoip-lookup` accepts the setting and has nothing to ask the file with.
+    pub verify_content: bool,
+
+    /// Smallest percentage of the copy it replaces a downloaded database may
+    /// be, zero for no floor.
+    ///
+    /// This is what refuses a truncated but parseable file or a provider
+    /// shipping a stub. A first download has nothing to compare against and is
+    /// always accepted.
+    pub min_size_percent: u8,
 }
 
 impl Default for AutoDownloadConfig {
@@ -361,6 +402,8 @@ impl Default for AutoDownloadConfig {
             max_age_days: DEFAULT_MAX_AGE_DAYS,
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             read_timeout_secs: DEFAULT_READ_TIMEOUT_SECS,
+            verify_content: true,
+            min_size_percent: DEFAULT_MIN_SIZE_PERCENT,
         }
     }
 }

@@ -1240,6 +1240,220 @@ async fn a_checksum_mismatch_leaves_the_previous_database_in_place() {
     assert_eq!(entries(dir.path()), ["origin-asn.mmdb"]);
 }
 
+// ---------------------------------------------------------------------------
+// What the format cannot state: content and volume
+// ---------------------------------------------------------------------------
+
+/// The guard an operator gets by default, for one database kind.
+fn default_guard(kind: Kind) -> Guard {
+    Guard::new(kind, &AutoDownloadConfig::default())
+}
+
+/// Serve `body` from a one-mock server and return the transfer that fetches it.
+async fn served(server: &MockServer, dest: PathBuf, body: Vec<u8>) -> Transfer {
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(server)
+        .await;
+    raw_transfer(format!("{}/db.mmdb", server.uri()), dest)
+}
+
+#[tokio::test]
+async fn a_database_that_answers_nothing_leaves_the_previous_one_in_place() {
+    // The dbip-asn defect: a valid MaxMind DB whose operator-name column is
+    // blank on every row. It parses, it matches the address, and it answers
+    // nothing, so no check on the bytes alone refuses it.
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("db.mmdb");
+
+    let good = verify::fixtures::asn_mmdb(13_335, "CLOUDFLARENET");
+    fs::write(&dest, &good).unwrap();
+
+    let transfer = served(
+        &server,
+        dest.clone(),
+        verify::fixtures::asn_mmdb(13_335, ""),
+    )
+    .await;
+    let err = transfer
+        .run_guarded(&default_client(), default_guard(Kind::Asn))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            GeoIpDownloadError::Unpopulated {
+                field: "organisation name",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    // The requirement: the database already on disk is still there, byte for
+    // byte, and is what the service keeps serving.
+    assert_eq!(fs::read(&dest).unwrap(), good);
+    assert_eq!(entries(dir.path()), ["db.mmdb"]);
+    // Worth another attempt: the provider may publish a populated build next.
+    assert!(!err.is_permanent(), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_populated_database_replaces_the_previous_one() {
+    // The mirror of the refusal, and the test that matters most: a check that
+    // refused everything would stop a deployment updating and say nothing.
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("db.mmdb");
+
+    fs::write(&dest, verify::fixtures::asn_mmdb(13_335, "AN OLDER NAME")).unwrap();
+    let published = verify::fixtures::asn_mmdb(13_335, "CLOUDFLARENET");
+
+    let transfer = served(&server, dest.clone(), published.clone()).await;
+    let written = transfer
+        .run_guarded(&default_client(), default_guard(Kind::Asn))
+        .await
+        .unwrap();
+
+    assert_eq!(written, dest);
+    assert_eq!(fs::read(&dest).unwrap(), published);
+}
+
+#[tokio::test]
+async fn a_city_database_that_resolves_no_country_leaves_the_previous_one() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("db.mmdb");
+
+    let good = verify::fixtures::city_mmdb("US");
+    fs::write(&dest, &good).unwrap();
+
+    let transfer = served(&server, dest.clone(), verify::fixtures::city_mmdb("")).await;
+    let err = transfer
+        .run_guarded(&default_client(), default_guard(Kind::City))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            GeoIpDownloadError::Unpopulated {
+                field: "country",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(fs::read(&dest).unwrap(), good);
+    assert_eq!(entries(dir.path()), ["db.mmdb"]);
+}
+
+#[tokio::test]
+async fn a_stub_replacement_leaves_the_previous_one_in_place() {
+    // A parseable database a fraction of the size of the copy it would replace:
+    // every byte of it is valid, and it is not the database the deployment had.
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("db.mmdb");
+
+    let mut good = verify::fixtures::asn_mmdb(13_335, "CLOUDFLARENET");
+    good.resize(10_000, 0);
+    fs::write(&dest, &good).unwrap();
+
+    let stub = verify::fixtures::asn_mmdb(13_335, "CLOUDFLARENET");
+    let transfer = served(&server, dest.clone(), stub).await;
+    let err = transfer
+        .run_guarded(&default_client(), default_guard(Kind::Asn))
+        .await
+        .unwrap_err();
+    let message = err.to_string();
+
+    assert!(
+        matches!(
+            err,
+            GeoIpDownloadError::Undersized {
+                existing: 10_000,
+                floor_percent: 50,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(message.contains("10000"), "{message}");
+    assert_eq!(fs::read(&dest).unwrap(), good);
+    assert_eq!(entries(dir.path()), ["db.mmdb"]);
+}
+
+#[tokio::test]
+async fn a_first_download_has_no_copy_to_be_measured_against() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("db.mmdb");
+    let published = verify::fixtures::asn_mmdb(15_169, "GOOGLE");
+
+    let transfer = served(&server, dest.clone(), published.clone()).await;
+    let written = transfer
+        .run_guarded(&default_client(), default_guard(Kind::Asn))
+        .await
+        .unwrap();
+
+    assert_eq!(written, dest);
+    assert_eq!(fs::read(&dest).unwrap(), published);
+}
+
+#[tokio::test]
+async fn an_operator_can_turn_the_content_check_off() {
+    // A deployment on a database this crate models badly has to be able to keep
+    // updating, and turning this off gives up neither the format check nor the
+    // digest.
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("db.mmdb");
+    fs::write(&dest, verify::fixtures::asn_mmdb(13_335, "CLOUDFLARENET")).unwrap();
+
+    let blank = verify::fixtures::asn_mmdb(13_335, "");
+    let auto = AutoDownloadConfig {
+        verify_content: false,
+        ..Default::default()
+    };
+
+    let transfer = served(&server, dest.clone(), blank.clone()).await;
+    let written = transfer
+        .run_guarded(&default_client(), Guard::new(Kind::Asn, &auto))
+        .await
+        .unwrap();
+
+    assert_eq!(written, dest);
+    assert_eq!(fs::read(&dest).unwrap(), blank);
+}
+
+#[tokio::test]
+async fn an_operator_can_turn_the_size_floor_off() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("db.mmdb");
+
+    let mut previous = verify::fixtures::asn_mmdb(13_335, "CLOUDFLARENET");
+    previous.resize(10_000, 0);
+    fs::write(&dest, &previous).unwrap();
+
+    let small = verify::fixtures::asn_mmdb(13_335, "CLOUDFLARENET");
+    let auto = AutoDownloadConfig {
+        min_size_percent: 0,
+        ..Default::default()
+    };
+
+    let transfer = served(&server, dest.clone(), small.clone()).await;
+    let written = transfer
+        .run_guarded(&default_client(), Guard::new(Kind::Asn, &auto))
+        .await
+        .unwrap();
+
+    assert_eq!(written, dest);
+    assert_eq!(fs::read(&dest).unwrap(), small);
+}
+
 #[tokio::test]
 async fn a_login_page_answered_with_200_is_not_written_out() {
     // Three provider endpoints answer 200 with HTML rather than a database, so
@@ -1659,6 +1873,133 @@ fn error_messages_name_the_problem() {
         status: 403,
     };
     assert!(err.to_string().contains("403"));
+}
+
+// ---------------------------------------------------------------------------
+// What the table states beyond the URL
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_built_in_selection_is_expressible_as_a_row() {
+    // The table is the whole provider model, so a selection it cannot state is
+    // a gap in the table rather than a case handled somewhere else.
+    for (choice, kind) in [
+        (free(GeoIpProvider::DbIp), Kind::City),
+        (free(GeoIpProvider::DbIp), Kind::Asn),
+        (free(GeoIpProvider::MaxMind), Kind::City),
+        (free(GeoIpProvider::MaxMind), Kind::Asn),
+        (paid(GeoIpProvider::MaxMind), Kind::City),
+        (paid(GeoIpProvider::MaxMind), Kind::Asn),
+        (free(GeoIpProvider::IpInfo), Kind::City),
+        (free(GeoIpProvider::SapicsOriginAsn), Kind::Asn),
+        (free(GeoIpProvider::SapicsIpToAsn), Kind::Asn),
+    ] {
+        let source = SourceSpec::select(choice, kind)
+            .unwrap_or_else(|e| panic!("{choice:?} {kind:?}: {e}"))
+            .unwrap_or_else(|| panic!("{choice:?} {kind:?} has no row"));
+
+        assert_eq!(source.database().format, DatabaseFormat::Mmdb);
+        assert_eq!(source.database().names.len(), 1, "{choice:?} {kind:?}");
+    }
+
+    // The one provider that fetches nothing states that by having no row, at
+    // either tier: its files are the operator's own.
+    for tier in [ProviderTier::Free, ProviderTier::Paid] {
+        let choice = ProviderChoice {
+            provider: GeoIpProvider::Custom,
+            tier,
+        };
+        for kind in [Kind::City, Kind::Asn] {
+            assert!(
+                SourceSpec::select(choice, kind).unwrap().is_none(),
+                "{choice:?} {kind:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_selection_reports_what_it_commits_the_deployer_to() {
+    // The obligation is readable at runtime, so a deployment renders its own
+    // attribution rather than someone remembering to read a table.
+    let dbip = source_terms(ProviderSelection::from(GeoIpProvider::DbIp));
+    assert_eq!(dbip.len(), 2);
+    for terms in &dbip {
+        assert_eq!(terms.obligation.licence, "CC BY 4.0");
+        assert!(terms.obligation.attribution.is_some(), "{terms:?}");
+    }
+
+    // Public-domain data owes nothing, which is the distinction that decides
+    // whether a product can ship a provider as its default.
+    let sapics = source_terms(ProviderSelection::from(GeoIpProvider::SapicsOriginAsn));
+    assert_eq!(sapics.len(), 1);
+    assert_eq!(sapics[0].kind, "asn");
+    assert!(sapics[0].obligation.attribution.is_none());
+
+    // A provider that publishes one kind reports one obligation.
+    let ipinfo = source_terms(ProviderSelection::from(GeoIpProvider::IpInfo));
+    assert_eq!(ipinfo.len(), 1);
+    assert_eq!(ipinfo[0].kind, "city");
+    assert!(ipinfo[0].min_interval.is_some());
+
+    // Nothing is fetched for an operator-supplied file, so there is no term
+    // this crate can state.
+    assert!(source_terms(ProviderSelection::from(GeoIpProvider::Custom)).is_empty());
+}
+
+#[test]
+fn the_freshness_default_is_the_providers_own_cadence() {
+    let month = Duration::from_secs(30 * 86_400);
+    let defaults = AutoDownloadConfig::default();
+    let geolite = SourceSpec::select(free(GeoIpProvider::MaxMind), Kind::City)
+        .unwrap()
+        .unwrap();
+    let dbip = SourceSpec::select(free(GeoIpProvider::DbIp), Kind::City)
+        .unwrap()
+        .unwrap();
+
+    // One global thirty days sits exactly on the GeoLite2 update duty, so a
+    // twice-weekly source is re-fetched with days of margin rather than none.
+    assert_eq!(defaults.max_age_days, 30);
+    assert!(geolite.staleness_window(&defaults) < month);
+
+    // A monthly source keeps the monthly window: the cadence is the default,
+    // not a blanket reduction.
+    assert_eq!(dbip.staleness_window(&defaults), month);
+
+    // The operator's ceiling still tightens it.
+    let tightened = AutoDownloadConfig {
+        max_age_days: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        dbip.staleness_window(&tightened),
+        Duration::from_secs(2 * 86_400)
+    );
+}
+
+#[test]
+fn a_fetch_ceiling_cannot_be_configured_away() {
+    // A provider that caps how often it may be fetched has that cap enforced
+    // by the freshness window, rather than by someone remembering it.
+    let aggressive = AutoDownloadConfig {
+        max_age_days: 0,
+        ..Default::default()
+    };
+
+    let ipinfo = SourceSpec::select(free(GeoIpProvider::IpInfo), Kind::City)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ipinfo.staleness_window(&aggressive),
+        Duration::from_secs(86_400)
+    );
+
+    // A source whose terms state no ceiling honours the setting as given.
+    let dbip = SourceSpec::select(free(GeoIpProvider::DbIp), Kind::City)
+        .unwrap()
+        .unwrap();
+    assert_eq!(dbip.staleness_window(&aggressive), Duration::ZERO);
 }
 
 #[test]

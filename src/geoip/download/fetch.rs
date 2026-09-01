@@ -31,6 +31,7 @@ use flate2::read::GzDecoder;
 use reqwest::{Client, RequestBuilder, StatusCode};
 use tracing::{error, info, warn};
 
+use super::verify::Guard;
 use super::{DatabaseFormat, GeoIpDownloadError};
 use crate::Secret;
 
@@ -186,10 +187,24 @@ pub(super) struct Transfer {
 }
 
 impl Transfer {
-    /// Fetch, materialise and atomically move the database into place.
+    /// The same transfer with nothing checked beyond the format and the digest.
+    ///
+    /// This is the shape the transport, archive and status cases are asserted
+    /// against, where the bodies are stand-ins rather than databases.
+    #[cfg(test)]
+    pub(super) async fn run(self, client: &Client) -> Result<PathBuf, GeoIpDownloadError> {
+        self.run_guarded(client, Guard::OFF).await
+    }
+
+    /// Fetch, materialise and atomically move the database into place, refusing
+    /// a staged file the guard will not admit.
     ///
     /// Returns the destination path on success.
-    pub(super) async fn run(self, client: &Client) -> Result<PathBuf, GeoIpDownloadError> {
+    pub(super) async fn run_guarded(
+        self,
+        client: &Client,
+        guard: Guard,
+    ) -> Result<PathBuf, GeoIpDownloadError> {
         if let Some(parent) = self.dest.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -228,7 +243,7 @@ impl Transfer {
         let format = self.format;
         let staged = with_extension(&dest, STAGE_EXT);
         let final_size = tokio::task::spawn_blocking(move || {
-            let result = materialise(&part, &staged, &dest, archive, format);
+            let result = materialise_guarded(&part, &staged, &dest, archive, format, guard);
             let _ = fs::remove_file(&part);
             if result.is_err() {
                 let _ = fs::remove_file(&staged);
@@ -554,14 +569,30 @@ fn holds_a_database(path: &Path, format: DatabaseFormat) -> Result<bool, io::Err
     }
 }
 
-/// Turn the transferred bytes into the destination file. Blocking: gzip and tar
-/// decode are synchronous and this runs on the blocking pool.
+/// Turn the transferred bytes into the destination file, with nothing checked
+/// beyond the format.
+///
+/// This is the shape the archive and format cases are asserted against.
+#[cfg(test)]
 fn materialise(
     part: &Path,
     staged: &Path,
     dest: &Path,
     archive: Archive,
     format: DatabaseFormat,
+) -> Result<u64, GeoIpDownloadError> {
+    materialise_guarded(part, staged, dest, archive, format, Guard::OFF)
+}
+
+/// Turn the transferred bytes into the destination file. Blocking: gzip and tar
+/// decode are synchronous and this runs on the blocking pool.
+fn materialise_guarded(
+    part: &Path,
+    staged: &Path,
+    dest: &Path,
+    archive: Archive,
+    format: DatabaseFormat,
+    guard: Guard,
 ) -> Result<u64, GeoIpDownloadError> {
     let source = fs::File::open(part)?;
 
@@ -587,6 +618,11 @@ fn materialise(
             url: dest.display().to_string(),
         });
     }
+
+    // What the format cannot state: whether the file answers anything, and
+    // whether it is the size of a database. Also before the rename, for the same
+    // reason.
+    guard.admit(staged, dest, format)?;
 
     let size = fs::metadata(staged)?.len();
     fs::rename(staged, dest)?;

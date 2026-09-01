@@ -28,9 +28,10 @@ account for most of what you see, and the long tail is nearly all
 single-appearance noise.
 
 That skew punishes a plain recency policy: a burst of one-off addresses evicts
-the entries that earn their keep. Measured on a Zipf stream with a 30% scan
-burst, a straight LRU gave up 8.8 points of hit ratio against a policy cache at
-the same capacity.
+the entries that earn their keep. On a synthetic Zipf stream with 30% one-off
+addresses, a straight LRU gave up 8.8 points of hit ratio against a policy cache
+at the same capacity -- a comparison of cache policies rather than a benchmark
+of this crate, and synthetic traffic is kinder than the real thing.
 
 factbook uses [quick_cache](https://crates.io/crates/quick_cache), whose
 Clock-PRO/S3-FIFO design keeps a ghost queue of recently-evicted keys -- so an
@@ -51,12 +52,13 @@ Three details follow from the same reasoning:
 
 ## Usage
 
-```rust
-use factbook::geoip::{GeoIp, GeoIpConfig};
+```rust,no_run
+use factbook::geoip::{CacheConfig, GeoIp, GeoIpConfig, ensure_databases};
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-// Downloads what is missing or stale, opens the readers, builds the cache.
-let geoip = GeoIp::from_config(&GeoIpConfig::default()).await?;
+// Downloads whatever is missing or stale, then opens the readers behind a cache.
+let databases = ensure_databases(&GeoIpConfig::default()).await?;
+let geoip = GeoIp::from_databases(&databases, CacheConfig::default())?;
 
 if let Some(record) = geoip.lookup("203.0.113.42".parse()?) {
     println!("{:?} / {:?}", record.country_code, record.city_name);
@@ -64,6 +66,10 @@ if let Some(record) = geoip.lookup("203.0.113.42".parse()?) {
 # Ok(())
 # }
 ```
+
+Provisioning and lookup stay separate calls rather than one convenience
+constructor: a host that pre-seeds its databases, or mounts them read-only,
+skips the first line entirely.
 
 ### Provisioning only
 
@@ -74,12 +80,13 @@ MMDB itself, say -- wants the download half and nothing more:
 factbook = { version = "0.1", default-features = false, features = ["geoip-download"] }
 ```
 
-```rust
-use factbook::geoip::{ensure_databases, GeoIpConfig};
+```rust,no_run
+use factbook::geoip::{GeoIpConfig, ensure_databases};
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let paths = ensure_databases(&GeoIpConfig::default()).await?;
-// `paths.city` and `paths.asn` are now on disk and fresh.
+let databases = ensure_databases(&GeoIpConfig::default()).await?;
+// `databases.city` and `databases.asn` each carry the files that landed and
+// the format they arrived in.
 # Ok(())
 # }
 ```
@@ -148,7 +155,7 @@ bans you is worse than one you never added.
 The default client is plain rustls. A deployment behind a proxy, or one that
 trusts a private CA, passes its own configured `reqwest::Client` instead:
 
-```rust
+```rust,no_run
 use factbook::geoip::GeoIpConfig;
 
 # fn example(configured: reqwest::Client) {
@@ -160,27 +167,37 @@ An injected client is used exactly as it stands, timeouts included.
 
 ## Database providers and their licences
 
-The provider you choose carries an obligation, and it is not the same one in
-every case. This matters if you redistribute a product that ships a default.
+Choosing a provider takes on that provider's obligation, and they differ. The
+obligation falls on whoever deploys and queries the data, because factbook
+downloads at runtime and distributes nothing itself.
 
-| provider | tier | databases | format | licence |
-|---|---|---|---|---|
-| `db_ip` | free (DB-IP Lite) | city, ASN | MMDB | CC BY 4.0 -- **attribution required** |
-| `max_mind` | free (GeoLite2) | city, ASN | MMDB | MaxMind EULA -- account and licence key required |
-| `max_mind` | paid (GeoIP2) | city, ASN through GeoIP2-ISP | MMDB | MaxMind EULA -- account and licence key required |
-| `ip_info` | free (IPinfo Lite) | city | MMDB | IPinfo terms -- token required |
-| `sapics_db_ip_asn` | free | ASN | CSV | CC BY 4.0 -- **attribution required** |
-| `sapics_origin_asn` | free | ASN | CSV | PDDL -- public domain, no attribution |
+**Ask the code, not this table.** `factbook::geoip::source_terms(selection)`
+returns the licence, the attribution text, whether a logo is required, the
+publish cadence and any fetch ceiling for whatever a config selects, so a
+deployment can state its own obligations rather than relying on someone having
+read the docs.
+
+| provider | tier | databases | licence |
+|---|---|---|---|
+| `db_ip` | free (DB-IP Lite) | city, ASN | CC BY 4.0 -- **attribution required** |
+| `max_mind` | free (GeoLite2) | city, ASN | MaxMind EULA -- account and licence key |
+| `max_mind` | paid (GeoIP2) | city, ISP | MaxMind EULA -- account and licence key |
+| `ip_info` | free (IPinfo Lite) | city | CC BY-SA 4.0 -- token required |
+| `sapics_origin_asn` | free | ASN | PDDL -- public domain, no attribution |
+| `sapics_ip_to_asn` | free | ASN | PDDL -- public domain, no attribution |
+
+Every provider above publishes MMDB. sapics moved its distribution to GitHub
+release assets, which is why its files are single combined databases rather than
+the split CSV pairs its repository tree still holds.
 
 sapics republishes several upstreams and **the licence is per dataset, not per
-provider** -- its `dbip-*` sets carry DB-IP's attribution requirement, and only
-the `iptoasn`, `origin-asn` and `*-country` sets are attribution-free. Reading
-"sapics" as one licence is the mistake to avoid.
+provider**: its `dbip-*` sets carry DB-IP's attribution requirement, while
+`origin-asn` and `iptoasn-asn` are public domain. Reading "sapics" as one
+licence is the mistake to avoid, and it is why the two datasets are separate
+providers here rather than one with a switch.
 
-Note the format column: the sapics datasets are published as CSV, not MMDB, and
-as two files -- IPv4 and IPv6 -- so choosing one is also choosing a format and a
-file count. Every provisioned database reports its own `format`, so a consumer
-picks its reader from what it was handed.
+`sapics_origin_asn` is the better default of the two -- the same public-domain
+terms, wider coverage, and operator names rather than registry handles.
 
 ### Free and paid tiers
 
@@ -193,7 +210,7 @@ geoip:
     city:
       provider: max_mind
       tier: paid
-    asn: sapics_db_ip_asn
+    asn: sapics_origin_asn
 ```
 
 `factbook::geoip::validate` is the config-load check. A paid tier with no

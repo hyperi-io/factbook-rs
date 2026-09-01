@@ -29,11 +29,18 @@
 //!
 //! Nothing here ships a database. Files are fetched at runtime from the
 //! provider you configure, under that provider's licence -- which differs by
-//! provider, and in two cases requires attribution. See the provider table in
-//! the README before shipping a default to someone else.
+//! provider, and in most cases requires attribution.
+//! [`geoip::source_terms`] reports what a given selection commits a deployer
+//! to, and is the authority the README's table defers to.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(unsafe_code)]
+// The README's examples are compiled by `cargo test`, so an API change that
+// outdates them fails the build rather than misleading a reader.
+#![cfg_attr(
+    all(doctest, feature = "geoip-download", feature = "geoip-lookup"),
+    doc = include_str!("../README.md")
+)]
 
 #[cfg(any(feature = "geoip-download", feature = "geoip-lookup"))]
 #[cfg_attr(

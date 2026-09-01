@@ -347,7 +347,10 @@ impl GeoIp {
     /// touched turns it into a single lookup.
     #[must_use]
     pub fn lookup_many(&self, ips: &[IpAddr]) -> Vec<Option<Arc<GeoIpRecord>>> {
-        let mut resolved: HashMap<IpAddr, Option<Arc<GeoIpRecord>>> = HashMap::new();
+        // Sized to the batch rather than grown into it: a flush of twenty
+        // thousand rows would otherwise rehash the map on the way up.
+        let mut resolved: HashMap<IpAddr, Option<Arc<GeoIpRecord>>> =
+            HashMap::with_capacity(ips.len());
         for &ip in ips {
             resolved.entry(ip).or_insert_with(|| self.lookup(ip));
         }

@@ -46,7 +46,8 @@ pub use config::{
 };
 #[cfg(feature = "geoip-download")]
 pub use download::{
-    Database, DatabaseFormat, Databases, GeoIpDownloadError, ensure_databases, validate,
+    Database, DatabaseFormat, Databases, GeoIpDownloadError, Obligation, SourceTerms,
+    ensure_databases, source_terms, validate,
 };
 
 #[cfg(feature = "geoip-lookup")]

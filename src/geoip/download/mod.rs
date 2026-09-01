@@ -43,6 +43,8 @@
 //! ```
 
 mod fetch;
+mod source;
+mod verify;
 
 use std::fs;
 use std::io;
@@ -52,9 +54,19 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use super::config::{GeoIpConfig, GeoIpProvider, ProviderChoice, ProviderSelection, ProviderTier};
-use crate::Secret;
-use fetch::{Archive, Credential, Transfer};
+use super::config::{GeoIpConfig, ProviderChoice, ProviderSelection};
+use fetch::Transfer;
+use source::SourceSpec;
+use verify::Guard;
+
+pub use source::{Obligation, SourceTerms, source_terms};
+
+// The provider selection and the transfer shapes are the table's inputs and
+// outputs, named here so the test module reaches them through this one.
+#[cfg(test)]
+use super::config::{GeoIpProvider, ProviderTier};
+#[cfg(test)]
+use fetch::{Archive, Credential};
 
 /// Seconds in a day, for the staleness comparison.
 const SECS_PER_DAY: u64 = 86_400;
@@ -165,6 +177,31 @@ pub enum GeoIpDownloadError {
         url: String,
         /// Seconds the provider asked for, when it said.
         retry_after_secs: Option<u64>,
+    },
+
+    /// The database parsed but answered nothing for the field it exists to
+    /// carry.
+    #[error("{path} resolved no {field} for any probe address")]
+    Unpopulated {
+        /// File that was being replaced.
+        path: String,
+        /// What a database of that kind exists to answer with.
+        field: &'static str,
+    },
+
+    /// The replacement is a fraction of the size of the copy already on disk.
+    #[error(
+        "{path} is {actual} bytes against the {existing} on disk, under the {floor_percent}% floor"
+    )]
+    Undersized {
+        /// File that was being replaced.
+        path: String,
+        /// Length of what arrived.
+        actual: u64,
+        /// Length of the copy it would have replaced.
+        existing: u64,
+        /// Floor the operator configured.
+        floor_percent: u8,
     },
 
     /// The body ended before the length the provider promised.
@@ -296,15 +333,15 @@ impl Kind {
 
     /// What this provider tier publishes for this kind.
     ///
+    /// Provisioning reads the selected row directly, so this is the declared
+    /// view the table's own tests assert against.
+    ///
     /// # Errors
     ///
     /// [`GeoIpDownloadError::UnsupportedTier`] when the tier is not modelled.
+    #[cfg(test)]
     fn spec(self, choice: ProviderChoice) -> Result<Option<DatabaseSpec>, GeoIpDownloadError> {
-        let (city, asn) = provider_files(choice)?;
-        Ok(match self {
-            Self::City => city,
-            Self::Asn => asn,
-        })
+        Ok(SourceSpec::select(choice, self)?.map(SourceSpec::database))
     }
 }
 
@@ -329,19 +366,17 @@ pub async fn ensure_databases(config: &GeoIpConfig) -> Result<Databases, GeoIpDo
         return Ok(Databases::default());
     }
 
-    let max_age_secs = u64::from(config.auto_download.max_age_days) * SECS_PER_DAY;
-
     // Sequential, not joined: two concurrent multi-hundred-megabyte transfers
     // would compete for the same link and the same disk.
     Ok(Databases {
-        city: resolve(Kind::City, config, max_age_secs).await,
-        asn: resolve(Kind::Asn, config, max_age_secs).await,
+        city: resolve(Kind::City, config).await,
+        asn: resolve(Kind::Asn, config).await,
     })
 }
 
 /// Resolve one database: an explicit path, else fresh files, else a download,
 /// else whatever stale copy is on disk.
-async fn resolve(kind: Kind, config: &GeoIpConfig, max_age_secs: u64) -> Option<Database> {
+async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
     // An explicit path bypasses the provider for this kind alone, and is
     // returned unchecked: the operator asserted the file exists. It is declared
     // MMDB because that is the format a single operator-supplied file takes.
@@ -353,14 +388,14 @@ async fn resolve(kind: Kind, config: &GeoIpConfig, max_age_secs: u64) -> Option<
     }
 
     let choice = kind.choice(config.provider);
-    let spec = match kind.spec(choice) {
-        Ok(spec) => spec?,
+    let source = match SourceSpec::select(choice, kind) {
+        Ok(source) => source?,
         Err(e) => {
             warn!(kind = kind.label(), error = %e, "GeoIP provider tier is not modelled");
             return None;
         }
     };
-    let database = spec.at(&config.auto_download.data_dir);
+    let database = source.database().at(&config.auto_download.data_dir);
 
     if !config.auto_download.enabled {
         return database
@@ -369,6 +404,10 @@ async fn resolve(kind: Kind, config: &GeoIpConfig, max_age_secs: u64) -> Option<
             .all(|file| file.exists())
             .then_some(database);
     }
+
+    // The provider's own publish rhythm is the freshness default, so a source
+    // under a contractual update duty is not left sitting on it.
+    let max_age_secs = source.staleness_window(&config.auto_download).as_secs();
 
     // A database is its whole file set, so one stale half re-downloads both.
     if database
@@ -407,71 +446,18 @@ async fn resolve(kind: Kind, config: &GeoIpConfig, max_age_secs: u64) -> Option<
 /// What one provider tier publishes, as `(city, asn)`. `None` means it
 /// publishes no database of that kind.
 ///
+/// The pairwise view of the table, which is what its tests assert against.
+///
 /// # Errors
 ///
 /// [`GeoIpDownloadError::UnsupportedTier`] for a tier this crate does not
 /// model. Those are gaps in verified provider facts, not statements that the
 /// tier does not exist.
+#[cfg(test)]
 fn provider_files(
     choice: ProviderChoice,
 ) -> Result<(Option<DatabaseSpec>, Option<DatabaseSpec>), GeoIpDownloadError> {
-    let mmdb = |names| {
-        Some(DatabaseSpec {
-            format: DatabaseFormat::Mmdb,
-            names,
-        })
-    };
-
-    let files = match (choice.provider, choice.tier) {
-        (GeoIpProvider::DbIp, ProviderTier::Free) => (
-            mmdb(&["dbip-city-lite.mmdb"][..]),
-            mmdb(&["dbip-asn-lite.mmdb"][..]),
-        ),
-        (GeoIpProvider::MaxMind, tier) => (
-            mmdb(maxmind_files(tier, Kind::City)),
-            mmdb(maxmind_files(tier, Kind::Asn)),
-        ),
-        (GeoIpProvider::IpInfo, ProviderTier::Free) => (mmdb(&["ipinfo-lite.mmdb"][..]), None),
-        (GeoIpProvider::SapicsOriginAsn, ProviderTier::Free) => {
-            (None, mmdb(&["origin-asn.mmdb"][..]))
-        }
-        (GeoIpProvider::SapicsIpToAsn, ProviderTier::Free) => {
-            (None, mmdb(&["iptoasn-asn.mmdb"][..]))
-        }
-        (GeoIpProvider::Custom, _) => (None, None),
-
-        (
-            GeoIpProvider::DbIp
-            | GeoIpProvider::IpInfo
-            | GeoIpProvider::SapicsOriginAsn
-            | GeoIpProvider::SapicsIpToAsn,
-            ProviderTier::Paid,
-        ) => return Err(unsupported_tier(choice)),
-    };
-
-    Ok(files)
-}
-
-/// Files a MaxMind tier publishes for one kind.
-///
-/// The paid line has no ASN database of its own: the ASN fields ship inside
-/// GeoIP2-ISP, which is the edition the paid ASN slot resolves to.
-const fn maxmind_files(tier: ProviderTier, kind: Kind) -> &'static [&'static str] {
-    match (tier, kind) {
-        (ProviderTier::Free, Kind::City) => &["GeoLite2-City.mmdb"],
-        (ProviderTier::Free, Kind::Asn) => &["GeoLite2-ASN.mmdb"],
-        (ProviderTier::Paid, Kind::City) => &["GeoIP2-City.mmdb"],
-        (ProviderTier::Paid, Kind::Asn) => &["GeoIP2-ISP.mmdb"],
-    }
-}
-
-/// The tier is real but its endpoints are not verified, so it is refused rather
-/// than guessed at.
-fn unsupported_tier(choice: ProviderChoice) -> GeoIpDownloadError {
-    GeoIpDownloadError::UnsupportedTier {
-        provider: format!("{:?}", choice.provider),
-        tier: choice.tier.label(),
-    }
+    Ok((Kind::City.spec(choice)?, Kind::Asn.spec(choice)?))
 }
 
 /// Check the configuration can be acted on, before anything is downloaded.
@@ -534,167 +520,32 @@ async fn download(kind: Kind, config: &GeoIpConfig) -> Result<Vec<PathBuf>, GeoI
         Duration::from_secs(config.auto_download.read_timeout_secs),
     )?;
 
+    // Resolved once for the whole database: the settings behind it cannot change
+    // between two files of one file set.
+    let guard = Guard::new(kind, &config.auto_download);
+
     let mut files = Vec::with_capacity(transfers.len());
     for transfer in transfers {
-        files.push(transfer.run(&client).await?);
+        files.push(transfer.run_guarded(&client, guard).await?);
     }
     Ok(files)
 }
 
-/// Map (provider, tier, kind) onto the transfers that fetch it.
+/// The transfers that fetch one database.
 ///
 /// Errors here are configuration faults -- a missing credential, an unmodelled
 /// tier, or a provider that does not publish this kind -- and cost no network
 /// round trip.
 fn plan(kind: Kind, config: &GeoIpConfig) -> Result<Vec<Transfer>, GeoIpDownloadError> {
-    let auto = &config.auto_download;
-    let dir = &auto.data_dir;
     let choice = kind.choice(config.provider);
-    let unavailable = || GeoIpDownloadError::NoDatabases {
-        provider: format!("{:?}", choice.provider),
-        kind: kind.label(),
+    let Some(source) = SourceSpec::select(choice, kind)? else {
+        return Err(GeoIpDownloadError::NoDatabases {
+            provider: choice.provider.label().to_string(),
+            kind: kind.label(),
+        });
     };
 
-    let transfers = match (choice.provider, choice.tier, kind) {
-        (GeoIpProvider::DbIp, ProviderTier::Free, _) => {
-            let (slug, file) = match kind {
-                Kind::City => ("city", "dbip-city-lite.mmdb"),
-                Kind::Asn => ("asn", "dbip-asn-lite.mmdb"),
-            };
-            // DB-IP dates the free files by month and does not publish the
-            // current month until some days into it, so the previous month --
-            // which is kept online -- is the fallback.
-            let now = chrono::Utc::now();
-            let previous = now.checked_sub_months(chrono::Months::new(1));
-            vec![Transfer {
-                url: dbip_url(slug, now),
-                fallback_url: previous.map(|month| dbip_url(slug, month)),
-                checksum_url: None,
-                dest: dir.join(file),
-                archive: Archive::Gzip,
-                format: DatabaseFormat::Mmdb,
-                credential: Credential::None,
-            }]
-        }
-
-        (GeoIpProvider::MaxMind, tier, _) => {
-            // Both lines download from the one endpoint under the one
-            // credential; only the edition id differs, and the file the tar
-            // carries is that id with the extension.
-            let member = maxmind_files(tier, kind)[0];
-            let edition = member.trim_end_matches(".mmdb");
-            vec![Transfer {
-                url: format!(
-                    "https://download.maxmind.com/geoip/databases/{edition}/download?suffix=tar.gz"
-                ),
-                fallback_url: None,
-                checksum_url: None,
-                dest: dir.join(member),
-                archive: Archive::TarGz { member },
-                format: DatabaseFormat::Mmdb,
-                credential: Credential::Basic {
-                    username: require(
-                        auto.maxmind_account_id.as_ref(),
-                        "MaxMind",
-                        "auto_download.maxmind_account_id",
-                    )?,
-                    password: require(
-                        auto.maxmind_license_key.as_ref(),
-                        "MaxMind",
-                        "auto_download.maxmind_license_key",
-                    )?,
-                    fields: "auto_download.maxmind_account_id and \
-                             auto_download.maxmind_license_key",
-                },
-            }]
-        }
-
-        (GeoIpProvider::IpInfo, ProviderTier::Free, Kind::City) => vec![Transfer {
-            url: "https://ipinfo.io/data/ipinfo_lite.mmdb".to_string(),
-            fallback_url: None,
-            checksum_url: None,
-            dest: dir.join("ipinfo-lite.mmdb"),
-            archive: Archive::Raw,
-            format: DatabaseFormat::Mmdb,
-            credential: Credential::QueryToken {
-                name: "token",
-                value: require(
-                    auto.ipinfo_token.as_ref(),
-                    "IpInfo",
-                    "auto_download.ipinfo_token",
-                )?,
-                fields: "auto_download.ipinfo_token",
-            },
-        }],
-
-        (GeoIpProvider::SapicsOriginAsn, ProviderTier::Free, Kind::Asn) => {
-            vec![sapics_transfer(dir, "origin-asn")]
-        }
-
-        (GeoIpProvider::SapicsIpToAsn, ProviderTier::Free, Kind::Asn) => {
-            vec![sapics_transfer(dir, "iptoasn-asn")]
-        }
-
-        // Providers that publish only one of the two kinds, plus Custom, which
-        // publishes neither -- its paths are supplied by the operator.
-        (GeoIpProvider::IpInfo, ProviderTier::Free, Kind::Asn)
-        | (
-            GeoIpProvider::SapicsOriginAsn | GeoIpProvider::SapicsIpToAsn,
-            ProviderTier::Free,
-            Kind::City,
-        )
-        | (GeoIpProvider::Custom, _, _) => return Err(unavailable()),
-
-        (
-            GeoIpProvider::DbIp
-            | GeoIpProvider::IpInfo
-            | GeoIpProvider::SapicsOriginAsn
-            | GeoIpProvider::SapicsIpToAsn,
-            ProviderTier::Paid,
-            _,
-        ) => return Err(unsupported_tier(choice)),
-    };
-
-    Ok(transfers)
-}
-
-/// URL of the DB-IP Lite file published for one month.
-fn dbip_url(slug: &str, month: chrono::DateTime<chrono::Utc>) -> String {
-    format!(
-        "https://download.db-ip.com/free/dbip-{slug}-lite-{}.mmdb.gz",
-        month.format("%Y-%m")
-    )
-}
-
-/// Transfer for one `sapics/ip-location-db` dataset.
-///
-/// The data moved out of the git tree into GitHub Releases, so the URL is the
-/// release asset rather than a path in the repository, and it is undated: the
-/// same URL always serves the current build. A digest is published beside it.
-fn sapics_transfer(dir: &Path, dataset: &str) -> Transfer {
-    const RELEASES: &str = "https://github.com/sapics/ip-location-db/releases/download";
-
-    let file = format!("{dataset}.mmdb");
-    Transfer {
-        url: format!("{RELEASES}/latest/{file}"),
-        fallback_url: None,
-        checksum_url: Some(format!("{RELEASES}/checksum/{file}.sha256")),
-        dest: dir.join(&file),
-        archive: Archive::Raw,
-        format: DatabaseFormat::Mmdb,
-        credential: Credential::None,
-    }
-}
-
-/// Fetch a required credential, naming the config field when it is absent.
-fn require(
-    value: Option<&Secret>,
-    provider: &'static str,
-    field: &'static str,
-) -> Result<Secret, GeoIpDownloadError> {
-    value
-        .cloned()
-        .ok_or(GeoIpDownloadError::MissingCredential { provider, field })
+    Ok(vec![source.transfer(&config.auto_download)?])
 }
 
 #[cfg(test)]
