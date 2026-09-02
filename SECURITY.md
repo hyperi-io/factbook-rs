@@ -41,6 +41,33 @@ With your permission, we will credit you for the discovery of confirmed
 vulnerabilities. We do not offer monetary bounties. We value and appreciate
 responsible disclosure regardless.
 
+## A database is trusted input
+
+factbook downloads reference databases from sources the deploying operator
+names, and then decodes whatever arrives. **Treat a database as trusted
+input, and the URL it comes from as part of your trust boundary.**
+
+A deliberately crafted MaxMind DB file can make a single lookup take
+unbounded time. The format's data section is a pointer graph, and the
+decoder follows pointers with a limit on nesting depth but not on how many
+values a record expands to. A file of a few hundred bytes can therefore
+describe a record with billions of leaves. We have measured a 624-byte file
+that stops a lookup returning at all, which takes the calling thread with it.
+
+What factbook bounds today: the map of unmodelled source fields on each
+record, at 512 fields and 64 KiB, enforced by stopping the decode as the
+limit is reached rather than after. That closes the memory exhaustion and
+most of the time cost.
+
+What it does not bound: the decode of the fields the record models by name,
+which walks the same pointer graph inside the `maxminddb` reader. A
+sufficiently deep crafted file still hangs a lookup there.
+
+So: fetch over TLS, from sources you have reason to trust, and check the
+published digest where a publisher offers one -- factbook verifies it for
+you when `checksum_url` is set. A compromised source or a hostile URL is not
+something the crate can defend you against on its own.
+
 ## Out of Scope
 
 The following are generally out of scope:

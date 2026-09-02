@@ -72,12 +72,14 @@ use super::record::GeoIpRecord;
 
 /// Addresses held in the cache by default.
 ///
-/// Enough to hold the working set of a busy feed. A record carries every field
-/// its databases wrote, so its size follows the source: a few hundred bytes on
-/// a lean ASN table, and two to four kilobytes on a city build whose records
-/// carry geoname ids, confidence scores and names in eight languages. At this
-/// capacity that is tens of megabytes at the low end and a few hundred at the
-/// high one, against a database of 10 to 120 MB.
+/// Enough to hold the working set of a busy feed. What an entry costs follows
+/// the source and how much of it is kept: a few hundred bytes on a lean ASN
+/// table, and two to four kilobytes on a city build whose records carry geoname
+/// ids, confidence scores and names in eight languages. At this capacity that is
+/// tens of megabytes at the low end and a few hundred at the high one, against a
+/// database of 10 to 120 MB.
+/// [`collect_extra_fields`](CacheConfig::collect_extra_fields) is what moves an
+/// entry between those two ends.
 const DEFAULT_CAPACITY: usize = 100_000;
 
 /// Errors raised while opening or refreshing the databases.
@@ -118,7 +120,8 @@ pub enum GeoIpLookupError {
     },
 }
 
-/// How the lookup side is set up: the cache, and how a database is held.
+/// How the lookup side is set up: the cache, how a database is held, and how
+/// much of a record is kept.
 ///
 /// The cache knobs stop here on purpose. Shard count, ghost-queue allocation,
 /// weighers, eviction listeners and hashers are the cache implementation's
@@ -146,6 +149,23 @@ pub struct CacheConfig {
     /// own size either way -- what changes is whether a lookup can stall.
     /// Zero maps every database.
     pub resident_max_bytes: u64,
+
+    /// Keep the source fields no typed field names, in
+    /// [`extra`](GeoIpRecord::extra).
+    ///
+    /// On by default: a database holds more than the record names -- an ISP
+    /// edition's `isp` and `organization`, a city build's geoname ids,
+    /// confidence scores and names in eight languages -- and dropping them
+    /// enriches from part of the source rather than from all of it.
+    ///
+    /// Turn it off where the cache costs more than those fields are worth. They
+    /// are what takes an entry from a few hundred bytes to two to four
+    /// kilobytes, so at [`capacity`](Self::capacity) they are the difference
+    /// between tens of megabytes of cache and a few hundred. Off, the fields are
+    /// never read rather than read and dropped, so the second record decode is
+    /// saved along with the memory. The typed fields resolve the same either
+    /// way.
+    pub collect_extra_fields: bool,
 }
 
 impl Default for CacheConfig {
@@ -154,6 +174,7 @@ impl Default for CacheConfig {
             capacity: DEFAULT_CAPACITY,
             max_age: None,
             resident_max_bytes: DEFAULT_RESIDENT_MAX_BYTES,
+            collect_extra_fields: true,
         }
     }
 }
@@ -269,6 +290,8 @@ pub(super) struct Inner {
     max_age: Option<Duration>,
     /// Ceiling under which a reopened database is read into memory.
     pub(super) resident_max_bytes: u64,
+    /// Whether a miss keeps the source fields no typed field names.
+    collect_extra_fields: bool,
 }
 
 impl Inner {
@@ -372,6 +395,7 @@ impl GeoIp {
                 }),
                 max_age: cache.max_age,
                 resident_max_bytes: cache.resident_max_bytes,
+                collect_extra_fields: cache.collect_extra_fields,
             }),
         })
     }
@@ -525,7 +549,7 @@ impl GeoIp {
             // Stamped even when no age limit is set: an unconditional clock read
             // on the miss path is far below the cost of the read it accompanies.
             loaded: Instant::now(),
-            record: read(&readers, ip).map(Arc::new),
+            record: read(&readers, ip, self.inner.collect_extra_fields).map(Arc::new),
         }
     }
 
@@ -555,7 +579,7 @@ impl fmt::Debug for GeoIp {
 /// Returns `None` when neither held it, which the cache stores as the negative
 /// answer. Both are read even when the first answers: they are different
 /// databases and the ASN one routinely holds an address the city one does not.
-fn read(readers: &Readers, ip: IpAddr) -> Option<GeoIpRecord> {
+fn read(readers: &Readers, ip: IpAddr, collect_extra: bool) -> Option<GeoIpRecord> {
     let mut record = GeoIpRecord::default();
     let mut found = false;
 
@@ -563,14 +587,14 @@ fn read(readers: &Readers, ip: IpAddr) -> Option<GeoIpRecord> {
     // the traversal itself stays monomorphic.
     if let Some(backing) = readers.city.as_deref() {
         found |= match backing {
-            Backing::Resident(reader) => read_city(reader, ip, &mut record),
-            Backing::Mapped(reader) => read_city(reader, ip, &mut record),
+            Backing::Resident(reader) => read_city(reader, ip, &mut record, collect_extra),
+            Backing::Mapped(reader) => read_city(reader, ip, &mut record, collect_extra),
         };
     }
     if let Some(backing) = readers.asn.as_deref() {
         found |= match backing {
-            Backing::Resident(reader) => read_asn(reader, ip, &mut record),
-            Backing::Mapped(reader) => read_asn(reader, ip, &mut record),
+            Backing::Resident(reader) => read_asn(reader, ip, &mut record, collect_extra),
+            Backing::Mapped(reader) => read_asn(reader, ip, &mut record, collect_extra),
         };
     }
 
@@ -611,7 +635,12 @@ pub(super) fn asn_number(text: &str) -> Option<u32> {
 }
 
 /// Fill the fields an IPinfo database carries, location and network together.
-fn read_ipinfo<S: AsRef<[u8]>>(reader: &Reader<S>, ip: IpAddr, record: &mut GeoIpRecord) -> bool {
+fn read_ipinfo<S: AsRef<[u8]>>(
+    reader: &Reader<S>,
+    ip: IpAddr,
+    record: &mut GeoIpRecord,
+    collect_extra: bool,
+) -> bool {
     let Some(result) = lookup_in(reader, ip, "ipinfo") else {
         return false;
     };
@@ -637,15 +666,22 @@ fn read_ipinfo<S: AsRef<[u8]>>(reader: &Reader<S>, ip: IpAddr, record: &mut GeoI
     record.asn_network = network;
 
     // Collected last, so the typed fields it is filtered against are set.
-    extra::collect(&result, record);
+    if collect_extra {
+        extra::collect(&result, record);
+    }
 
     true
 }
 
 /// Fill the location fields, reporting whether the database held the address.
-fn read_city<S: AsRef<[u8]>>(reader: &Reader<S>, ip: IpAddr, record: &mut GeoIpRecord) -> bool {
+fn read_city<S: AsRef<[u8]>>(
+    reader: &Reader<S>,
+    ip: IpAddr,
+    record: &mut GeoIpRecord,
+    collect_extra: bool,
+) -> bool {
     if is_ipinfo(reader) {
-        return read_ipinfo(reader, ip, record);
+        return read_ipinfo(reader, ip, record, collect_extra);
     }
 
     let Some(result) = lookup_in(reader, ip, "city") else {
@@ -683,15 +719,22 @@ fn read_city<S: AsRef<[u8]>>(reader: &Reader<S>, ip: IpAddr, record: &mut GeoIpR
     record.accuracy_radius = city.location.accuracy_radius;
     record.network = network_of(&result);
 
-    extra::collect(&result, record);
+    if collect_extra {
+        extra::collect(&result, record);
+    }
 
     true
 }
 
 /// Fill the ASN fields, reporting whether the database held the address.
-fn read_asn<S: AsRef<[u8]>>(reader: &Reader<S>, ip: IpAddr, record: &mut GeoIpRecord) -> bool {
+fn read_asn<S: AsRef<[u8]>>(
+    reader: &Reader<S>,
+    ip: IpAddr,
+    record: &mut GeoIpRecord,
+    collect_extra: bool,
+) -> bool {
     if is_ipinfo(reader) {
-        return read_ipinfo(reader, ip, record);
+        return read_ipinfo(reader, ip, record, collect_extra);
     }
 
     let Some(result) = lookup_in(reader, ip, "asn") else {
@@ -711,7 +754,9 @@ fn read_asn<S: AsRef<[u8]>>(reader: &Reader<S>, ip: IpAddr, record: &mut GeoIpRe
         asn.autonomous_system_organization.map(CompactString::from);
     record.asn_network = network_of(&result);
 
-    extra::collect(&result, record);
+    if collect_extra {
+        extra::collect(&result, record);
+    }
 
     true
 }
@@ -986,7 +1031,7 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::geoip::ExtraValue;
+    use crate::geoip::{ExtraFields, ExtraValue};
 
     /// A database in MaxMind's City schema, built by scripts/make_fixtures.py.
     const CITY_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/city-test.mmdb");
@@ -1798,6 +1843,110 @@ mod tests {
 
         let boxford = geoip.lookup(ip(BOXFORD)).unwrap();
         assert_eq!(extra_str(&boxford, "traits.user_type"), "residential");
+    }
+
+    /// The lookup settings with the source fields dropped.
+    fn without_extras() -> CacheConfig {
+        CacheConfig {
+            collect_extra_fields: false,
+            ..CacheConfig::default()
+        }
+    }
+
+    /// An enricher over the given databases, keeping no source fields.
+    fn lean(paths: DatabasePaths<'_>) -> GeoIp {
+        GeoIp::open(paths, without_extras()).unwrap()
+    }
+
+    #[test]
+    fn the_source_fields_are_kept_unless_the_setting_says_otherwise() {
+        // The stated requirement is enrichment from everything the source
+        // supplies, so an unconfigured deployment gets all of it.
+        assert!(CacheConfig::default().collect_extra_fields);
+    }
+
+    #[test]
+    fn the_source_fields_are_dropped_when_collection_is_off() {
+        let rich = city_rich().lookup(ip(BOXFORD)).unwrap();
+        let lean = lean(DatabasePaths::city_only(Path::new(CITY_RICH_DB)))
+            .lookup(ip(BOXFORD))
+            .unwrap();
+
+        // The same database, the same address, and the map is the whole
+        // difference between the two answers.
+        assert!(!rich.extra.is_empty());
+        assert!(lean.extra.is_empty(), "{:?}", lean.extra);
+
+        let mut typed_only = (*rich).clone();
+        typed_only.extra = ExtraFields::new();
+        assert_eq!(typed_only, *lean);
+    }
+
+    #[test]
+    fn the_typed_fields_resolve_with_collection_off() {
+        let record = lean(DatabasePaths::city_only(Path::new(CITY_RICH_DB)))
+            .lookup(ip(BOXFORD))
+            .unwrap();
+
+        assert_eq!(record.city_name.as_deref(), Some("Boxford"));
+        assert_eq!(record.continent_name.as_deref(), Some("Europe"));
+        assert_eq!(record.country_code.as_deref(), Some("GB"));
+        // The last subdivision still wins, which is a decision the typed decode
+        // makes over an array the map is no longer holding.
+        assert_eq!(record.region_name.as_deref(), Some("West Berkshire"));
+        assert_eq!(record.region_code.as_deref(), Some("WBK"));
+        assert_eq!(record.postal_code.as_deref(), Some("OX1"));
+        assert_eq!(record.timezone.as_deref(), Some("Europe/London"));
+        assert_eq!(record.accuracy_radius, Some(100));
+        assert_eq!(record.network.as_deref(), Some("2.125.160.216/29"));
+        assert!(record.extra.is_empty());
+    }
+
+    #[test]
+    fn the_asn_half_drops_its_fields_and_keeps_its_typed_ones() {
+        let geoip = lean(DatabasePaths::asn_only(Path::new(ISP_DB)));
+        let record = geoip.lookup(ip("1.0.0.1")).unwrap();
+
+        // The paid edition's own fields are what the setting gives up.
+        assert!(record.extra.is_empty(), "{:?}", record.extra);
+        assert_eq!(record.autonomous_system_number, Some(15169));
+        assert_eq!(
+            record.autonomous_system_organization.as_deref(),
+            Some("Google Inc.")
+        );
+        assert_eq!(record.asn_network.as_deref(), Some("1.0.0.0/24"));
+    }
+
+    #[test]
+    fn an_ipinfo_database_answers_with_collection_off() {
+        let geoip = lean(DatabasePaths::city_only(Path::new(IPINFO_DB)));
+        let record = geoip.lookup(ip("8.8.8.8")).unwrap();
+
+        assert_eq!(record.country_code.as_deref(), Some("US"));
+        assert_eq!(record.autonomous_system_number, Some(15169));
+        assert_eq!(record.as_domain.as_deref(), Some("google.com"));
+        assert!(record.extra.is_empty());
+    }
+
+    #[test]
+    fn neither_database_contributes_a_field_when_collection_is_off() {
+        let geoip = lean(DatabasePaths {
+            city: Some(Path::new(CITY_RICH_DB)),
+            asn: Some(Path::new(ISP_DB)),
+        });
+
+        // Both halves are read for both addresses, so this covers the city path
+        // and the ASN path answering into one record.
+        let linkoping = geoip.lookup(ip(LINKOPING)).unwrap();
+        assert_eq!(
+            linkoping.autonomous_system_organization.as_deref(),
+            Some("Bredband2 AB")
+        );
+        assert!(linkoping.extra.is_empty(), "{:?}", linkoping.extra);
+
+        let boxford = geoip.lookup(ip(BOXFORD)).unwrap();
+        assert_eq!(boxford.city_name.as_deref(), Some("Boxford"));
+        assert!(boxford.extra.is_empty(), "{:?}", boxford.extra);
     }
 
     #[cfg(feature = "geoip-download")]

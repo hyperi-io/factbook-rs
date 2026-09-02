@@ -37,7 +37,7 @@ Setting a path bypasses the provider for that half only. The other half still pr
 | `verify_content` | bool | `true` | Check that a download is the kind of thing it claims to be |
 | `min_size_percent` | u8 | `50` | Refuse a replacement below this fraction of the copy on disk. Zero disables the floor |
 | `age_from_source` | bool | `true` | Report database age from the publisher's build stamp rather than the local write time. Metric only; freshness still counts from the write |
-| `resident_max_bytes` | u64 | `134217728` | Read a database this size or smaller onto the heap when it is opened; map a larger one. Zero maps everything |
+| `resident_max_bytes` | u64 | `134217728` | Read a database this size or smaller onto the heap when it is opened; map a larger one. Zero maps everything. A table source that outgrows it is refused, below |
 
 A geo provider reads `max_age_days` against its own published cadence: the window is that cadence, shortened by this ceiling, then floored at whatever minimum interval between fetches the provider's row states. MaxMind and IPinfo state one day, which is what their download caps allow. DB-IP and sapics state none, so nothing floors the ceiling there.
 
@@ -65,8 +65,13 @@ Held separately from provisioning, because a deployment that pre-seeds its datab
 |---|---|---|---|
 | `capacity` | usize | `100_000` | Addresses held before eviction starts. A ceiling, not a reservation |
 | `max_age` | duration | unset | How long a cached answer stays usable |
+| `collect_extra_fields` | bool | `true` | Keep the source fields the record has no named field for. Off is what makes a cached entry small |
 
 Leave `max_age` unset. An answer only goes stale when the file behind it changes, and a reader swap clears the cache, so a time limit evicts correct answers early and still leaves a window that clearing does not.
+
+`collect_extra_fields` decides what an entry costs. A database holds more than the record names -- an ISP edition's `isp` and `organization`, a city build's geoname ids, confidence scores and names in eight languages -- and on, all of it is kept under the path it sits at in the source. That takes an entry from a few hundred bytes on a lean ASN table to two to four kilobytes on a rich city build, so at the default capacity it is the difference between tens of megabytes of cache and a few hundred.
+
+Off, those fields are never read rather than read and dropped, so it saves the decode as well as the memory. The typed fields resolve the same either way, which is what makes this a trade of fields for cache and nothing else. It stays on by default because enriching from everything the source supplies is the point of the crate, and a default that silently dropped fields would undercut it.
 
 ## Table sources
 
@@ -119,6 +124,16 @@ index: prefix
 ```
 
 The column is found the same way `ip` finds one -- a conventional name (`prefix`, `network`, `cidr`, `range`, `subnet`) is preferred, and a source using none is sampled instead. Name it with `index: {column: ...}` when neither works.
+
+### A table that will not fit is refused
+
+A geo database is already in the format the reader reads, so `resident_max_bytes` only decides how it is opened. A table source is a CSV or a JSON document, and holding one costs several times the file it came from -- so the same key decides something bigger for a table: whether it can be held at all.
+
+If it loads into memory it is used. If it does not, `Table::ensure` returns `OverResidentCeiling` and the table does not load. Raise the ceiling, or point the source at less data.
+
+Whether a source fits is not knowable before it is read. An encoding, a quoting style and a column count all move the answer, and the file size on disk does not. So the ceiling is **hit rather than predicted**: the read fills memory, stops the moment it crosses `resident_max_bytes`, and releases everything it had taken as it fails. A CSV stops on a record and a JSON array on an element, so neither reader's peak is set by the file -- the refusal is early and cheap rather than an allocation failure at the end of one.
+
+Writing an oversized source out as a MaxMind DB and serving it from there is future work, tracked as issue #2. Until it lands there is no fallback, and nothing here pretends otherwise.
 
 ### How the formats differ on a bad row
 

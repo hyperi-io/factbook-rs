@@ -59,6 +59,45 @@ fn from_csv(body: &str, index: &Index) -> Result<Table, TableError> {
     )
 }
 
+/// One column of every row, as owned text.
+///
+/// A row is handed back rather than borrowed from the table, so a value read out
+/// of it has to be taken before the row is dropped.
+fn column(rows: Rows<'_>, name: &str) -> Vec<String> {
+    rows.map(|row| row.get(name).unwrap_or_default().to_string())
+        .collect()
+}
+
+/// A source read out of the data directory and never fetched.
+fn local(name: &str) -> TableSource {
+    TableSource::new(
+        format!("https://example.net/{name}"),
+        name,
+        TableFormat::Csv { header: true },
+        Index::Column("asn".to_string()),
+    )
+}
+
+/// Settings reading `dir` and downloading nothing.
+fn offline(dir: &Path) -> AutoDownloadConfig {
+    AutoDownloadConfig {
+        enabled: false,
+        data_dir: dir.to_path_buf(),
+        ..Default::default()
+    }
+}
+
+/// A CSV of `rows` numbered operators, big enough to run past a small ceiling.
+fn operators(rows: u32) -> String {
+    use std::fmt::Write as _;
+
+    (0..rows).fold(String::from("asn,name\n"), |mut body, at| {
+        let asn = 64_500 + at;
+        let _ = writeln!(body, "{asn},OPERATOR-{asn}");
+        body
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Indexing and lookup
 // ---------------------------------------------------------------------------
@@ -108,8 +147,8 @@ fn a_repeated_key_keeps_every_row() {
     let body = "asn,prefix\n13335,1.1.1.0/24\n13335,1.0.0.0/24\n";
     let table = from_csv(body, &Index::Column("asn".to_string())).unwrap();
 
-    let prefixes: Vec<Option<&str>> = table.all("13335").map(|row| row.get("prefix")).collect();
-    assert_eq!(prefixes, [Some("1.1.1.0/24"), Some("1.0.0.0/24")]);
+    let prefixes = column(table.all("13335"), "prefix");
+    assert_eq!(prefixes, ["1.1.1.0/24", "1.0.0.0/24"]);
 
     // The first is what a single-answer lookup gets.
     assert_eq!(
@@ -122,10 +161,9 @@ fn a_repeated_key_keeps_every_row() {
 #[test]
 fn rows_are_kept_in_file_order() {
     let table = from_csv(NETWORKS, &Index::Column("asn".to_string())).unwrap();
-    let names: Vec<Option<&str>> = table.rows().map(|row| row.get("name")).collect();
 
-    assert_eq!(names, [Some("CLOUDFLARENET"), Some("GOOGLE")]);
-    assert_eq!(table.rows().len(), 2);
+    assert_eq!(column(table.rows(), "name"), ["CLOUDFLARENET", "GOOGLE"]);
+    assert_eq!(table.rows().count(), 2);
 }
 
 #[test]
@@ -324,7 +362,7 @@ fn a_row_with_no_key_is_kept_and_unreachable() {
 
     assert_eq!(table.len(), 2);
     assert_eq!(table.rows().next().unwrap().get("name"), Some("ORPHAN"));
-    assert_eq!(table.get("").map(|row| row.get("name")), None);
+    assert!(table.get("").is_none());
 }
 
 #[test]
@@ -793,4 +831,87 @@ async fn a_schema_that_names_its_columns_refuses_a_file_of_another_width() {
     source.schema = Schema::Auto;
     let table = Table::ensure(&source, &auto(dir.path())).await.unwrap();
     assert_eq!(table.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Held in memory, or refused
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_read_stops_at_the_ceiling_rather_than_reading_to_the_end() {
+    // A quoting fault the reader refuses the instant it meets it, past the row
+    // the ceiling is reached on. Reporting it would mean the whole file had
+    // been read, which is the memory the ceiling exists not to spend.
+    let mut body = operators(200);
+    body.push_str("64999,\"OPERATOR\" LTD\n");
+
+    let stopped = parse::read(
+        body.as_bytes(),
+        TableFormat::Csv { header: true },
+        &Schema::Auto,
+        512,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(stopped, TableError::OverResidentCeiling { ceiling: 512 }),
+        "{stopped:?}"
+    );
+
+    // Unbounded, the same body reaches that row, so it is the ceiling doing the
+    // stopping rather than anything about the file.
+    let read_out = parse::read(
+        body.as_bytes(),
+        TableFormat::Csv { header: true },
+        &Schema::Auto,
+        u64::MAX,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(read_out, TableError::Malformed { .. }),
+        "{read_out:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_table_that_fits_is_held_in_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("networks.csv"), NETWORKS).unwrap();
+
+    let table = Table::ensure(&local("networks.csv"), &offline(dir.path()))
+        .await
+        .unwrap();
+
+    assert_eq!(table.backing(), TableBacking::Resident);
+    assert_eq!(
+        table.get("13335").unwrap().get("name"),
+        Some("CLOUDFLARENET")
+    );
+}
+
+#[tokio::test]
+async fn a_table_that_will_not_fit_is_refused_at_load() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("networks.csv"), operators(200)).unwrap();
+
+    let settings = AutoDownloadConfig {
+        resident_max_bytes: 512,
+        ..offline(dir.path())
+    };
+    let err = Table::ensure(&local("networks.csv"), &settings)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&err, TableError::OverResidentCeiling { ceiling } if *ceiling == 512),
+        "{err:?}"
+    );
+    // The refusal names the setting that decided it.
+    assert!(err.to_string().contains("resident_max_bytes"), "{err}");
+
+    // The same file loads with room for it, so it is the ceiling doing the
+    // refusing rather than anything about the source.
+    let table = Table::ensure(&local("networks.csv"), &offline(dir.path()))
+        .await
+        .unwrap();
+    assert_eq!(table.len(), 200);
 }

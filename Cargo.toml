@@ -60,7 +60,6 @@ geoip-download = [
     "dep:sha2",
     "dep:prefix-trie",
     "dep:ipnet",
-    "dep:maxminddb-writer",
 ]
 
 # Read and cache. A database is read into memory when it fits under the resident
@@ -72,6 +71,11 @@ geoip-lookup = [
     "dep:compact_str",
     "dep:arc-swap",
 ]
+
+# A `geoip-convert` feature belongs here once a table too large for the resident
+# ceiling is written out as a database rather than refused (#2). It is absent
+# rather than declared-and-inert: a feature that pulls the MMDB writer and
+# changes no behaviour is one a consumer cannot tell is doing nothing.
 
 # Download outcomes and the age of each database, through the `metrics` facade.
 #
@@ -86,7 +90,11 @@ metrics = ["dep:metrics"]
 # OFF by default, on measurement rather than principle: it costs three to four
 # times a cache hit, on the one path the crate exists to make fast. Take it when
 # you want cache behaviour visible and can pay for it.
-metrics-lookup = ["metrics"]
+#
+# It names the lookup half because the cache it instruments is there: taken
+# without it, every call site it would emit from is compiled out and the feature
+# silently measures nothing.
+metrics-lookup = ["metrics", "geoip-lookup"]
 
 # A `vrl` feature belongs here once a host actually needs a record mapped into
 # `vrl::value::ObjectMap`. It is absent rather than declared-and-empty: adding a
@@ -100,6 +108,13 @@ metrics-lookup = ["metrics"]
 name = "geoip_lookup"
 harness = false
 required-features = ["geoip-lookup"]
+
+# The resident table is the default backing and the one that has to stay cheap,
+# so what a row costs to hand back is measured rather than argued about.
+[[bench]]
+name = "table_lookup"
+harness = false
+required-features = ["geoip-download"]
 
 [dependencies]
 serde = { version = ">=1.0.228, <2", features = ["derive"] }
@@ -128,11 +143,6 @@ prefix-trie = { version = ">=0.10.1, <0.11", default-features = false, features 
 # The CIDR type and its parser, neither of which std has. Every one of its own
 # dependencies is optional, so it arrives on its own.
 ipnet = { version = ">=2.12.1, <3", default-features = false, optional = true }
-# Writes the format the reader already reads, so a source too large to hold in
-# memory becomes a prefix trie with a deduplicated data section. Its only
-# required dependencies are serde and thiserror, both already here.
-maxminddb-writer = { version = ">=0.1.2, <0.2", optional = true }
-
 # --- geoip-lookup ---
 # 0.30.3 (2026-08-24) is also what vector-vrl's bindings resolve to, so the
 # three DFE consumers converge on one reader rather than three.

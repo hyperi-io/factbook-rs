@@ -29,6 +29,32 @@
 //! an autonomous system number cannot. [`Table`] is the generic surface: it
 //! knows about columns and keys and nothing about geography.
 //!
+//! # A table is held in memory, or it is refused
+//!
+//! [`Table::ensure`] reads the source into memory and serves it from there. A
+//! source that outgrows `resident_max_bytes` while it is being read is abandoned
+//! -- what it had taken is released, and the call fails with
+//! [`TableError::OverResidentCeiling`] rather than holding a table the
+//! deployment said it did not want held.
+//!
+//! The ceiling is hit, never predicted. Whether a source fits is not knowable
+//! from its size on disk: an encoding, a quoting style and a column count all
+//! move the answer.
+//!
+//! Refusing is the whole of it. Writing an oversized source out as a MaxMind DB
+//! and serving it from there is future work, tracked as issue #2.
+//!
+//! # One key, or several conditions
+//!
+//! [`Table::get`] and [`Table::all`] answer the enrichment question -- what is
+//! filed under this key -- in a hash lookup and a hand-back. That is the common
+//! case and the fast one.
+//!
+//! A host whose lookups arrive as condition objects asks something else: the
+//! rows where country is `AU` and status is `active`. [`Table::find`] takes a
+//! [`Query`] of those conditions, and an equality on the indexed column still
+//! reaches the index rather than walking the table.
+//!
 //! # Example
 //!
 //! ```yaml
@@ -63,15 +89,7 @@
 
 mod config;
 mod parse;
-
-// A text key has no address to be filed under, so it is hashed into one. That
-// needs the writer, which in turn needs the reader that checks what it wrote.
-#[cfg(feature = "geoip-lookup")]
-#[allow(
-    dead_code,
-    reason = "the conversion is verified ahead of the call site that will use it"
-)]
-mod hashed;
+mod query;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -96,6 +114,7 @@ use parse::Parsed;
 
 pub use config::{Index, Schema, SourceArchive, TableFormat, TableSource};
 pub(crate) use parse::probe;
+pub use query::{Condition, Fields, Matched, Matches, Query};
 
 /// Column names an [`Index::Ip`] source is likely to have written, lowercase.
 const ADDRESS_COLUMNS: [&str; 5] = ["ip", "ip_address", "ipaddress", "address", "addr"];
@@ -190,20 +209,73 @@ pub enum TableError {
         /// Columns the source actually has.
         columns: String,
     },
+
+    /// The rows outgrew the memory the source was given.
+    ///
+    /// The read stops here rather than finishing: a source too large for
+    /// `resident_max_bytes` is refused, and there is nowhere else for it to go.
+    /// Writing one out as a database and serving it from there is future work.
+    #[error(
+        "the table outgrew the {ceiling}-byte resident ceiling; raise \
+         auto_download.resident_max_bytes or point the source at less data"
+    )]
+    OverResidentCeiling {
+        /// Ceiling the read was given, in bytes.
+        ceiling: u64,
+    },
+}
+
+/// Where a table's rows are held.
+///
+/// One backing today. A source that will not fit in memory is refused rather
+/// than moved anywhere else, so this reports rather than chooses -- and it is
+/// what a metrics recorder reads to see that a table loaded at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TableBacking {
+    /// Read into memory when the table was loaded.
+    Resident,
+}
+
+impl TableBacking {
+    /// Label used in metric series and log fields.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Resident => "resident",
+        }
+    }
 }
 
 /// How the rows of a table are reached.
+///
+/// The address and prefix kinds carry the rows their index could not file --
+/// a key cell that is there and does not parse. Those rows are unreachable by
+/// address and still reachable by the text they hold, so a
+/// [`Query`](query::Query) narrowed by the index walks them as well.
 #[derive(Debug)]
 enum Keys {
     /// Filed under the text of a column.
     Text(HashMap<Box<str>, Vec<usize>>),
 
     /// Filed under a parsed address.
-    Address(HashMap<IpAddr, Vec<usize>>),
+    Address {
+        /// Rows, by the address their key cell parsed to.
+        filed: HashMap<IpAddr, Vec<usize>>,
+
+        /// Rows whose key cell is there and is not an address.
+        unindexed: Vec<usize>,
+    },
 
     /// Filed under a CIDR range, reached by the longest one containing an
     /// address.
-    Prefix(Box<JointPrefixMap<IpNet, Vec<usize>>>),
+    Prefix {
+        /// Rows, by the range their key cell parsed to.
+        filed: Box<JointPrefixMap<IpNet, Vec<usize>>>,
+
+        /// Rows whose key cell is there and is not a range.
+        unindexed: Vec<usize>,
+    },
 }
 
 /// A tabular source, in memory and indexed.
@@ -252,10 +324,16 @@ impl Table {
     /// that copy, because a stale table answers most lookups and no table
     /// answers none.
     ///
+    /// Reading is not. The rows are held to `auto.resident_max_bytes`, and a
+    /// source that outgrows it is abandoned mid-read and refused -- there is
+    /// nowhere else for a table to be served from, so a ceiling it crosses is
+    /// the end of the load rather than a switch to something slower.
+    ///
     /// # Errors
     ///
     /// [`TableError::Fetch`] when the download fails and there is no local copy
-    /// to fall back to, or any of the read errors of [`Table::load`].
+    /// to fall back to, [`TableError::OverResidentCeiling`] when the source will
+    /// not fit, or any of the read errors of [`Table::load`].
     pub async fn ensure(
         source: &TableSource,
         auto: &AutoDownloadConfig,
@@ -290,10 +368,23 @@ impl Table {
             }
         }
 
-        Self::load(&dest, source.format, &source.schema, &source.index)
+        let reader = BufReader::new(fs::File::open(&dest)?);
+        let parsed = parse::read(
+            reader,
+            source.format,
+            &source.schema,
+            auto.resident_max_bytes,
+        )?;
+        let table = Self::build(parsed, &source.index)?;
+
+        telemetry::backing(&source.file, table.backing());
+        Ok(table)
     }
 
     /// Read a table off disk.
+    ///
+    /// Held in memory whatever its size. The ceiling belongs to
+    /// [`Table::ensure`], which is the call that reads the setting.
     ///
     /// # Errors
     ///
@@ -322,7 +413,7 @@ impl Table {
         schema: &Schema,
         index: &Index,
     ) -> Result<Self, TableError> {
-        Self::build(parse::read(reader, format, schema)?, index)
+        Self::build(parse::read(reader, format, schema, u64::MAX)?, index)
     }
 
     /// Column names, in the order a row's cells are stored.
@@ -348,7 +439,16 @@ impl Table {
     /// [`get`](Self::get). This is how a caller tells the two apart.
     #[must_use]
     pub const fn keyed_by_address(&self) -> bool {
-        matches!(self.keys, Keys::Address(_) | Keys::Prefix(_))
+        matches!(self.keys, Keys::Address { .. } | Keys::Prefix { .. })
+    }
+
+    /// Where the rows are held.
+    ///
+    /// One answer today, and reported rather than configured. The same answer
+    /// reaches a metrics recorder as `enrichment_table_backing`.
+    #[must_use]
+    pub const fn backing(&self) -> TableBacking {
+        TableBacking::Resident
     }
 
     /// How many rows the table holds.
@@ -448,25 +548,40 @@ impl Table {
             }
             Index::Ip => {
                 let mut filed: HashMap<IpAddr, Vec<usize>> = HashMap::new();
+                let mut unindexed = Vec::new();
                 for (at, row) in rows.iter().enumerate() {
-                    if let Some(address) = cell(row, key_column).and_then(as_address) {
+                    let Some(text) = cell(row, key_column) else {
+                        continue;
+                    };
+                    if let Some(address) = as_address(text) {
                         filed.entry(address).or_default().push(at);
                         reachable += 1;
+                    } else {
+                        unindexed.push(at);
                     }
                 }
-                Keys::Address(filed)
+                Keys::Address { filed, unindexed }
             }
             Index::Prefix => {
                 let mut filed: JointPrefixMap<IpNet, Vec<usize>> = JointPrefixMap::default();
+                let mut unindexed = Vec::new();
                 for (at, row) in rows.iter().enumerate() {
-                    if let Some(prefix) = cell(row, key_column).and_then(as_prefix) {
+                    let Some(text) = cell(row, key_column) else {
+                        continue;
+                    };
+                    if let Some(prefix) = as_prefix(text) {
                         // A repeated range keeps every row, the same as a
                         // repeated text key does.
                         filed.entry(prefix).or_default().push(at);
                         reachable += 1;
+                    } else {
+                        unindexed.push(at);
                     }
                 }
-                Keys::Prefix(Box::new(filed))
+                Keys::Prefix {
+                    filed: Box::new(filed),
+                    unindexed,
+                }
             }
         };
 
@@ -493,7 +608,7 @@ impl Table {
     fn positions_of(&self, key: &str) -> &[usize] {
         match &self.keys {
             Keys::Text(filed) => filed.get(key).map_or(NO_ROWS, Vec::as_slice),
-            Keys::Address(_) | Keys::Prefix(_) => NO_ROWS,
+            Keys::Address { .. } | Keys::Prefix { .. } => NO_ROWS,
         }
     }
 
@@ -504,8 +619,8 @@ impl Table {
     /// around it.
     fn positions_at(&self, address: IpAddr) -> &[usize] {
         match &self.keys {
-            Keys::Address(filed) => filed.get(&address).map_or(NO_ROWS, Vec::as_slice),
-            Keys::Prefix(filed) => filed
+            Keys::Address { filed, .. } => filed.get(&address).map_or(NO_ROWS, Vec::as_slice),
+            Keys::Prefix { filed, .. } => filed
                 .get_lpm(&IpNet::from(address))
                 .map_or(NO_ROWS, |(_, rows)| rows.as_slice()),
             Keys::Text(_) => NO_ROWS,
@@ -569,8 +684,7 @@ impl<'a> Row<'a> {
     /// The value under a column name.
     #[must_use]
     pub fn get(&self, column: &str) -> Option<&'a str> {
-        let at = self.table.columns.iter().position(|name| name == column)?;
-        self.at(at)
+        self.at(self.table.position_of(column)?)
     }
 
     /// The value at a column position.
@@ -724,6 +838,38 @@ fn keyed_column(
     }
 
     (0..columns.len()).find(|&at| holds(at))
+}
+
+/// The backing each table got, through the facade.
+///
+/// On the same footing as the enricher's own backing gauge: it is emitted once
+/// per table per load, so it costs nothing a lookup can feel.
+#[cfg(feature = "metrics")]
+mod telemetry {
+    use super::TableBacking;
+
+    /// Value of the `type` label on every series.
+    const TYPE: &str = "table";
+
+    /// Report where a loaded table's rows are.
+    pub(super) fn backing(file: &str, chosen: TableBacking) {
+        metrics::gauge!(
+            "enrichment_table_backing",
+            "type" => TYPE,
+            "file" => file.to_string(),
+            "backing" => chosen.label(),
+        )
+        .set(1.0);
+    }
+}
+
+/// Backing emission, compiled out.
+#[cfg(not(feature = "metrics"))]
+mod telemetry {
+    use super::TableBacking;
+
+    /// Report where a loaded table's rows are.
+    pub(super) const fn backing(_file: &str, _chosen: TableBacking) {}
 }
 
 #[cfg(test)]

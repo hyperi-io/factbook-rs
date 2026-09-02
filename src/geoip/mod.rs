@@ -31,7 +31,10 @@
 //!
 //! # Example
 //!
-//! ```rust,no_run
+// The example provisions, so it only compiles where the download half does.
+// Marked `ignore` otherwise: a lookup-only build has no `GeoIpConfig` to name.
+#![cfg_attr(feature = "geoip-download", doc = "```rust,no_run")]
+#![cfg_attr(not(feature = "geoip-download"), doc = "```ignore")]
 //! use factbook::geoip::{GeoIpConfig, ensure_databases};
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -61,6 +64,10 @@ mod private;
 mod record;
 #[cfg(feature = "geoip-lookup")]
 mod refresh;
+
+// One MaxMind DB encoder, shared by the two suites that build their own file.
+#[cfg(test)]
+mod mmdb_wire;
 
 #[cfg(feature = "geoip-download")]
 pub use config::{

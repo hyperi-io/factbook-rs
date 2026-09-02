@@ -1,18 +1,25 @@
 # factbook
 
+<!-- BADGES:START -->
+[![Build Status](https://github.com/hyperi-io/factbook-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/hyperi-io/factbook-rs/actions)
+[![Crates.io](https://img.shields.io/crates/v/factbook?logo=rust)](https://crates.io/crates/factbook)
+[![docs.rs](https://img.shields.io/docsrs/factbook?logo=rust)](https://docs.rs/factbook)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/hyperi-io/factbook-rs/blob/main/LICENSE)
+<!-- BADGES:END -->
+
+> Reference data is rarely what a system is built for, and costs a surprising
+> amount anyway. Someone writes a downloader. Someone writes a freshness check.
+> Someone discovers the provider answered 200 with a login page and quietly
+> overwrote a good database with 35 KB of HTML. Someone else notices the
+> enrichment table does a full traversal for a key that appears ten thousand
+> times a minute. Every service grows its own copy of all four.
+
 A high-speed, self-maintaining fact enricher for data at scale.
 
 Point it at reference data -- wherever it lives, in whatever shape it ships --
 and it fetches, verifies, indexes and serves it, keeping itself current without
 anyone tending it. Your hot path gets a lookup measured in nanoseconds against
 facts that were refreshed while it was running.
-
-Reference data is rarely what a system is built for, and costs a surprising
-amount anyway. Someone writes a downloader. Someone writes a freshness check.
-Someone discovers the provider answered 200 with a login page and quietly
-overwrote a good database with 35 KB of HTML. Someone else notices the
-enrichment table does a full traversal for a key that appears ten thousand times
-a minute. Every service grows its own copy of all four.
 
 **What people point it at:**
 
@@ -30,8 +37,8 @@ what your data means to keep it fresh and fast.
 
 ## Using it
 
-```toml
-factbook = "0.1"
+```console
+cargo add factbook
 ```
 
 ### GeoIP, with no account anywhere
@@ -96,8 +103,8 @@ skips the first line. A host running someone else's lookup engine -- a Vector
 process reading the MMDB itself, say -- takes the download half alone and pays
 for no reader:
 
-```toml
-factbook = { version = "0.1", default-features = false, features = ["geoip-download"] }
+```console
+cargo add factbook --no-default-features --features geoip-download
 ```
 
 ### A source you name yourself
@@ -149,6 +156,39 @@ schema:
 
 Unknown keys are an error rather than a silent default, so a misspelt `indx` is
 caught when the config loads rather than at the first fetch.
+
+**One key, or several conditions.** Enrichment asks what is filed under a key,
+and `get` answers that in a hash lookup. A host whose lookups arrive as
+condition objects asks something else -- the rows where every field matches at
+once -- and `find` takes the whole object. An equality on the indexed column
+still goes through the index rather than walking the table:
+
+```rust
+use factbook::table::{Condition, Index, Query, Schema, Table, TableFormat};
+
+# fn example() -> Result<(), factbook::table::TableError> {
+# let csv = "asn,name,country\n13335,CLOUDFLARENET,US\n15169,GOOGLE,US\n";
+# let table = Table::from_reader(
+#     csv.as_bytes(),
+#     TableFormat::Csv { header: true },
+#     &Schema::Auto,
+#     &Index::Column("asn".to_string()),
+# )?;
+let conditions = [
+    Condition::Equals { column: "asn", value: "13335" },
+    Condition::Equals { column: "country", value: "US" },
+];
+
+for matched in table.find(Query::new(&conditions)) {
+    println!("{:?}", matched.row().get("name"));
+}
+# Ok(())
+# }
+```
+
+Folded case, a wildcard value in the data that stands for "any", date ranges
+over a column holding dates, and a projection limiting which columns come back
+are settings on the query rather than four more methods.
 
 ## How it works
 

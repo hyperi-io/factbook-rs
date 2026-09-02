@@ -27,7 +27,10 @@
 //! carries geoname ids, confidence scores and names in eight languages. All of
 //! it lands in [`extra`](GeoIpRecord::extra), keyed by the path it sits at in
 //! the source record, so a paid edition or a new provider delivers its fields
-//! without this record being widened for them.
+//! without this record being widened for them. They are also what makes a record
+//! several kilobytes rather than a few hundred bytes, so a deployment weighing
+//! the cache against the fields drops them with
+//! [`collect_extra_fields`](super::CacheConfig::collect_extra_fields).
 
 use std::fmt;
 use std::slice;
@@ -40,6 +43,15 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Number of typed fields a record can carry, to size the schema map in one go.
 const TYPED_FIELDS: usize = 19;
+
+/// Entries reserved up front from a deserialiser's size hint.
+///
+/// A hint is what the encoding claims, not what it holds, and a re-read parses
+/// whatever a consumer hands back: a claim of sixteen million would otherwise be
+/// a sixteen-million-entry allocation before the first element is read. Honest
+/// maps larger than this still grow into place, so the clamp costs one or two
+/// reallocations on a record no provider publishes.
+const HINT_RESERVE: usize = 128;
 
 /// The answer for an address that cannot have a geolocation, built once and
 /// shared by every lookup that short-circuits.
@@ -188,7 +200,7 @@ impl<'de> Visitor<'de> for ExtraValueVisitor {
 
     /// JSON has no byte string, so a re-read arrives as a sequence of numbers.
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or_default());
+        let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or_default().min(HINT_RESERVE));
         while let Some(byte) = seq.next_element::<u8>()? {
             bytes.push(byte);
         }
@@ -293,7 +305,7 @@ impl<'de> Visitor<'de> for ExtraFieldsVisitor {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        let mut fields = Vec::with_capacity(map.size_hint().unwrap_or_default());
+        let mut fields = Vec::with_capacity(map.size_hint().unwrap_or_default().min(HINT_RESERVE));
         while let Some(entry) = map.next_entry::<CompactString, ExtraValue>()? {
             fields.push(entry);
         }

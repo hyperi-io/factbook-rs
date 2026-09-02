@@ -17,6 +17,12 @@ language: rust
 license: Apache-2.0
 quality:
   enabled: true
+  rust:
+    # A CVE in a dependency stops a release rather than logging a warning:
+    # this crate publishes publicly, so a warning nobody reads is not a gate.
+    # osv_scanner stays advisory because it overlaps audit and double-reports.
+    deny: blocking
+    audit: blocking
 test:
   enabled: true
   coverage: false

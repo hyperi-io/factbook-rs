@@ -10,10 +10,9 @@ By the end of this you will have downloaded two databases and resolved an addres
 
 ## Add the crate
 
-```toml
-[dependencies]
-factbook = "0.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```console
+cargo add factbook
+cargo add tokio --features macros,rt-multi-thread
 ```
 
 The default features cover both halves: fetching databases and answering from them.
@@ -113,14 +112,14 @@ BR-4402,Acetone,L,3
 
 A host running someone else's lookup engine wants the files kept fresh and nothing else:
 
-```toml
-factbook = { version = "0.1", default-features = false, features = ["geoip-download"] }
+```console
+cargo add factbook --no-default-features --features geoip-download
 ```
 
 A host whose databases arrive by some other route wants the reader and no HTTP client:
 
-```toml
-factbook = { version = "0.1", default-features = false, features = ["geoip-lookup"] }
+```console
+cargo add factbook --no-default-features --features geoip-lookup
 ```
 
 ## Verify a build

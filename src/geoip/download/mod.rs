@@ -48,15 +48,6 @@ pub(crate) mod fetch;
 pub(crate) mod source;
 pub(crate) mod verify;
 
-// Writing the format needs the reader that reads it: a conversion is refused
-// unless it reads back, and this crate's only reader is the lookup half.
-#[cfg(feature = "geoip-lookup")]
-#[allow(
-    dead_code,
-    reason = "the converter is verified ahead of the call site that will use it"
-)]
-pub(crate) mod mmdb;
-
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -465,12 +456,17 @@ pub async fn ensure_databases(config: &GeoIpConfig) -> Result<Databases, GeoIpDo
 /// Resolve one database: an explicit path, else fresh files, else a download,
 /// else whatever stale copy is on disk.
 async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
+    // Every path that answers reports the age of what it is about to serve.
+    let age = |files: &[PathBuf]| {
+        telemetry::age(kind.label(), files, config.auto_download.age_from_source);
+    };
+
     // An explicit path bypasses the provider for this kind alone, and is
     // returned unchecked: the operator asserted the file exists. It is declared
     // MMDB because that is the format a single operator-supplied file takes.
     if let Some(path) = kind.explicit_path(config) {
         let files = vec![path.clone()];
-        telemetry::age(kind.label(), &files, config.auto_download.age_from_source);
+        age(&files);
         return Some(Database {
             format: DatabaseFormat::Mmdb,
             files,
@@ -491,11 +487,7 @@ async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
         if !database.files.iter().all(|file| file.exists()) {
             return None;
         }
-        telemetry::age(
-            kind.label(),
-            &database.files,
-            config.auto_download.age_from_source,
-        );
+        age(&database.files);
         return Some(database);
     }
 
@@ -510,18 +502,14 @@ async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
         .all(|file| is_fresh(file, max_age_secs))
     {
         debug!(kind = kind.label(), files = ?database.files, "GeoIP database is fresh");
-        telemetry::age(
-            kind.label(),
-            &database.files,
-            config.auto_download.age_from_source,
-        );
+        age(&database.files);
         return Some(database);
     }
 
     match download(kind, config).await {
         Ok(files) => {
             telemetry::attempt(kind.label(), "ok");
-            telemetry::age(kind.label(), &files, config.auto_download.age_from_source);
+            age(&files);
             Some(Database {
                 format: database.format,
                 files,
@@ -539,11 +527,7 @@ async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
             // beats disabling enrichment outright.
             if database.files.iter().all(|file| file.exists()) {
                 warn!(kind = kind.label(), files = ?database.files, "using stale GeoIP database");
-                telemetry::age(
-                    kind.label(),
-                    &database.files,
-                    config.auto_download.age_from_source,
-                );
+                age(&database.files);
                 Some(database)
             } else {
                 None

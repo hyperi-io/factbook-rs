@@ -43,7 +43,8 @@
 //!     verify_content: true
 //!     min_size_percent: 50
 //!     # A database at or under this is read into memory when it is opened;
-//!     # a larger one is memory-mapped. Zero maps everything.
+//!     # a larger one is memory-mapped. Zero maps everything. A table source
+//!     # that outgrows it is refused, because a table has nowhere else to go.
 //!     resident_max_bytes: 134217728
 //!     # Credentials are Secret: redacted in Debug and Display. Supply them
 //!     # through the secrets layer, not as literals.

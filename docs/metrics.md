@@ -29,14 +29,10 @@ What the gauge costs depends on the build. A default build takes the age from th
 | `enrichment_database_age_seconds` | gauge | `type`, `kind` | Seconds since the publisher built the database. The oldest file of a set, because a database is only as current as its stalest half |
 | `enrichment_download_total` | counter | `type`, `kind`, `result` | One per download attempt, by how it ended |
 | `enrichment_database_backing` | gauge | `type`, `kind`, `backing` | Whether an open database was read onto the heap or mapped. Both `backing` series are written, 1 for the chosen one and 0 for the other |
+| `enrichment_table_backing` | gauge | `type`, `file`, `backing` | Where a loaded table source's rows are. One backing today, so it says that the table loaded and is being held in memory |
 
-`kind` is `city` or `asn`. `type` is `geoip` on every series. `backing` is
-`resident` or `mapped`.
-
-Both `backing` series are written so a refresh that flips a database leaves none
-still reporting the backing it no longer has. A mapped database can stall a
-lookup on a page fault where a resident one cannot, so this is the series to
-read when lookup latency has a tail the cache does not explain.
+`kind` is `city` or `asn`. `type` is `geoip` on the database series and `table`
+on the table one.
 
 ### The `result` label separates five outcomes
 
@@ -50,12 +46,20 @@ read when lookup latency has a tail the cache does not explain.
 
 Separate the two when you alert. `refused` is the provider's problem: it shipped a login page, a stub, or a database that answers nothing, and the old file is still in place. `failed` is yours.
 
+## The two backing gauges say where the bytes are
+
+Both are in the default set. `file` is the name a source is written under, which separates one configured table from another.
+
+`enrichment_database_backing` is `resident` or `mapped`, and both series are written -- 1 for the chosen one and 0 for the other -- so a refresh that flips a database leaves none still reporting the backing it no longer has. A mapped database can stall a lookup on a page fault where a resident one cannot, so this is the series to read when lookup latency has a tail the cache does not explain.
+
+`enrichment_table_backing` has one backing, `resident`, because a table source that will not fit in memory is refused rather than moved anywhere. Watch it for absence: the series appears when a table loads, so a source that has grown past `auto_download.resident_max_bytes` stops reporting entirely rather than reporting something different. Serving an oversized table from a converted database is issue #2, and a second backing arrives with it.
+
 ## Lookup, off by default
 
 The `metrics-lookup` feature is opt-in, on measurement rather than principle: it costs three to four times a cache hit, and the hit path is the one the crate exists to make fast. Take it when you want cache behaviour visible and can afford it.
 
-```toml
-factbook = { version = "0.1", features = ["metrics-lookup"] }
+```console
+cargo add factbook --features metrics-lookup
 ```
 
 | metric | type | labels | what it says |
@@ -75,8 +79,8 @@ The names are bare and each carries a `type` label, so one recorder hosts factbo
 
 ## Turning it all off
 
-```toml
-factbook = { version = "0.1", default-features = false, features = ["geoip"] }
+```console
+cargo add factbook --no-default-features --features geoip
 ```
 
 That drops the facade dependency entirely. The call sites compile to nothing.

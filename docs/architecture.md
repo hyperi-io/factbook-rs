@@ -86,13 +86,36 @@ Three consequences shape the record type:
 
 Cached answers are cleared when the reader set is swapped rather than aged out on a timer. An answer only goes stale when the file behind it changes, so clearing on the swap is exact and leaves no window.
 
+## A database that will not fit is mapped; a table that will not fit is refused
+
+The two halves answer the same question differently, and the reason is the format rather than the policy.
+
+A **database** is already in the format the reader reads. One larger than `resident_max_bytes` is memory-mapped instead of being read onto the heap, and it answers from there through the same cache -- so a repeat address never touches the file. It is never refused for its size.
+
+A **table** is a CSV or a JSON document, and turning one into rows and an index costs several times the file. There is no equivalent of mapping it, because it has to be parsed to be used at all. Somewhere above `resident_max_bytes` holding it stops being worth spending, and above that it is refused.
+
+```mermaid
+flowchart LR
+    DB[(database)] -->|fits| DR[resident, behind the cache]
+    DB -->|larger| DM[mapped, behind the cache]
+
+    S[(table source)] --> R[read into memory]
+    R -->|fits| A[held: rows and index in memory]
+    R -->|hits the ceiling| D[abandon, release what was taken]
+    D --> X[refuse at load]
+```
+
+The ceiling is hit, never predicted. Size on disk does not say whether a source fits -- encoding, quoting and column count all move the answer -- so the read fills memory and stops when it crosses the line. A CSV stops on a record and a JSON array on an element, so neither reader's peak is set by the file, and what the read had taken is released as the refusal unwinds. The refusal is early and cheap rather than an allocation failure at the end of the file.
+
+Nothing sits behind that refusal today. Writing an oversized source out as a MaxMind DB and serving it mapped is future work, tracked as issue #2. `Table::backing()` and the `enrichment_table_backing` gauge already report where a table's rows are, so the answer keeps the shape it will have when there is a second place for them to be.
+
 ## One record shape, several source schemas
 
 Providers disagree about how a record is written. MaxMind nests, and DB-IP and sapics follow it. IPinfo is flat and writes an autonomous system number as text with an `AS` prefix.
 
 Each database names its own schema in its metadata, so the reader dispatches on the file rather than on config. A pre-seeded or mounted file is handled the same as a downloaded one. Every schema lands on the same flat record, which is what lets answers from different sources merge.
 
-The typed fields are the ones every provider publishes. A source carries more than that, and none of it is discarded: after the typed decode the record is read a second time with no schema, flattened to dotted paths -- `city.names.de`, `subdivisions.0.iso_code`, `isp` -- and everything the typed decode did not take lands in `record.extra`. So a paid edition, a richer free build or a provider nobody has written a field for delivers its fields with no change here. The test is on the value rather than the path alone, which is what keeps a superseded subdivision, or a field whose wire type the typed shape refused, in the map instead of lost. The cost is a second record decode on the miss path, which the cache pays once per address; the located cold read measures 1.7 microseconds against 2.7, and 2.1 against 5.4 on a record the size a city build writes.
+The typed fields are the ones every provider publishes. A source carries more than that, and by default none of it is discarded: after the typed decode the record is read a second time with no schema, flattened to dotted paths -- `city.names.de`, `subdivisions.0.iso_code`, `isp` -- and everything the typed decode did not take lands in `record.extra`. So a paid edition, a richer free build or a provider nobody has written a field for delivers its fields with no change here. The test is on the value rather than the path alone, which is what keeps a superseded subdivision, or a field whose wire type the typed shape refused, in the map instead of lost. The cost is a second record decode on the miss path, which the cache pays once per address; the located cold read measures 1.7 microseconds against 2.7, and 2.1 against 5.4 on a record the size a city build writes. A deployment that would rather have the memory back sets `cache.collect_extra_fields` to false, which skips the second decode rather than discarding its result -- over half the cost of a miss.
 
 ## Features draw the dependency line
 
@@ -101,9 +124,13 @@ The typed fields are the ones every provider publishes. A source carries more th
 | `geoip-download` | HTTP, TLS, gzip, tar | fetching and verifying |
 | `geoip-lookup` | resident or mapped reader, cache | answering |
 | `metrics` *(default)* | the `metrics` facade | download outcomes and database age |
-| `metrics-lookup` | the same facade | cache hits, misses, size and lookup duration |
+| `metrics-lookup` | the same facade + `geoip-lookup` | cache hits, misses, size and lookup duration |
 
 A download-only build carries no database reader, and a lookup-only build carries no HTTP client, because neither feature lists the other's dependencies. CI checks that with a feature-matrix build rather than trusting it, which is what catches a module behind one feature quietly using a crate another feature declares. Test builds are the exception: the dev-dependencies pull an HTTP client whatever features are selected.
+
+`metrics-lookup` names `geoip-lookup` because the cache it instruments is there. Taken without it, every call site it would emit from is compiled out, so the feature pulls a dependency and measures nothing -- which a consumer has no way to tell from the feature list.
+
+No feature is declared for a capability the crate does not have. Writing a table out as a database is future work, so there is no `geoip-convert` to enable: a feature that pulls the MMDB writer and changes no behaviour would be inert in exactly the way `metrics-lookup` used to be.
 
 The two metrics features split on cost. Acquisition metrics run once per database per refresh, so they are on by default and the database-age gauge is the only signal a deployment has that its downloads stopped working. Lookup metrics cost three to four times a cache hit, on the one path the crate exists to make fast, so they are opt-in. Details: [metrics.md](metrics.md).
 

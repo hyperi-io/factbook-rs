@@ -26,25 +26,80 @@
 //! # A second decode, not a wider one
 //!
 //! The address is located once; both decodes read the record bytes the one
-//! traversal found, so this costs a record decode rather than a tree walk. It
-//! runs on every miss because there is no database that needs it and no
+//! traversal found, so this costs a record decode rather than a tree walk. It is
+//! not selected per database, because there is no database that needs it and no
 //! database that does not -- every published GeoIP build carries fields outside
 //! the typed set, the free ones included.
+//!
+//! What the fields cost is the cache rather than the walk: they take an entry
+//! from a few hundred bytes to several kilobytes, so a deployment that wants the
+//! smaller record turns the whole thing off with
+//! [`collect_extra_fields`](super::CacheConfig::collect_extra_fields). Off, the
+//! call below is not reached, so the second decode is saved along with the map.
+//!
+//! # Bounded, because a record is not trusted input
+//!
+//! The data section of a MaxMind DB is a pointer graph, not a tree. The reader
+//! follows a pointer wherever it appears and caps only nesting depth, so a
+//! record written as nested two-key maps whose branches both point at the level
+//! below expands to two leaves per level: forty levels is a four-hundred-byte
+//! file and a million million leaves. Whoever supplies the database supplies
+//! the digest it is checked against, so a compromised provider or a hostile URL
+//! puts that record inside the reader with nothing upstream to catch it.
+//!
+//! Two bounds hold that down, and one of them has to be counted in bytes.
+//! [`MAX_FIELDS`] alone would not bound memory, because every leaf of a crafted
+//! record can point at the same long string and each is copied on the way out;
+//! [`MAX_BYTES`] is what makes the retained size finite whatever the leaves
+//! hold.
+//!
+//! Both are enforced by stopping the walk, not by truncating a finished list.
+//! The distinction is the whole point: a list truncated afterwards has already
+//! cost the traversal that built it, so the memory would be bounded and the
+//! time would not. A visitor that stops asking for entries stops the reader
+//! following pointers, which bounds both at once.
+//!
+//! Reaching a bound truncates rather than fails, for the same reason an
+//! unreadable record does not fail the event carrying it.
 
 use std::fmt::{self, Write as _};
+use std::sync::Once;
 
 use compact_str::CompactString;
 use maxminddb::LookupResult;
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::enricher::asn_number;
 use super::record::{ExtraValue, GeoIpRecord};
 
+/// Most fields one record's map keeps.
+///
+/// Set about three times above the richest record any provider publishes. A
+/// free GeoLite2-City record runs to roughly 21 unmodelled fields; a paid
+/// GeoIP2 Enterprise one reaches about 180 once names in a dozen languages
+/// across eight named entities, confidence scores, several subdivisions and the
+/// traits block are counted. Nothing published comes near 512, so no real
+/// database is truncated by it.
+const MAX_FIELDS: usize = 512;
+
+/// Most bytes one record's map keeps, counting each path and what its value
+/// holds on the heap.
+///
+/// The field cap does not bound this on its own: a leaf is an owned copy, and a
+/// crafted record can point all of its leaves at one long string. The richest
+/// real record accounts for well under 16 KiB here -- about 4 KiB of paths and
+/// a few KiB of names -- so 64 KiB leaves the same order of headroom the field
+/// cap does.
+const MAX_BYTES: usize = 64 * 1024;
+
+/// Warns once, so a hostile database costs one line rather than one per address.
+static TRUNCATED: Once = Once::new();
+
 /// Read every field of one record and keep the ones no typed field took.
 pub(super) fn collect<S: AsRef<[u8]>>(result: &LookupResult<'_, S>, record: &mut GeoIpRecord) {
-    let leaves = match result.decode::<Leaves>() {
+    let kept = match result.decode::<Leaves>() {
         Ok(Some(leaves)) => leaves.0,
         Ok(None) => return,
         Err(e) => {
@@ -54,35 +109,116 @@ pub(super) fn collect<S: AsRef<[u8]>>(result: &LookupResult<'_, S>, record: &mut
         }
     };
 
-    record.extra.reserve(leaves.len());
-    for (path, value) in leaves {
+    if kept.full() {
+        truncated(result);
+    }
+
+    record.extra.reserve(kept.fields.len());
+    for (path, value) in kept.fields {
         if !typed(&path, &value, record) {
             record.extra.push(path, value);
         }
     }
 }
 
+/// Say once that a record reached a bound, and which bounds those are.
+///
+/// The record is named by the network it matched and its offset in the data
+/// section, which is what identifies it inside the file; the reader does not
+/// offer the database's own name through a lookup result.
+///
+/// Latched because a record large enough to truncate is a property of the
+/// database rather than of the address, so every address matching it would
+/// repeat the line -- and a spray of addresses is exactly the traffic that
+/// reaches this.
+fn truncated<S: AsRef<[u8]>>(result: &LookupResult<'_, S>) {
+    TRUNCATED.call_once(|| {
+        warn!(
+            network = ?result.network().ok(),
+            offset = ?result.offset(),
+            max_fields = MAX_FIELDS,
+            max_bytes = MAX_BYTES,
+            "database record carries more fields than the map holds; it was truncated"
+        );
+    });
+}
+
 /// Every leaf of one record, as a dotted path and an owned value.
-struct Leaves(Vec<(CompactString, ExtraValue)>);
+struct Leaves(Kept);
+
+/// The leaves kept so far, and what keeping them has cost.
+struct Kept {
+    /// Path and value, in source order.
+    fields: Vec<(CompactString, ExtraValue)>,
+
+    /// Bytes those fields retain: each path, and each value's heap payload.
+    bytes: usize,
+
+    /// Whether a bound has been reached, which is where the walk stops.
+    full: bool,
+}
+
+impl Kept {
+    /// Nothing kept yet.
+    const fn new() -> Self {
+        Self {
+            fields: Vec::new(),
+            bytes: 0,
+            full: false,
+        }
+    }
+
+    /// Whether a bound is reached, which is where the walk stops.
+    const fn full(&self) -> bool {
+        self.full
+    }
+
+    /// Keep one leaf, charged for its path and for what its value holds.
+    ///
+    /// A leaf that would carry the record past [`MAX_BYTES`] is dropped rather
+    /// than kept and counted afterwards, which is what makes the bound the size
+    /// it says it is: one value is as large as the record it was read from, so
+    /// admitting it first and stopping second would bound nothing.
+    fn push(&mut self, path: &str, value: ExtraValue) {
+        let cost = path.len() + payload(&value);
+        if self.bytes + cost > MAX_BYTES {
+            self.full = true;
+            return;
+        }
+
+        self.bytes += cost;
+        self.fields.push((CompactString::from(path), value));
+        self.full = self.fields.len() >= MAX_FIELDS;
+    }
+}
+
+/// Bytes a value holds beyond the pair itself.
+fn payload(value: &ExtraValue) -> usize {
+    match value {
+        ExtraValue::Str(text) => text.len(),
+        ExtraValue::Bytes(bytes) => bytes.len(),
+        _ => 0,
+    }
+}
 
 impl<'de> Deserialize<'de> for Leaves {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut leaves = Vec::new();
+        let mut kept = Kept::new();
         let mut path = String::new();
         Walk {
-            leaves: &mut leaves,
+            kept: &mut kept,
             path: &mut path,
         }
         .deserialize(deserializer)?;
 
-        Ok(Self(leaves))
+        Ok(Self(kept))
     }
 }
 
 /// One position in a record: where it sits, and where its leaves go.
 struct Walk<'a> {
-    /// Leaves found so far, in source order.
-    leaves: &'a mut Vec<(CompactString, ExtraValue)>,
+    /// Leaves found so far, and what they have cost.
+    kept: &'a mut Kept,
 
     /// Dotted path of the value about to be read.
     path: &'a mut String,
@@ -91,8 +227,7 @@ struct Walk<'a> {
 impl Walk<'_> {
     /// Record one leaf at the current path.
     fn leaf(self, value: ExtraValue) {
-        self.leaves
-            .push((CompactString::from(self.path.as_str()), value));
+        self.kept.push(self.path, value);
     }
 }
 
@@ -148,8 +283,14 @@ impl<'de> Visitor<'de> for Walk<'_> {
         Ok(())
     }
 
+    /// Stops asking once a bound is reached, which is what bounds the decode
+    /// as well as the record: an entry never requested is never followed.
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
-        while let Some(key) = map.next_key::<&str>()? {
+        while !self.kept.full() {
+            let Some(key) = map.next_key::<&str>()? else {
+                break;
+            };
+
             let parent = self.path.len();
             if parent != 0 {
                 self.path.push('.');
@@ -157,7 +298,7 @@ impl<'de> Visitor<'de> for Walk<'_> {
             self.path.push_str(key);
 
             map.next_value_seed(Walk {
-                leaves: &mut *self.leaves,
+                kept: &mut *self.kept,
                 path: &mut *self.path,
             })?;
             self.path.truncate(parent);
@@ -168,7 +309,7 @@ impl<'de> Visitor<'de> for Walk<'_> {
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
         let mut index = 0usize;
-        loop {
+        while !self.kept.full() {
             let parent = self.path.len();
             if parent != 0 {
                 self.path.push('.');
@@ -177,16 +318,18 @@ impl<'de> Visitor<'de> for Walk<'_> {
             let _ = write!(self.path, "{index}");
 
             let element = seq.next_element_seed(Walk {
-                leaves: &mut *self.leaves,
+                kept: &mut *self.kept,
                 path: &mut *self.path,
             })?;
             self.path.truncate(parent);
 
             if element.is_none() {
-                return Ok(());
+                break;
             }
             index += 1;
         }
+
+        Ok(())
     }
 }
 
@@ -360,5 +503,266 @@ mod tests {
         assert_eq!(subdivision("subdivisions.x.iso_code"), None);
         assert_eq!(subdivision("subdivisions.0"), None);
         assert_eq!(subdivision("city.names.en"), None);
+    }
+}
+
+/// Records built to defeat the bounds, in whole MaxMind DB files.
+///
+/// A pointer graph is not something any writer will emit and not something to
+/// commit as a fixture, so the hostile record is built here from the format's
+/// own encoding -- [`mmdb_wire`](crate::geoip::mmdb_wire) -- and thrown away
+/// with the temporary file it is written to.
+#[cfg(test)]
+mod crafted {
+    use crate::geoip::mmdb_wire::{IPV4, MAP, database, header, string};
+
+    /// Database type every crafted file declares, so the typed decode in front
+    /// of the walk reads it as the schema the bound is measured on.
+    const DATABASE_TYPE: &str = "GeoLite2-City";
+
+    /// Type number of a pointer into the data section.
+    const POINTER: u8 = 1;
+
+    /// Largest offset the two-byte pointer form reaches.
+    const POINTER_LIMIT: usize = 2048;
+
+    /// A pointer to a data-section offset, in the two-byte form.
+    fn pointer(target: usize) -> Vec<u8> {
+        assert!(target < POINTER_LIMIT, "crafted records stay under 2 KiB");
+        vec![
+            (POINTER << 5) | u8::try_from(target >> 8).unwrap(),
+            u8::try_from(target & 0xff).unwrap(),
+        ]
+    }
+
+    /// A database whose one record expands to `2 ^ levels` copies of `leaf`.
+    ///
+    /// Each level is a two-key map whose branches are both pointers to the level
+    /// below, so the record doubles per level while the file grows by nine
+    /// bytes. `leaf` is stored once and reached down every path, which is what
+    /// makes a small file able to retain a large record. Every address the
+    /// database is asked about resolves to it.
+    pub(super) fn pointer_bomb(levels: u32, leaf: &str) -> Vec<u8> {
+        let mut data = string(leaf);
+        let mut below = 0;
+
+        for _ in 0..levels {
+            let here = data.len();
+            let branch = pointer(below);
+            data.extend_from_slice(&header(MAP, 2));
+            data.extend_from_slice(&string("a"));
+            data.extend_from_slice(&branch);
+            data.extend_from_slice(&string("b"));
+            data.extend_from_slice(&branch);
+            below = here;
+        }
+
+        database(&data, below, DATABASE_TYPE, IPV4)
+    }
+
+    /// A database whose one record is a map of `fields` distinct leaves.
+    ///
+    /// The honest shape of a rich record, for the bound's edges: no pointer, no
+    /// sharing, and every leaf under its own key.
+    pub(super) fn wide_record(fields: usize, value: &str) -> Vec<u8> {
+        let mut data = header(MAP, fields);
+        for index in 0..fields {
+            data.extend_from_slice(&string(&format!("f{index}")));
+            data.extend_from_slice(&string(value));
+        }
+
+        database(&data, 0, DATABASE_TYPE, IPV4)
+    }
+}
+
+/// What the bounds hold, against records built to defeat them.
+#[cfg(test)]
+mod bounds {
+    use std::io::Write as _;
+    use std::net::IpAddr;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use tempfile::NamedTempFile;
+
+    use super::crafted;
+    use super::{ExtraValue, MAX_BYTES, MAX_FIELDS};
+    use crate::geoip::{CacheConfig, DatabasePaths, GeoIp, GeoIpRecord};
+    use crate::maxminddb::Reader;
+
+    /// The City schema as a current build writes it, the richest real record the
+    /// suite holds.
+    const CITY_RICH_DB: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/city-rich-test.mmdb"
+    );
+
+    /// The address that database holds the most fields for.
+    const BOXFORD: &str = "2.125.160.216";
+
+    /// Long enough that a walk which stopped counting fields alone would still
+    /// retain megabytes.
+    const LONG_LEAF_BYTES: usize = 200;
+
+    /// Nesting that expands to 2^45 leaves -- a walk that follows every pointer
+    /// does not finish this side of a year.
+    const DEEP: u32 = 45;
+
+    /// Generous by three orders of magnitude against the sub-millisecond walk,
+    /// and unreachable for one that is not bounded, so it fails on the defect
+    /// rather than on a slow machine.
+    const BUDGET: Duration = Duration::from_secs(2);
+
+    /// Parse a literal the tests are asserting about.
+    fn ip(literal: &str) -> IpAddr {
+        literal.parse().unwrap()
+    }
+
+    /// Write a crafted database out, keeping the file alive for the reader.
+    fn written(bytes: &[u8]) -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(bytes).unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    /// Collect one crafted record, timing the walk on its own.
+    ///
+    /// Driven straight at the reader rather than through a lookup, because the
+    /// typed decode in front of it walks the same pointer graph and would put
+    /// its own cost in the way of the bound being measured.
+    fn collected(bytes: &[u8]) -> (GeoIpRecord, Duration) {
+        let file = written(bytes);
+        let reader = Reader::open_readfile(file.path()).unwrap();
+        let result = reader.lookup(ip("1.2.3.4")).unwrap();
+
+        let mut record = GeoIpRecord::default();
+        let started = Instant::now();
+        super::collect(&result, &mut record);
+
+        (record, started.elapsed())
+    }
+
+    /// Bytes the map retains: each path, and each value's heap payload.
+    fn retained(record: &GeoIpRecord) -> usize {
+        record
+            .extra
+            .iter()
+            .map(|(path, value)| path.len() + super::payload(value))
+            .sum()
+    }
+
+    #[test]
+    fn a_pointer_graph_cannot_grow_the_map_or_stall_the_walk() {
+        let bytes = crafted::pointer_bomb(DEEP, "x");
+        // The whole hostile database is smaller than this source file.
+        assert!(bytes.len() < 1024, "{}", bytes.len());
+
+        let (record, elapsed) = collected(&bytes);
+
+        // Unbounded this is 2^45 fields; the walk stops asking at the cap.
+        assert_eq!(record.extra.len(), MAX_FIELDS);
+        // Bounded in time as well as in size, which is what stopping the visitor
+        // rather than truncating a finished list buys.
+        assert!(elapsed < BUDGET, "{elapsed:?}");
+    }
+
+    #[test]
+    fn leaves_sharing_one_long_string_are_bounded_in_bytes_not_just_in_count() {
+        // Every leaf points at the same string, so the file stays tiny while
+        // each field kept copies it. A count cap alone would let 512 of them
+        // through; the byte cap is what stops short of that.
+        let leaf = "v".repeat(LONG_LEAF_BYTES);
+        let bytes = crafted::pointer_bomb(DEEP, &leaf);
+        assert!(bytes.len() < 1024, "{}", bytes.len());
+
+        let (record, elapsed) = collected(&bytes);
+
+        assert!(retained(&record) <= MAX_BYTES, "{}", retained(&record));
+        assert!(record.extra.len() < MAX_FIELDS, "{}", record.extra.len());
+        assert!(elapsed < BUDGET, "{elapsed:?}");
+    }
+
+    #[test]
+    fn a_crafted_record_cannot_stall_a_lookup() {
+        // Shallower than the walk's own test: the typed decode runs first and
+        // follows the same pointers, so this depth is what that half tolerates.
+        // The bound under test is the field count, which is exact either way.
+        let bytes = crafted::pointer_bomb(20, "x");
+        let file = written(&bytes);
+
+        let geoip = GeoIp::open(
+            DatabasePaths::city_only(file.path()),
+            CacheConfig::default(),
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let record = geoip.lookup(ip("1.2.3.4")).unwrap();
+        let elapsed = started.elapsed();
+
+        // A million and a half fields before the bound, and the answer is still
+        // an answer rather than an error.
+        assert_eq!(record.extra.len(), MAX_FIELDS);
+        assert!(elapsed < BUDGET, "{elapsed:?}");
+    }
+
+    #[test]
+    fn an_honest_record_over_the_cap_is_truncated_rather_than_refused() {
+        let bytes = crafted::wide_record(MAX_FIELDS + 100, "v");
+
+        let (record, _) = collected(&bytes);
+
+        // Truncated, not failed: the fields that fit are still delivered.
+        assert_eq!(record.extra.len(), MAX_FIELDS);
+        assert_eq!(record.extra.get("f0").unwrap().as_str(), Some("v"));
+    }
+
+    #[test]
+    fn an_honest_record_under_the_cap_keeps_every_field() {
+        let fields = MAX_FIELDS - 1;
+        let bytes = crafted::wide_record(fields, "v");
+
+        let (record, _) = collected(&bytes);
+
+        assert_eq!(record.extra.len(), fields);
+    }
+
+    #[test]
+    fn the_richest_published_record_is_nowhere_near_the_bounds() {
+        let geoip = GeoIp::open(
+            DatabasePaths::city_only(Path::new(CITY_RICH_DB)),
+            CacheConfig::default(),
+        )
+        .unwrap();
+        let record = geoip.lookup(ip(BOXFORD)).unwrap();
+
+        // The bound exists to be unreachable for a real database. A current
+        // city build with geoname ids, confidence scores, traits and names in
+        // several languages sits an order of magnitude below both caps.
+        assert!(
+            record.extra.len() * 8 < MAX_FIELDS,
+            "{}",
+            record.extra.len()
+        );
+        assert!(retained(&record) * 8 < MAX_BYTES, "{}", retained(&record));
+
+        // Nothing the earlier tests assert about this database went missing.
+        assert_eq!(
+            record
+                .extra
+                .get("city.names.de")
+                .and_then(ExtraValue::as_str),
+            Some("Boxford")
+        );
+        assert_eq!(
+            record
+                .extra
+                .get("traits.user_type")
+                .and_then(ExtraValue::as_str),
+            Some("residential")
+        );
+        assert!(record.extra.get("city.geoname_id").is_some());
+        assert!(record.extra.get("subdivisions.1.confidence").is_some());
     }
 }

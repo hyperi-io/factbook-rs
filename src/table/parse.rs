@@ -18,12 +18,34 @@
 //! The CSV reader is written here rather than taken from a crate: it is one
 //! state machine over four states, and the alternative is a dependency in the
 //! graph of every consumer that only wanted the geo half.
+//!
+//! # The memory ceiling is hit, never predicted
+//!
+//! Whether a source fits in memory is not knowable from its size on disk: an
+//! encoding, a quoting style and a column count all move the answer. So the
+//! readers fill memory and stop at the ceiling the caller names, reporting
+//! [`TableError::OverResidentCeiling`] with everything they had accumulated
+//! released as the error unwinds. What is counted is the rows, not the index
+//! [`Table::build`](super::Table::build) later derives from them.
+//!
+//! Both encodings stop mid-file. A CSV record is complete as soon as it closes,
+//! and a JSON array is walked element by element rather than parsed whole -- a
+//! document is not valid until its last byte, but one element of it is, and one
+//! element is the unit the ceiling measures. So neither reader's peak is set by
+//! the file: it is the rows accumulated so far, plus one record being read.
+//!
+//! A JSON source that names no columns widens instead of collecting keys up
+//! front. A key first seen on the hundredth object is inserted into the
+//! ninety-nine rows already read, which reaches the same union of keys without
+//! a first pass that would have to hold the document to make one.
 
-use std::collections::BTreeSet;
+use std::fmt;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+use serde::Deserializer as _;
+use serde::de;
 use serde_json::Value;
 
 use super::config::{Schema, TableFormat};
@@ -42,6 +64,17 @@ const BOM: &str = "\u{feff}";
 /// One CSV record, and the line it started on.
 type Record = (usize, Vec<String>);
 
+/// Bytes one cell costs beyond the text in it.
+///
+/// The `Option<Box<str>>` itself. An estimate, like everything the ceiling
+/// counts: an allocator rounds a request up by an amount only it knows.
+const CELL_OVERHEAD: usize = size_of::<Cell>();
+
+/// Bytes one row costs beyond the cells in it.
+///
+/// The `Vec` holding them, and the slot it occupies in the table's own `Vec`.
+const ROW_OVERHEAD: usize = 4 * size_of::<usize>();
+
 /// Columns and rows read from a source file.
 #[derive(Debug)]
 pub(super) struct Parsed {
@@ -52,22 +85,27 @@ pub(super) struct Parsed {
     pub(super) rows: Vec<Vec<Cell>>,
 }
 
-/// Read a source file into columns and rows.
+/// Read a source file into columns and rows, stopping at `ceiling` bytes.
+///
+/// `u64::MAX` reads whatever is there, which is what a caller reading bytes it
+/// already holds wants.
 ///
 /// # Errors
 ///
 /// [`TableError::Malformed`] for a CSV the reader cannot make rows of,
 /// [`TableError::NotAnArrayOfObjects`] for JSON that is not one,
 /// [`TableError::NamesRequired`] for a headerless CSV that supplies no names,
-/// or [`TableError::Empty`] when the file holds no rows.
+/// [`TableError::Empty`] when the file holds no rows, or
+/// [`TableError::OverResidentCeiling`] when the rows outgrow `ceiling`.
 pub(super) fn read(
     reader: impl BufRead,
     format: TableFormat,
     schema: &Schema,
+    ceiling: u64,
 ) -> Result<Parsed, TableError> {
     match format {
-        TableFormat::Csv { header } => read_csv(reader, header, schema),
-        TableFormat::Json => read_json(reader, schema),
+        TableFormat::Csv { header } => read_csv(reader, header, schema, ceiling),
+        TableFormat::Json => read_json(reader, schema, ceiling),
     }
 }
 
@@ -90,9 +128,7 @@ pub(crate) fn probe(
     match format {
         TableFormat::Csv { header } => validate_csv(reader, header, declared),
 
-        // A JSON document has to be read whole to be known valid at all, so the
-        // probe is the same read the load performs.
-        TableFormat::Json => read_json(reader, &Schema::Auto).map(drop),
+        TableFormat::Json => validate_json(reader),
     }
 }
 
@@ -108,7 +144,9 @@ fn validate_csv(
     header: bool,
     declared: Option<usize>,
 ) -> Result<(), TableError> {
-    let mut csv = Csv::new();
+    // The probe drops every record as it reads it, so it holds nothing the
+    // ceiling would be counting.
+    let mut csv = Csv::new(u64::MAX);
     let mut width: Option<usize> = declared;
     let mut seen: usize = 0;
 
@@ -159,8 +197,13 @@ fn drain(
 }
 
 /// Read a CSV into columns and rows.
-fn read_csv(reader: impl BufRead, header: bool, schema: &Schema) -> Result<Parsed, TableError> {
-    let mut records = records(reader)?.into_iter();
+fn read_csv(
+    reader: impl BufRead,
+    header: bool,
+    schema: &Schema,
+    ceiling: u64,
+) -> Result<Parsed, TableError> {
+    let mut records = records(reader, ceiling)?.into_iter();
 
     // The header row is consumed whether or not its names are used, so naming
     // the columns explicitly overrides a header rather than shifting the rows.
@@ -195,56 +238,221 @@ fn read_csv(reader: impl BufRead, header: bool, schema: &Schema) -> Result<Parse
 }
 
 /// Read a JSON array of objects into columns and rows.
-fn read_json(reader: impl BufRead, schema: &Schema) -> Result<Parsed, TableError> {
-    let values: Vec<Value> =
-        serde_json::from_reader(reader).map_err(|e| TableError::NotAnArrayOfObjects {
-            detail: e.to_string(),
-        })?;
+///
+/// Streamed element by element. Parsing the document whole and then measuring
+/// the rows built out of it would put the ceiling behind the allocation it
+/// exists to stop, which is no ceiling at all.
+fn read_json(reader: impl BufRead, schema: &Schema, ceiling: u64) -> Result<Parsed, TableError> {
+    let mut document = serde_json::Deserializer::from_reader(reader);
+    let mut stopped = None;
 
-    let mut objects = Vec::with_capacity(values.len());
-    for (position, value) in values.iter().enumerate() {
-        let object = value
-            .as_object()
-            .ok_or_else(|| TableError::NotAnArrayOfObjects {
-                detail: format!("element {position} is not an object"),
-            })?;
-        objects.push(object);
+    let read = document.deserialize_seq(Elements {
+        schema,
+        ceiling,
+        stopped: &mut stopped,
+    });
+
+    // A reader that stops mid-array leaves the deserializer standing on a comma,
+    // which it then reports as a malformed document. What stopped the read is
+    // the answer, so it is taken ahead of that.
+    if let Some(e) = stopped {
+        return Err(e);
     }
 
-    // Checked before the columns are derived, so an empty document reports that
-    // it holds no rows rather than that it names no columns.
-    if objects.is_empty() {
+    let parsed = read.map_err(|e| not_an_array(&e))?;
+    // Anything after the array is a malformed document rather than a second one.
+    document.end().map_err(|e| not_an_array(&e))?;
+
+    Ok(parsed)
+}
+
+/// Whether the reader holds an array of objects, without holding it.
+///
+/// The probe answers a yes-or-no question, so it keeps one element at a time and
+/// never builds the rows at all.
+fn validate_json(reader: impl BufRead) -> Result<(), TableError> {
+    let mut document = serde_json::Deserializer::from_reader(reader);
+    let mut stopped = None;
+
+    let counted = document.deserialize_seq(Objects {
+        stopped: &mut stopped,
+    });
+
+    if let Some(e) = stopped {
+        return Err(e);
+    }
+
+    let seen = counted.map_err(|e| not_an_array(&e))?;
+    document.end().map_err(|e| not_an_array(&e))?;
+
+    if seen == 0 {
         return Err(TableError::Empty);
     }
+    Ok(())
+}
 
-    // Sorted rather than first-seen: a JSON object has no key order to inherit,
-    // so sorting is the one ordering that does not depend on which object
-    // happened to come first.
-    let columns = match schema {
-        Schema::Auto => {
-            let keys: BTreeSet<&str> = objects
-                .iter()
-                .flat_map(|object| object.keys().map(String::as_str))
-                .collect();
-            keys.into_iter().map(str::to_string).collect()
-        }
-        Schema::Named(named) => named.clone(),
-    };
-    if columns.is_empty() {
-        return Err(TableError::NoNames);
+/// A `serde_json` refusal as the refusal it caused.
+fn not_an_array(e: &serde_json::Error) -> TableError {
+    TableError::NotAnArrayOfObjects {
+        detail: e.to_string(),
+    }
+}
+
+/// Abandon the walk, keeping the reason for the caller to read.
+///
+/// The error handed back to serde is the one that ends the walk; the caller
+/// never sees it, because it checks what was kept here first.
+fn stop<E: de::Error>(kept: &mut Option<TableError>, reason: TableError) -> E {
+    let text = reason.to_string();
+    *kept = Some(reason);
+    E::custom(text)
+}
+
+/// The elements of a JSON array, taken one at a time and turned into rows.
+///
+/// A document that names its columns nowhere widens as it goes: a key first seen
+/// on the hundredth object is inserted into the ninety-nine rows already read,
+/// which is how the union of every object's keys is reached without holding
+/// every object to compute it.
+struct Elements<'a> {
+    /// Where the column names come from.
+    schema: &'a Schema,
+
+    /// Bytes the rows may cost before the read is abandoned.
+    ceiling: u64,
+
+    /// Why the walk stopped, where it stopped before the array ended.
+    stopped: &'a mut Option<TableError>,
+}
+
+impl<'de> de::Visitor<'de> for Elements<'_> {
+    type Value = Parsed;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an array of objects")
     }
 
-    let rows: Vec<Vec<Cell>> = objects
-        .iter()
-        .map(|object| {
-            columns
+    fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let stated = matches!(self.schema, Schema::Named(_));
+        let mut columns: Vec<String> = match self.schema {
+            Schema::Auto => Vec::new(),
+            Schema::Named(named) => named.clone(),
+        };
+        let mut rows: Vec<Vec<Cell>> = Vec::new();
+        let mut held: u64 = 0;
+        let mut seen = 0usize;
+
+        while let Some(value) = seq.next_element::<Value>()? {
+            let Some(object) = value.as_object() else {
+                return Err(stop(
+                    self.stopped,
+                    TableError::NotAnArrayOfObjects {
+                        detail: format!("element {seen} is not an object"),
+                    },
+                ));
+            };
+
+            if !stated {
+                // Sorted rather than first-seen: a JSON object has no key order
+                // to inherit, so sorting is the one ordering that does not
+                // depend on which object happened to come first.
+                for key in object.keys() {
+                    let Err(at) = columns.binary_search(key) else {
+                        continue;
+                    };
+                    if columns.len() >= MAX_FIELDS {
+                        return Err(stop(
+                            self.stopped,
+                            TableError::NotAnArrayOfObjects {
+                                detail: format!("the objects carry more than {MAX_FIELDS} keys"),
+                            },
+                        ));
+                    }
+                    columns.insert(at, key.clone());
+                    for row in &mut rows {
+                        row.insert(at, None);
+                    }
+                    held = held.saturating_add(widened(rows.len()));
+                }
+            }
+
+            let row: Vec<Cell> = columns
                 .iter()
                 .map(|column| cell_of_value(object.get(column)))
-                .collect()
-        })
-        .collect();
+                .collect();
 
-    Ok(Parsed { columns, rows })
+            held = held.saturating_add(footprint(&row));
+            if held > self.ceiling {
+                return Err(stop(
+                    self.stopped,
+                    TableError::OverResidentCeiling {
+                        ceiling: self.ceiling,
+                    },
+                ));
+            }
+
+            rows.push(row);
+            seen += 1;
+        }
+
+        // Checked before the columns are, so an empty document reports that it
+        // holds no rows rather than that it names no columns.
+        if seen == 0 {
+            return Err(stop(self.stopped, TableError::Empty));
+        }
+        if columns.is_empty() {
+            return Err(stop(self.stopped, TableError::NoNames));
+        }
+
+        Ok(Parsed { columns, rows })
+    }
+}
+
+/// The elements of a JSON array, counted and dropped.
+struct Objects<'a> {
+    /// Why the walk stopped, where it stopped before the array ended.
+    stopped: &'a mut Option<TableError>,
+}
+
+impl<'de> de::Visitor<'de> for Objects<'_> {
+    type Value = usize;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an array of objects")
+    }
+
+    fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut seen = 0usize;
+
+        while let Some(value) = seq.next_element::<Value>()? {
+            if !value.is_object() {
+                return Err(stop(
+                    self.stopped,
+                    TableError::NotAnArrayOfObjects {
+                        detail: format!("element {seen} is not an object"),
+                    },
+                ));
+            }
+            seen += 1;
+        }
+
+        Ok(seen)
+    }
+}
+
+/// What widening `rows` rows by one absent cell costs.
+fn widened(rows: usize) -> u64 {
+    u64::try_from(rows * CELL_OVERHEAD).unwrap_or(u64::MAX)
+}
+
+/// What one row costs in memory, near enough for the ceiling to act on.
+fn footprint(row: &[Cell]) -> u64 {
+    let cells: usize = row
+        .iter()
+        .map(|cell| cell.as_deref().map_or(0, str::len) + CELL_OVERHEAD)
+        .sum();
+
+    u64::try_from(cells + ROW_OVERHEAD).unwrap_or(u64::MAX)
 }
 
 /// A text field as a cell. An empty field is a value the source did not supply.
@@ -273,8 +481,8 @@ fn cell_of_value(value: Option<&Value>) -> Cell {
 ///
 /// One exit, through `finish`, because that is where an unterminated quoted
 /// field is caught: a second exit that skipped it would accept a malformed file.
-fn records(mut reader: impl BufRead) -> Result<Vec<Record>, TableError> {
-    let mut csv = Csv::new();
+fn records(mut reader: impl BufRead, ceiling: u64) -> Result<Vec<Record>, TableError> {
+    let mut csv = Csv::new(ceiling);
 
     loop {
         let chunk = reader.fill_buf()?;
@@ -349,6 +557,12 @@ struct Csv {
 
     /// Whether the previous byte ended a record as the CR of a CRLF.
     after_cr: bool,
+
+    /// Bytes the completed records will cost once they are rows.
+    held: u64,
+
+    /// Bytes the completed records may cost before the read is abandoned.
+    ceiling: u64,
 }
 
 /// Longest one field may grow before the input is called malformed.
@@ -364,8 +578,9 @@ const MAX_FIELD: usize = 8 * 1024 * 1024;
 const MAX_FIELDS: usize = 4096;
 
 impl Csv {
-    /// A reader positioned at the first byte of the first line.
-    fn new() -> Self {
+    /// A reader positioned at the first byte of the first line, holding at most
+    /// `ceiling` bytes of completed records.
+    fn new(ceiling: u64) -> Self {
         Self {
             records: Vec::new(),
             fields: Vec::new(),
@@ -375,6 +590,8 @@ impl Csv {
             record_line: 1,
             started: false,
             after_cr: false,
+            held: 0,
+            ceiling,
         }
     }
 
@@ -526,9 +743,23 @@ impl Csv {
     }
 
     /// Move the fields read so far into a completed record.
+    ///
+    /// The ceiling is counted here rather than per byte: a record is what
+    /// becomes a row, and a partial one costs nothing that survives.
     fn end_record(&mut self) -> Result<(), TableError> {
         self.end_field()?;
         let fields = std::mem::take(&mut self.fields);
+
+        let row: usize = fields.iter().map(|text| text.len() + CELL_OVERHEAD).sum();
+        self.held = self
+            .held
+            .saturating_add(u64::try_from(row + ROW_OVERHEAD).unwrap_or(u64::MAX));
+        if self.held > self.ceiling {
+            return Err(TableError::OverResidentCeiling {
+                ceiling: self.ceiling,
+            });
+        }
+
         self.records.push((self.record_line, fields));
         self.started = false;
         Ok(())
@@ -558,6 +789,7 @@ mod tests {
             body.as_bytes(),
             TableFormat::Csv { header: true },
             &Schema::Auto,
+            u64::MAX,
         )
     }
 
@@ -652,6 +884,7 @@ mod tests {
             "13335,CLOUDFLARENET\n15169,GOOGLE\n".as_bytes(),
             TableFormat::Csv { header: false },
             &names,
+            u64::MAX,
         )
         .unwrap();
 
@@ -669,6 +902,7 @@ mod tests {
             "13335,CLOUDFLARENET\n".as_bytes(),
             TableFormat::Csv { header: false },
             &Schema::Auto,
+            u64::MAX,
         )
         .unwrap_err();
 
@@ -682,6 +916,7 @@ mod tests {
             "asn,name\n13335,CLOUDFLARENET\n".as_bytes(),
             TableFormat::Csv { header: true },
             &names,
+            u64::MAX,
         )
         .unwrap();
 
@@ -698,7 +933,7 @@ mod tests {
     #[test]
     fn json_objects_name_the_columns() {
         let body = r#"[{"asn": 13335, "name": "CLOUDFLARENET"}]"#;
-        let parsed = read(body.as_bytes(), TableFormat::Json, &Schema::Auto).unwrap();
+        let parsed = read(body.as_bytes(), TableFormat::Json, &Schema::Auto, u64::MAX).unwrap();
 
         assert_eq!(parsed.columns, ["asn", "name"]);
         assert_eq!(cells(&parsed), [["13335", "CLOUDFLARENET"]]);
@@ -712,7 +947,7 @@ mod tests {
             {"ip": "1.1.1.1", "country": "AU"},
             {"ip": "8.8.8.8", "asn": 15169}
         ]"#;
-        let parsed = read(body.as_bytes(), TableFormat::Json, &Schema::Auto).unwrap();
+        let parsed = read(body.as_bytes(), TableFormat::Json, &Schema::Auto, u64::MAX).unwrap();
 
         assert_eq!(parsed.columns, ["asn", "country", "ip"]);
         assert_eq!(parsed.rows[0][0], None);
@@ -727,7 +962,7 @@ mod tests {
         // the shape of the table under a consumer.
         let body = r#"[{"ip": "1.1.1.1", "country": "AU", "extra": 1}]"#;
         let names = Schema::Named(vec!["ip".to_string(), "country".to_string()]);
-        let parsed = read(body.as_bytes(), TableFormat::Json, &names).unwrap();
+        let parsed = read(body.as_bytes(), TableFormat::Json, &names, u64::MAX).unwrap();
 
         assert_eq!(parsed.columns, ["ip", "country"]);
         assert_eq!(cells(&parsed), [["1.1.1.1", "AU"]]);
@@ -736,7 +971,7 @@ mod tests {
     #[test]
     fn json_scalars_are_text_and_nested_values_keep_their_json() {
         let body = r#"[{"n": 42, "t": true, "z": null, "a": [1, 2], "o": {"k": "v"}}]"#;
-        let parsed = read(body.as_bytes(), TableFormat::Json, &Schema::Auto).unwrap();
+        let parsed = read(body.as_bytes(), TableFormat::Json, &Schema::Auto, u64::MAX).unwrap();
 
         assert_eq!(parsed.columns, ["a", "n", "o", "t", "z"]);
         assert_eq!(
@@ -748,7 +983,8 @@ mod tests {
     #[test]
     fn json_that_is_not_an_array_of_objects_is_refused() {
         for body in [r#"{"relays": []}"#, "[1, 2]", "not json at all"] {
-            let err = read(body.as_bytes(), TableFormat::Json, &Schema::Auto).unwrap_err();
+            let err =
+                read(body.as_bytes(), TableFormat::Json, &Schema::Auto, u64::MAX).unwrap_err();
             assert!(
                 matches!(err, TableError::NotAnArrayOfObjects { .. }),
                 "{body}: {err:?}"
@@ -757,8 +993,53 @@ mod tests {
     }
 
     #[test]
+    fn a_json_read_stops_at_the_ceiling_rather_than_parsing_the_document() {
+        // The document is malformed well past the point the ceiling is reached,
+        // so a read that reported that had parsed all of it -- which is the
+        // allocation the ceiling exists not to make.
+        use std::fmt::Write as _;
+
+        let mut body = String::from("[");
+        for at in 0..200u32 {
+            let asn = 64_500 + at;
+            let _ = write!(body, r#"{{"asn": {asn}, "name": "OPERATOR-{asn}"}},"#);
+        }
+        body.push_str(r#"{"asn": ]"#);
+
+        let stopped = read(body.as_bytes(), TableFormat::Json, &Schema::Auto, 512).unwrap_err();
+        assert!(
+            matches!(stopped, TableError::OverResidentCeiling { ceiling: 512 }),
+            "{stopped:?}"
+        );
+
+        // Unbounded, the same document is parsed far enough to meet the fault,
+        // so it is the ceiling doing the stopping.
+        let read_out =
+            read(body.as_bytes(), TableFormat::Json, &Schema::Auto, u64::MAX).unwrap_err();
+        assert!(
+            matches!(read_out, TableError::NotAnArrayOfObjects { .. }),
+            "{read_out:?}"
+        );
+    }
+
+    #[test]
+    fn a_json_element_that_is_not_an_object_is_named_by_its_position() {
+        // The walk stops on it, which leaves the document mid-array. Reporting
+        // what the deserializer then says about the remainder would lose the
+        // element that was actually wrong.
+        let body = r#"[{"ip": "1.1.1.1"}, {"ip": "8.8.8.8"}, 3]"#;
+
+        let err = read(body.as_bytes(), TableFormat::Json, &Schema::Auto, u64::MAX).unwrap_err();
+
+        assert!(
+            matches!(&err, TableError::NotAnArrayOfObjects { detail } if detail == "element 2 is not an object"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn an_empty_json_array_holds_no_rows() {
-        let err = read("[]".as_bytes(), TableFormat::Json, &Schema::Auto).unwrap_err();
+        let err = read("[]".as_bytes(), TableFormat::Json, &Schema::Auto, u64::MAX).unwrap_err();
         assert!(matches!(err, TableError::Empty), "{err:?}");
     }
 
