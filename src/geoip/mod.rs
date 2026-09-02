@@ -9,36 +9,56 @@
 //! GeoIP databases: which ones a service wants, getting them onto disk, and
 //! looking addresses up in them.
 //!
-//! [`config`] describes the databases; [`download`] provisions the files. The
-//! entry point is [`ensure_databases`], and its contract -- non-fatal, stale
-//! beats absent -- is documented on the [`download`] module. An app checks its
-//! configuration with [`validate`] when it loads it, because provisioning
-//! itself never fails loudly.
+//! [`GeoIpConfig`] describes the databases and [`ensure_databases`] provisions
+//! them. An app checks its configuration with [`validate`] when it loads it,
+//! because provisioning itself never fails loudly. [`GeoIp`] reads the
+//! provisioned files behind a cache and answers with a [`GeoIpRecord`].
 //!
-//! [`enricher`] reads the provisioned files behind a cache, [`record`] is what
-//! a lookup returns, and [`refresh`] swaps a reader when the file underneath it
-//! changes.
+//! # Non-fatal by contract
+//!
+//! [`ensure_databases`] returns `Ok` with `None` entries when a download fails.
+//! A GeoIP database going missing degrades enrichment; it must not stop a
+//! service from starting. Failures are logged at `warn` and a stale local file
+//! is preferred over no file at all.
+//!
+//! # Credentials
+//!
+//! MaxMind and IPinfo credentials are [`Secret`](crate::Secret) and never reach
+//! a log line. The IPinfo token is attached as a query parameter by the request
+//! builder rather than being formatted into the URL string, and a transport
+//! error is stripped of its URL before it is reported, so neither the logged URL
+//! nor the error text can carry it.
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use factbook::geoip::{GeoIpConfig, ensure_databases};
+//!
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let databases = ensure_databases(&GeoIpConfig::default()).await?;
+//! if let Some(city) = databases.city {
+//!     println!("city database is {:?} in {:?}", city.format, city.files);
+//! }
+//! # Ok(())
+//! # }
+//! ```
 
+// Private, with every public item re-exported below: the module layout is not
+// part of the API, so it can be rearranged without a major version. The table
+// half is arranged the same way.
 #[cfg(feature = "geoip-download")]
-#[cfg_attr(docsrs, doc(cfg(feature = "geoip-download")))]
-pub mod config;
+mod config;
 #[cfg(feature = "geoip-download")]
-#[cfg_attr(docsrs, doc(cfg(feature = "geoip-download")))]
-pub mod download;
+pub(crate) mod download;
 
 #[cfg(feature = "geoip-lookup")]
-#[cfg_attr(docsrs, doc(cfg(feature = "geoip-lookup")))]
-pub mod enricher;
+pub(crate) mod enricher;
 #[cfg(feature = "geoip-lookup")]
-#[cfg_attr(docsrs, doc(cfg(feature = "geoip-lookup")))]
-pub mod private;
+mod private;
 #[cfg(feature = "geoip-lookup")]
-#[cfg_attr(docsrs, doc(cfg(feature = "geoip-lookup")))]
-pub mod record;
-/// Reader refresh, as an inherent `impl` on [`enricher::GeoIp`].
+mod record;
 #[cfg(feature = "geoip-lookup")]
-#[cfg_attr(docsrs, doc(cfg(feature = "geoip-lookup")))]
-pub mod refresh;
+mod refresh;
 
 #[cfg(feature = "geoip-download")]
 pub use config::{
@@ -51,7 +71,7 @@ pub use download::{
 };
 
 #[cfg(feature = "geoip-lookup")]
-pub use enricher::{CacheConfig, GeoIp, GeoIpLookupError};
+pub use enricher::{CacheConfig, DatabasePaths, GeoIp, GeoIpLookupError};
 #[cfg(feature = "geoip-lookup")]
 pub use private::is_private;
 #[cfg(feature = "geoip-lookup")]

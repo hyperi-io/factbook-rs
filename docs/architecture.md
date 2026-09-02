@@ -38,15 +38,15 @@ A reader holds a memory map of the file. Writing a refresh into that file in pla
 
 Nothing dangles if a process dies mid-update:
 
-- The transfer holds an advisory lock on the file it writes, so two processes sharing a data directory cannot interleave into it. The kernel releases that lock when the process holding it goes away.
+- The transfer holds an advisory lock on a `.lock` file beside the destination, so two processes sharing a data directory cannot interleave into it. That file exists for the lock alone: the part file is unlinked and recreated mid-transfer, and a lock follows the inode rather than the name. The kernel releases the lock when the process holding it goes away.
 - A second process finding the lock held is turned away before it makes a request, so it spends none of the provider's quota and reads what is on disk.
 - A panic while the readers are being swapped poisons a lock guarding a path and a timestamp. It is recovered rather than failing every refresh from then on.
 
 ## A refusal keeps the previous database
 
-Verification runs against the staged file, before the rename. A file that fails is deleted and the copy already in place keeps being served. The ordering matters: a bad file at the destination carries a fresh modification time, so the freshness check would never replace it.
+The transfer checks what arrives, and the guard checks the staged file before the rename. Nothing is ever checked at the destination, because a bad file there would carry a fresh modification time the freshness check would then refuse to replace.
 
-Five checks, in the order they run:
+Six checks, in the order they run:
 
 ```mermaid
 flowchart LR
@@ -55,17 +55,22 @@ flowchart LR
     G --> M{format marker}
     M --> Z{volume against the copy on disk}
     Z --> K{answers a known address}
-    K -->|all pass| R[atomic rename]
+    K --> T{rows parse, for a table}
+    T -->|all pass| R[atomic rename]
 
-    L -.->|any fails| X[delete the staged file]
-    G -.-> X
+    L -.->|short body| Q[keep what arrived, to resume from]
+    G -.->|any fails| X[discard what arrived]
     M -.-> X
     Z -.-> X
     K -.-> X
+    T -.-> X
     X --> P[previous database keeps serving]
+    Q --> P
 ```
 
-The digest runs only where a publisher publishes one, and it is the expensive check: a full read and hash of the archive. The last two belong to the guard, which runs the volume floor first because two `stat` calls cost less than mapping a database.
+A short body is the one refusal that keeps its bytes: they are a valid prefix of the file, so the next run continues from them with a `Range` request rather than re-fetching tens of megabytes.
+
+The digest runs only where a publisher publishes one, and it is the expensive check: a full read and hash of the archive. The last three belong to the guard, which runs the volume floor first because two `stat` calls cost less than mapping a database. The last two of those never both apply -- a provider database is probed for an address and a table has its rows parsed, and the guard is built carrying only the one its payload takes.
 
 ## The cache is keyed on the address, not its text
 

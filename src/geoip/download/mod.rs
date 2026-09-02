@@ -79,6 +79,7 @@ pub(crate) const SECS_PER_DAY: u64 = 86_400;
 /// [`ensure_databases`] absorbs them all -- see the module-level non-fatal
 /// contract.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum GeoIpDownloadError {
     /// The HTTP client could not be built, or the request failed at the
     /// transport level.
@@ -116,6 +117,18 @@ pub enum GeoIpDownloadError {
     ArchiveMemberMissing {
         /// File name expected inside the archive.
         member: &'static str,
+    },
+
+    /// The body expanded past the ceiling decompression is allowed.
+    ///
+    /// A compressed body states nothing reliable about its expanded size, so a
+    /// hostile or corrupt one would otherwise write until the filesystem fills.
+    #[error("{url} expanded past the {limit} byte ceiling")]
+    TooLarge {
+        /// URL that was requested, without any credential.
+        url: String,
+        /// Ceiling that was exceeded, in bytes.
+        limit: u64,
     },
 
     /// The provider offers no database of the requested kind.
@@ -297,17 +310,30 @@ impl GeoIpDownloadError {
 /// provider name, so the format travels with the files.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum DatabaseFormat {
     /// MaxMind DB binary format, published as one file.
     #[default]
     Mmdb,
 
-    /// Comma-separated rows, published as one file per address family for a
-    /// geo database and as a single file for a table.
+    /// Comma-separated rows in a single file. No geo source modelled here
+    /// publishes one; a table source can.
     Csv,
 
     /// JSON rows, published as one file.
     Json,
+}
+
+impl DatabaseFormat {
+    /// The format's name, for a message a reader shows an operator.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Mmdb => "MaxMind DB",
+            Self::Csv => "CSV",
+            Self::Json => "JSON",
+        }
+    }
 }
 
 /// One provisioned database.
@@ -316,9 +342,9 @@ pub struct Database {
     /// Format of the files.
     pub format: DatabaseFormat,
 
-    /// The files on disk, in the order the provider publishes them: one file
-    /// for [`DatabaseFormat::Mmdb`], IPv4 then IPv6 for
-    /// [`DatabaseFormat::Csv`].
+    /// The files on disk. Every source modelled here publishes a single file,
+    /// so this holds one path; the vector carries a provider that splits a
+    /// database across files without a change to this signature.
     pub files: Vec<PathBuf>,
 }
 
@@ -710,6 +736,9 @@ mod telemetry {
     ) {
     }
 }
+
+#[cfg(test)]
+pub(crate) mod testkit;
 
 #[cfg(test)]
 mod tests;

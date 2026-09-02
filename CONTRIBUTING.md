@@ -98,7 +98,7 @@ By making a contribution to this project, you certify that:
    and may be redistributed consistent with this project or the license(s)
    involved.
 
-## How to Sign Off Your Commits
+### How to Sign Off Your Commits
 
 You must sign off each commit to indicate your acceptance of the DCO. Combine
 the signoff with your conventional commit message:
@@ -124,12 +124,9 @@ git config --global user.email "your.email@example.com"
 
 ## License for Contributions
 
-All contributions to this project are licensed under the Business Source
-License 1.1 (Apache-2.0), the same license that covers the project.
-
-Each version of the software (including your contributions) will automatically
-become available under the Apache License, Version 2.0 on the third
-anniversary of its release.
+Contributions are licensed under the Apache License, Version 2.0 -- the same
+license that covers the project, as stated in `LICENSE` and `NOTICE`. The
+`Signed-off-by` line described above is your DCO sign-off.
 
 ## How to Contribute
 

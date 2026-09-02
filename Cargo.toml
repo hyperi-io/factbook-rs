@@ -11,16 +11,30 @@ name = "factbook"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
-description = "GeoIP enrichment end to end: download and auto-update the MMDB databases, then look addresses up through a cache built for skewed IP traffic."
+description = "A high-speed, self-maintaining fact enricher for data at scale. Point it at reference data and it fetches, verifies, indexes and serves it, keeping itself current. IP geolocation is the batteries-included case."
 license = "Apache-2.0"
 repository = "https://github.com/hyperi-io/factbook-rs"
+documentation = "https://docs.rs/factbook"
+readme = "README.md"
 publish = true
-keywords = ["geoip", "mmdb", "maxmind", "enrichment", "ip"]
+keywords = ["geoip", "mmdb", "maxmind", "enrichment", "reference-data"]
 categories = ["network-programming", "caching", "database"]
-# benches/ ships: the manifest declares that target, so excluding the file
-# warns on every publish and leaves the package describing something it does
-# not contain.
-exclude = [".claude/", ".github/", ".hyperi-ai/", "docs/", "scripts/"]
+# An allowlist, so a file must be named here to reach a consumer. The leading
+# slashes anchor to the package root: these are gitignore-style globs, and a
+# bare `README.md` would also match `docs/README.md`.
+include = [
+    "/src/**",
+    # The bench is a declared target and opens the fixtures, so shipping one
+    # without the other panics instead of benchmarking.
+    "/benches/**",
+    "/tests/data/**",
+    "/README.md",
+    "/LICENSE",
+    "/NOTICE",
+    "/SOURCES.md",
+    "/SECURITY.md",
+    "/CHANGELOG.md",
+]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -143,7 +157,7 @@ metrics = { version = ">=0.24.5, <0.25", optional = true }
 tokio = { version = ">=1.50.0, <2", features = ["full", "test-util"] }
 tempfile = ">=3.24.0, <4"
 serde_json = ">=1.0.149, <2"
-criterion = { version = ">=0.5, <0.9", features = ["html_reports"] }
+criterion = { version = ">=0.8.2, <0.9", features = ["html_reports"] }
 pretty_assertions = ">=1.4.1, <2"
 # Serve the provider URLs over loopback so the download tests exercise the
 # transfer, the auth shapes and the status handling, not a URL string.

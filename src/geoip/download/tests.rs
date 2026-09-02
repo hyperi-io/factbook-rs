@@ -14,7 +14,6 @@
 //! itself is exercised against the same request shapes served over loopback.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
@@ -22,6 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use super::testkit::{gzip, mmdb_body, sha256_hex, tar_gz};
 use super::*;
 use crate::geoip::config::AutoDownloadConfig;
 
@@ -171,26 +171,13 @@ fn resumable_transfer(url: String, dest: PathBuf, checksum_url: String) -> Trans
     }
 }
 
-/// Bytes shaped like a MaxMind DB: a payload, then the metadata marker the
-/// format ends with.
-fn mmdb_body(payload: &[u8]) -> Vec<u8> {
-    let mut body = payload.to_vec();
-    body.extend_from_slice(b"\xab\xcd\xefMaxMind.com");
-    body.extend_from_slice(b"binary metadata section");
-    body
-}
-
-/// SHA-256 of a body as lowercase hex, the way a provider publishes it.
-fn sha256_hex(body: &[u8]) -> String {
-    use sha2::Digest;
-    use std::fmt::Write;
-
-    sha2::Sha256::digest(body)
-        .iter()
-        .fold(String::new(), |mut hex, byte| {
-            let _ = write!(hex, "{byte:02x}");
-            hex
-        })
+/// A transfer of a gzip body with no digest behind it, which resumes on the
+/// container's own integrity check alone.
+fn gzip_transfer(url: String, dest: PathBuf) -> Transfer {
+    Transfer {
+        archive: Archive::Gzip,
+        ..raw_transfer(url, dest)
+    }
 }
 
 /// A one-shot server that writes `chunks` with `gap` between them.
@@ -239,34 +226,43 @@ fn drip_server_promising(chunks: Vec<Vec<u8>>, length: usize, gap: Duration) -> 
     format!("http://{address}/db.mmdb")
 }
 
-/// A gzip stream wrapping `payload`.
-fn gzip(payload: &[u8]) -> Vec<u8> {
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    encoder.write_all(payload).unwrap();
-    encoder.finish().unwrap()
-}
+/// A one-shot server that answers only once the test releases it.
+///
+/// Returns the URL, a receiver that fires when the request head has arrived,
+/// and the sender that lets the body go. A transfer aimed here holds its lock
+/// from the moment the receiver fires until the sender is used, which is the
+/// window a second writer has to be turned away in.
+fn held_server(
+    body: Vec<u8>,
+) -> (
+    String,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+    let (arrived, has_arrived) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
 
-/// A gzip-compressed tar holding `payload` as `member`, under the dated
-/// directory MaxMind ships it in.
-fn tar_gz(member: &str, payload: &[u8]) -> Vec<u8> {
-    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
-        Vec::new(),
-        flate2::Compression::fast(),
-    ));
-    let mut header = tar::Header::new_gnu();
-    header.set_size(payload.len() as u64);
-    header.set_mode(0o644);
-    header.set_cksum();
-    builder
-        .append_data(
-            &mut header,
-            format!("GeoLite2-City_20241231/{member}"),
-            payload,
-        )
-        .unwrap();
-    let mut encoder = builder.into_inner().unwrap();
-    encoder.flush().unwrap();
-    encoder.finish().unwrap()
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+
+        let mut buffer = [0u8; 2048];
+        let _ = socket.read(&mut buffer).await;
+        let _ = arrived.send(());
+        let _ = released.await;
+
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+        let _ = socket.write_all(head.as_bytes()).await;
+        let _ = socket.write_all(&body).await;
+        let _ = socket.flush().await;
+    });
+
+    (format!("http://{address}/db.mmdb"), has_arrived, release)
 }
 
 /// Names of everything left in a directory that a reader might open.
@@ -941,9 +937,11 @@ async fn maxmind_basic_auth_reaches_the_request() {
 fn a_database_carries_when_it_was_built_not_when_it_was_fetched() {
     // The age metric reads the publisher's stamp because the two diverge by
     // however long the copy sat published before anyone fetched it.
+    // The fixture is stamped with a fixed build epoch months behind whenever the
+    // file itself was written, so the two cannot collapse onto one another.
     let path = std::path::Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/data/GeoLite2-City-Test.mmdb"
+        "/tests/data/city-test.mmdb"
     ));
 
     let built = crate::geoip::enricher::open_reader(path)
@@ -1002,6 +1000,38 @@ fn a_refused_download_is_counted_apart_from_one_that_never_arrived() {
     );
 }
 
+#[test]
+fn a_408_is_the_one_4xx_worth_coming_back_from() {
+    // A request timeout is the server inviting a retry. The rest of the 4xx
+    // range is its answer about this request and will not change on its own,
+    // so retrying it spends the provider's quota and hides the cause.
+    let at = |status| GeoIpDownloadError::UnexpectedStatus {
+        url: "https://example.invalid/db".into(),
+        status,
+    };
+
+    assert!(!at(408).is_permanent(), "408 is worth another attempt");
+    for status in [400, 401, 403, 404, 407, 409, 410, 451] {
+        assert!(at(status).is_permanent(), "{status}");
+    }
+    for status in [500, 502, 503, 504] {
+        assert!(!at(status).is_permanent(), "{status}");
+    }
+}
+
+#[test]
+fn a_body_that_expanded_past_the_ceiling_is_worth_fetching_again() {
+    // Nothing about the configuration produced it, so the next build may well
+    // be the size it should be.
+    let err = GeoIpDownloadError::TooLarge {
+        url: "https://example.invalid/db".into(),
+        limit: 4 * 1024 * 1024 * 1024,
+    };
+
+    assert!(!err.is_permanent(), "{err:?}");
+    assert!(err.to_string().contains("4294967296"), "{err}");
+}
+
 #[tokio::test]
 async fn a_second_writer_is_turned_away_rather_than_interleaved() {
     let server = MockServer::start().await;
@@ -1026,6 +1056,87 @@ async fn a_second_writer_is_turned_away_rather_than_interleaved() {
     assert!(matches!(err, GeoIpDownloadError::Busy { .. }), "{err:?}");
     // Turned away before the request, so the other process keeps its quota.
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_transfer_in_flight_turns_a_second_transfer_of_the_same_database_away() {
+    // The same exclusion, driven by two real transfers rather than by a lock
+    // the test holds: the first is held mid-body while the second runs.
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("db.mmdb");
+    let body = mmdb_body(b"the database the first writer is fetching");
+    let (url, arrived, release) = held_server(body.clone());
+
+    let first = tokio::spawn({
+        let dest = dest.clone();
+        async move { raw_transfer(url, dest).run(&default_client()).await }
+    });
+
+    // The request is on the wire, so the first transfer is holding the lock.
+    arrived.await.unwrap();
+
+    // Port 1 on loopback refuses immediately, so a second transfer that got
+    // past the lock would fail as a transport error rather than as Busy.
+    let err = raw_transfer("http://127.0.0.1:1/db.mmdb".to_string(), dest.clone())
+        .run(&default_client())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, GeoIpDownloadError::Busy { .. }), "{err:?}");
+    assert_eq!(err.outcome(), "busy");
+
+    release.send(()).unwrap();
+    assert_eq!(first.await.unwrap().unwrap(), dest);
+    assert_eq!(fs::read(&dest).unwrap(), body);
+}
+
+#[tokio::test]
+async fn a_destination_that_cannot_be_renamed_over_leaves_no_staged_file() {
+    // The rename is the last step and can still fail -- a directory sitting
+    // where the database belongs is the reachable case -- and the staged file
+    // has to go with it rather than sit there as a second copy.
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("db.mmdb");
+    fs::create_dir(&dest).unwrap();
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(mmdb_body(b"a real database")))
+        .mount(&server)
+        .await;
+
+    let err = raw_transfer(format!("{}/db.mmdb", server.uri()), dest.clone())
+        .run(&default_client())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, GeoIpDownloadError::Io(_)), "{err:?}");
+    assert!(dest.is_dir(), "the destination was left as it was found");
+    assert_eq!(entries(dir.path()), ["db.mmdb"]);
+}
+
+#[tokio::test]
+async fn a_data_directory_that_cannot_be_created_costs_no_request() {
+    // A file where the data directory belongs is the config fault that reaches
+    // here, and it is reported before the lock is taken or a socket is opened.
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("geoip");
+    fs::write(&blocker, b"not a directory").unwrap();
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(mmdb_body(b"a real database")))
+        .mount(&server)
+        .await;
+
+    let err = raw_transfer(format!("{}/db.mmdb", server.uri()), blocker.join("db.mmdb"))
+        .run(&default_client())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, GeoIpDownloadError::Io(_)), "{err:?}");
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(entries(dir.path()), ["geoip"]);
 }
 
 #[tokio::test]
@@ -1365,6 +1476,53 @@ async fn a_checksum_mismatch_leaves_the_previous_database_in_place() {
     );
     assert_eq!(fs::read(&dest).unwrap(), good);
     assert_eq!(entries(dir.path()), ["origin-asn.mmdb"]);
+}
+
+#[tokio::test]
+async fn a_digest_that_is_not_a_sha256_leaves_the_previous_database_in_place() {
+    // A release asset redirects to a CDN that answers 200 with a page, and a
+    // prefixed or empty digest is the same fault: nothing to check against.
+    for body in [
+        "<!DOCTYPE html><html><title>Not Found</title></html>".to_string(),
+        format!("sha256:{}", sha256_hex(&mmdb_body(b"what was published"))),
+        String::new(),
+    ] {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("db.mmdb");
+        let good = mmdb_body(b"yesterday's database");
+        fs::write(&dest, &good).unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/db.mmdb"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(mmdb_body(b"today's database")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/db.mmdb.sha256"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.clone()))
+            .mount(&server)
+            .await;
+
+        let err = resumable_transfer(
+            format!("{}/db.mmdb", server.uri()),
+            dest.clone(),
+            format!("{}/db.mmdb.sha256", server.uri()),
+        )
+        .run(&default_client())
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, GeoIpDownloadError::MalformedChecksum { url } if url.ends_with("/db.mmdb.sha256")),
+            "{body:?}: {err:?}"
+        );
+        // Bytes arrived and were rejected, which is the provider's fault rather
+        // than the network's.
+        assert_eq!(err.outcome(), "refused", "{body:?}");
+        // The requirement: the copy on disk is still there, byte for byte.
+        assert_eq!(fs::read(&dest).unwrap(), good, "{body:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1917,6 +2075,56 @@ async fn a_raw_body_with_no_digest_is_never_continued() {
         requests[0].headers.get("range").is_none(),
         "the request must not ask for a range it cannot check"
     );
+}
+
+#[tokio::test]
+async fn a_gzip_resume_spliced_from_another_build_fails_the_decode() {
+    // A compressed transfer is allowed to continue with no digest behind it,
+    // because the container's own integrity check is what catches a prefix of
+    // one build spliced onto the tail of the next.
+    const AT: usize = 24;
+
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("db.mmdb");
+    let part = dir.path().join("db.mmdb.part");
+
+    let good = mmdb_body(b"yesterday's database");
+    fs::write(&dest, &good).unwrap();
+
+    let yesterday = gzip(&mmdb_body(&b"yesterday's build ".repeat(64)));
+    let today = gzip(&mmdb_body(&b"today's build ".repeat(64)));
+    // Past the ten-byte gzip header, so the splice lands inside the deflate
+    // stream rather than on two identical headers.
+    fs::write(&part, &yesterday[..AT]).unwrap();
+
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header(
+                    "content-range",
+                    format!("bytes {AT}-{}/{}", today.len() - 1, today.len()).as_str(),
+                )
+                .set_body_bytes(today[AT..].to_vec()),
+        )
+        .mount(&server)
+        .await;
+
+    let err = gzip_transfer(format!("{}/db.mmdb", server.uri()), dest.clone())
+        .run(&default_client())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, GeoIpDownloadError::Io(_)), "{err:?}");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests[0].headers.get("range").unwrap(),
+        format!("bytes={AT}-").as_str()
+    );
+    // The destination is untouched, and the spliced prefix is gone rather than
+    // left to poison the next attempt.
+    assert_eq!(fs::read(&dest).unwrap(), good);
+    assert_eq!(entries(dir.path()), ["db.mmdb"]);
 }
 
 #[tokio::test]

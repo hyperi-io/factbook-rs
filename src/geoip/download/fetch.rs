@@ -27,9 +27,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use reqwest::{Client, RequestBuilder, StatusCode};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use super::verify::Guard;
 use super::{DatabaseFormat, GeoIpDownloadError};
@@ -70,8 +70,47 @@ const METADATA_TAIL_BYTES: u64 = 128 * 1024;
 /// Length of a SHA-256 digest written as hex.
 const SHA256_HEX_LEN: usize = 64;
 
+/// Ceiling on a digest body. `sha256sum` output is one short line, so anything
+/// past this is not a digest and is refused rather than buffered.
+const CHECKSUM_BODY_LIMIT: usize = 4 * 1024;
+
+/// What replaces a query value in a URL that is about to be logged.
+const REDACTED: &str = "<redacted>";
+
+/// A URL safe to log or put in an error, with every query value removed.
+///
+/// This crate never formats its own credentials into a URL, but a table source
+/// is a string an operator wrote, and an authenticated one has nowhere to carry
+/// its token except the query. Parameter names are kept because they say which
+/// endpoint shape was used and carry nothing secret.
+fn loggable(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+
+    let mut safe = String::with_capacity(url.len());
+    safe.push_str(base);
+    for (position, pair) in query.split('&').enumerate() {
+        safe.push(if position == 0 { '?' } else { '&' });
+        safe.push_str(pair.split_once('=').map_or(pair, |(name, _)| name));
+        safe.push('=');
+        safe.push_str(REDACTED);
+    }
+
+    safe
+}
+
 /// Read size while digesting a file, which runs to tens of megabytes.
 const DIGEST_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Ceiling on what one compressed body may expand to.
+///
+/// A gzip header states nothing about the expanded size, so without a ceiling a
+/// small hostile body writes until the filesystem fills -- and `data_dir`
+/// defaults under `/var`, which is usually the root filesystem. Set far above
+/// any real reference dataset: the largest database modelled here is under
+/// 200 MB.
+const MAX_EXPANDED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Openers of a markup document, lowercase, for a payload that should be text.
 const MARKUP_OPENERS: [&[u8]; 3] = [b"<!doctype", b"<html", b"<?xml"];
@@ -165,6 +204,11 @@ pub(crate) fn client(
     Ok(Client::builder()
         .tls_backend_rustls()
         .user_agent(format!("factbook/{}", crate::VERSION))
+        // Off because a credential can ride in the query string, and reqwest's
+        // referer keeps the query: it strips only user, password and fragment.
+        // A provider that answers 302 -- the sapics sources always do, GitHub
+        // releases redirect to a CDN -- would hand the token to the next host.
+        .referer(false)
         .connect_timeout(connect_timeout)
         // An idle timeout, and deliberately no whole-request one: a database
         // body is hundreds of megabytes, so a total-time limit caps the link
@@ -241,14 +285,20 @@ impl Transfer {
                 });
             }
             // A filesystem with no lock support must not stop a lone process
-            // from downloading.
+            // from downloading. At warn because it silently removes the only
+            // thing stopping two replicas sharing a volume from interleaving
+            // their writes into one staged file.
             Err(fs::TryLockError::Error(e)) => {
-                debug!(dest = %self.dest.display(), error = %e, "file locking unavailable");
+                warn!(
+                    dest = %self.dest.display(),
+                    error = %e,
+                    "file locking unavailable, so a concurrent writer cannot be detected"
+                );
             }
         }
 
         info!(
-            url = %self.url,
+            url = %loggable(&self.url),
             dest = %self.dest.display(),
             archive = ?self.archive,
             "downloading GeoIP database"
@@ -315,7 +365,7 @@ impl Transfer {
     /// served, and it will keep being served until a later download passes.
     fn rejected(&self, error: GeoIpDownloadError) -> GeoIpDownloadError {
         error!(
-            url = %self.url,
+            url = %loggable(&self.url),
             dest = %self.dest.display(),
             reason = %error,
             "rejected a GeoIP download, keeping the file already on disk"
@@ -345,7 +395,7 @@ impl Transfer {
         }
 
         warn!(
-            url = %self.url,
+            url = %loggable(&self.url),
             fallback = %fallback,
             "GeoIP database not published at that URL, trying the previous one"
         );
@@ -402,11 +452,15 @@ impl Transfer {
             fs::File::create(part)?
         };
         let mut written = if resuming { resume_from } else { 0 };
+        // What the part file already held. A range the server ignored leaves
+        // `resume_from` set while nothing was kept, so the rate has to measure
+        // against this rather than against `resume_from`.
+        let carried = written;
         let expected = response.content_length().map(|length| length + written);
 
         if resume_from > 0 {
             info!(
-                url = %url,
+                url = %loggable(url),
                 resumed_from = resume_from,
                 honoured = resuming,
                 "continuing an interrupted GeoIP download"
@@ -432,10 +486,10 @@ impl Transfer {
 
             if reported.elapsed() >= PROGRESS_INTERVAL {
                 info!(
-                    url = %url,
+                    url = %loggable(url),
                     downloaded_bytes = written,
                     expected_bytes = expected,
-                    rate_kib_per_sec = rate_kib_per_sec(written - resume_from, started.elapsed()),
+                    rate_kib_per_sec = rate_kib_per_sec(written - carried, started.elapsed()),
                     "downloading GeoIP database"
                 );
                 reported = Instant::now();
@@ -456,7 +510,7 @@ impl Transfer {
             && written != expected
         {
             return Err(GeoIpDownloadError::Truncated {
-                url: url.to_string(),
+                url: loggable(url),
                 expected,
                 actual: written,
             });
@@ -479,7 +533,7 @@ fn refused(
 ) -> GeoIpDownloadError {
     if status == StatusCode::TOO_MANY_REQUESTS {
         return GeoIpDownloadError::RateLimited {
-            url: url.to_string(),
+            url: loggable(url),
             // Providers ban a client that ignores this, so the delay is carried
             // to the caller rather than being retried inside the transfer.
             retry_after_secs: headers
@@ -496,20 +550,18 @@ fn refused(
     if let Some(fields) = credential.fields() {
         if status == StatusCode::UNAUTHORIZED {
             return GeoIpDownloadError::CredentialRejected {
-                url: url.to_string(),
+                url: loggable(url),
                 status: status.as_u16(),
                 fields,
             };
         }
         if status == StatusCode::FORBIDDEN {
-            return GeoIpDownloadError::NotEntitled {
-                url: url.to_string(),
-            };
+            return GeoIpDownloadError::NotEntitled { url: loggable(url) };
         }
     }
 
     GeoIpDownloadError::UnexpectedStatus {
-        url: url.to_string(),
+        url: loggable(url),
         status: status.as_u16(),
     }
 }
@@ -568,7 +620,7 @@ async fn fetch_checksum(
     url: &str,
     credential: &Credential,
 ) -> Result<String, GeoIpDownloadError> {
-    let response = credential
+    let mut response = credential
         .apply(client.get(url))
         .send()
         .await
@@ -576,17 +628,30 @@ async fn fetch_checksum(
     let status = response.status();
     if !status.is_success() {
         return Err(GeoIpDownloadError::UnexpectedStatus {
-            url: url.to_string(),
+            url: loggable(url),
             status: status.as_u16(),
         });
     }
 
-    let body = response.text().await.map_err(reqwest::Error::without_url)?;
+    // Read a bounded prefix rather than the whole body: a digest endpoint that
+    // answers with gigabytes would otherwise be buffered whole before the
+    // length check below ever runs.
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(reqwest::Error::without_url)?
+    {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > CHECKSUM_BODY_LIMIT {
+            return Err(GeoIpDownloadError::MalformedChecksum { url: loggable(url) });
+        }
+    }
+
+    let body = String::from_utf8_lossy(&bytes);
     let digest = body.split_whitespace().next().unwrap_or_default();
     if digest.len() != SHA256_HEX_LEN || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(GeoIpDownloadError::MalformedChecksum {
-            url: url.to_string(),
-        });
+        return Err(GeoIpDownloadError::MalformedChecksum { url: loggable(url) });
     }
 
     Ok(digest.to_ascii_lowercase())
@@ -684,13 +749,12 @@ fn materialise_guarded(
             fs::rename(part, staged)?;
         }
         Archive::Gzip => {
-            let mut decoder = GzDecoder::new(io::BufReader::new(source));
+            let decoder = MultiGzDecoder::new(io::BufReader::new(source));
             let mut out = io::BufWriter::new(fs::File::create(staged)?);
-            io::copy(&mut decoder, &mut out)?;
-            io::Write::flush(&mut out)?;
+            copy_bounded(decoder, &mut out, dest)?;
         }
         Archive::TarGz { member } => {
-            extract_member(source, staged, member)?;
+            extract_member(source, staged, member, dest)?;
         }
     }
 
@@ -708,8 +772,45 @@ fn materialise_guarded(
     guard.admit(staged, dest, format)?;
 
     let size = fs::metadata(staged)?.len();
+
+    // A rename is atomic against another process but says nothing about the
+    // bytes reaching disk. Without this, a crash in the window leaves a torn
+    // file carrying a fresh mtime, which the freshness check then refuses to
+    // replace for the whole of `max_age_days`.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(staged)?
+        .sync_all()?;
     fs::rename(staged, dest)?;
+    // Best effort: makes the rename itself durable, and not every filesystem
+    // allows a directory to be synced.
+    if let Some(parent) = dest.parent() {
+        let _ = fs::File::open(parent).and_then(|dir| dir.sync_all());
+    }
+
     Ok(size)
+}
+
+/// Copy a decompressed stream, refusing one that runs past the ceiling.
+///
+/// Reads one byte past the limit so a body sitting exactly on it is admitted
+/// rather than reported as an overrun.
+fn copy_bounded(
+    source: impl io::Read,
+    out: &mut impl io::Write,
+    dest: &Path,
+) -> Result<(), GeoIpDownloadError> {
+    let written = io::copy(&mut source.take(MAX_EXPANDED_BYTES + 1), out)?;
+    io::Write::flush(out)?;
+
+    if written > MAX_EXPANDED_BYTES {
+        return Err(GeoIpDownloadError::TooLarge {
+            url: dest.display().to_string(),
+            limit: MAX_EXPANDED_BYTES,
+        });
+    }
+
+    Ok(())
 }
 
 /// Extract a single named member from a gzip-compressed tar.
@@ -721,17 +822,20 @@ fn extract_member(
     source: fs::File,
     staged: &Path,
     member: &'static str,
+    dest: &Path,
 ) -> Result<(), GeoIpDownloadError> {
-    let decoder = GzDecoder::new(io::BufReader::new(source));
+    let decoder = MultiGzDecoder::new(io::BufReader::new(source));
     let mut archive = tar::Archive::new(decoder);
 
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let is_match = entry.path()?.file_name().is_some_and(|name| name == member);
+        // A directory entry can carry the member's name and copies zero bytes,
+        // which would stage an empty file rather than report the member absent.
+        let is_file = entry.header().entry_type().is_file();
+        let is_match = is_file && entry.path()?.file_name().is_some_and(|name| name == member);
         if is_match {
             let mut out = io::BufWriter::new(fs::File::create(staged)?);
-            io::copy(&mut entry, &mut out)?;
-            io::Write::flush(&mut out)?;
+            copy_bounded(&mut entry, &mut out, dest)?;
             return Ok(());
         }
     }
@@ -751,7 +855,10 @@ fn with_extension(path: &Path, extension: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use tar::EntryType;
+
     use super::*;
+    use crate::geoip::download::testkit::{gzip, mmdb_body, tar_gz, tar_gz_of};
 
     #[test]
     fn temp_names_append_rather_than_replace() {
@@ -808,6 +915,31 @@ mod tests {
     }
 
     #[test]
+    fn a_logged_url_keeps_its_parameter_names_and_drops_their_values() {
+        // A table source is a string an operator wrote, and an authenticated
+        // one has nowhere to carry its token but the query.
+        assert_eq!(
+            loggable("https://internal.example/feed.csv?api_key=AKIAsecret"),
+            "https://internal.example/feed.csv?api_key=<redacted>"
+        );
+        assert_eq!(
+            loggable("https://example.invalid/db?suffix=tar.gz&token=abc"),
+            "https://example.invalid/db?suffix=<redacted>&token=<redacted>"
+        );
+
+        // A parameter with no value still loses nothing, and a URL with no
+        // query is left exactly as it was.
+        assert_eq!(
+            loggable("https://example.invalid/db?bare"),
+            "https://example.invalid/db?bare=<redacted>"
+        );
+        assert_eq!(
+            loggable("https://example.invalid/db.mmdb"),
+            "https://example.invalid/db.mmdb"
+        );
+    }
+
+    #[test]
     fn the_default_client_builds() {
         // The default arm sets a TLS backend, a user agent and two timeouts, any
         // of which can fail the build at runtime rather than at compile time.
@@ -854,30 +986,15 @@ mod tests {
         assert!(part.exists(), "a resumable part file is kept");
     }
 
-    /// Bytes carrying the metadata marker a MaxMind DB ends with.
-    fn mmdb_bytes(payload: &[u8]) -> Vec<u8> {
-        let mut body = payload.to_vec();
-        body.extend_from_slice(MMDB_MARKER);
-        body.extend_from_slice(b"binary metadata section");
-        body
-    }
-
     #[test]
     fn materialise_gzip_writes_the_decompressed_file() {
-        use std::io::Write;
-
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("db.mmdb");
         let part = with_extension(&dest, PART_EXT);
         let staged = with_extension(&dest, STAGE_EXT);
 
-        let payload = mmdb_bytes(b"a body that round-trips");
-        let mut encoder = flate2::write::GzEncoder::new(
-            fs::File::create(&part).unwrap(),
-            flate2::Compression::fast(),
-        );
-        encoder.write_all(&payload).unwrap();
-        encoder.finish().unwrap();
+        let payload = mmdb_body(b"a body that round-trips");
+        fs::write(&part, gzip(&payload)).unwrap();
 
         let size = materialise(&part, &staged, &dest, Archive::Gzip, DatabaseFormat::Mmdb).unwrap();
         assert_eq!(usize::try_from(size).unwrap(), payload.len());
@@ -892,7 +1009,7 @@ mod tests {
         let part = with_extension(&dest, PART_EXT);
         let staged = with_extension(&dest, STAGE_EXT);
 
-        let payload = mmdb_bytes(b"raw body");
+        let payload = mmdb_body(b"raw body");
         fs::write(&part, &payload).unwrap();
         let size = materialise(&part, &staged, &dest, Archive::Raw, DatabaseFormat::Mmdb).unwrap();
 
@@ -922,37 +1039,14 @@ mod tests {
 
     #[test]
     fn materialise_tar_gz_extracts_the_named_member() {
-        use std::io::Write;
-
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("GeoLite2-City.mmdb");
         let part = with_extension(&dest, PART_EXT);
         let staged = with_extension(&dest, STAGE_EXT);
 
         // Mirror the real layout: the member sits under a dated directory.
-        let payload = mmdb_bytes(b"city database bytes");
-        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
-            fs::File::create(&part).unwrap(),
-            flate2::Compression::fast(),
-        ));
-        let mut header = tar::Header::new_gnu();
-        header.set_size(payload.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder
-            .append_data(
-                &mut header,
-                "GeoLite2-City_20241231/GeoLite2-City.mmdb",
-                &payload[..],
-            )
-            .unwrap();
-        builder
-            .into_inner()
-            .unwrap()
-            .finish()
-            .unwrap()
-            .flush()
-            .unwrap();
+        let payload = mmdb_body(b"city database bytes");
+        fs::write(&part, tar_gz("GeoLite2-City.mmdb", &payload)).unwrap();
 
         let size = materialise(
             &part,
@@ -976,11 +1070,7 @@ mod tests {
         let part = with_extension(&dest, PART_EXT);
         let staged = with_extension(&dest, STAGE_EXT);
 
-        let builder = tar::Builder::new(flate2::write::GzEncoder::new(
-            fs::File::create(&part).unwrap(),
-            flate2::Compression::fast(),
-        ));
-        builder.into_inner().unwrap().finish().unwrap();
+        fs::write(&part, tar_gz_of(&[])).unwrap();
 
         let err = materialise(
             &part,
@@ -998,6 +1088,114 @@ mod tests {
             "{err:?}"
         );
         assert!(!dest.exists());
+    }
+
+    /// Extract `member` from `archive`, reporting what landed at the
+    /// destination.
+    fn extract(
+        archive: &[u8],
+        member: &'static str,
+    ) -> (tempfile::TempDir, PathBuf, Result<u64, GeoIpDownloadError>) {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join(member);
+        let part = with_extension(&dest, PART_EXT);
+        let staged = with_extension(&dest, STAGE_EXT);
+        fs::write(&part, archive).unwrap();
+
+        let result = materialise(
+            &part,
+            &staged,
+            &dest,
+            Archive::TarGz { member },
+            DatabaseFormat::Mmdb,
+        );
+        (dir, dest, result)
+    }
+
+    #[test]
+    fn materialise_tar_gz_takes_the_first_member_carrying_the_name() {
+        // A rebuilt archive can carry the name twice. Taking the later one
+        // would make which copy lands depend on the order entries were written
+        // in, which no publisher states.
+        let first = mmdb_body(b"the copy the extraction stops at");
+        let second = mmdb_body(b"a second copy filed under the same name");
+        let archive = tar_gz_of(&[
+            (
+                "GeoLite2-City_20241231/GeoLite2-City.mmdb",
+                EntryType::Regular,
+                &first,
+            ),
+            (
+                "GeoLite2-City_20250131/GeoLite2-City.mmdb",
+                EntryType::Regular,
+                &second,
+            ),
+        ]);
+
+        let (_dir, dest, result) = extract(&archive, "GeoLite2-City.mmdb");
+
+        assert_eq!(usize::try_from(result.unwrap()).unwrap(), first.len());
+        assert_eq!(fs::read(&dest).unwrap(), first);
+    }
+
+    #[test]
+    fn materialise_tar_gz_does_not_take_a_directory_for_the_member() {
+        // A directory entry can carry the member's name and copies zero bytes,
+        // so matching it would stage an empty file rather than report the
+        // member absent.
+        let archive = tar_gz_of(&[("GeoLite2-City.mmdb", EntryType::Directory, &[][..])]);
+
+        let (dir, dest, result) = extract(&archive, "GeoLite2-City.mmdb");
+        let err = result.unwrap_err();
+
+        assert!(
+            matches!(err, GeoIpDownloadError::ArchiveMemberMissing { member } if member == "GeoLite2-City.mmdb"),
+            "{err:?}"
+        );
+        assert!(!dest.exists());
+        assert!(!with_extension(&dest, STAGE_EXT).exists());
+        // The part file is the caller's to clean up, so only it is left.
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "nothing was staged"
+        );
+    }
+
+    #[test]
+    fn materialise_tar_gz_reaches_a_member_behind_unrelated_entries() {
+        // The published archives lead with a directory entry, a licence and a
+        // readme, so the scan has to walk past them rather than stop at the
+        // first thing it reads.
+        let payload = mmdb_body(b"city database bytes");
+        let archive = tar_gz_of(&[
+            ("GeoLite2-City_20241231/", EntryType::Directory, &[][..]),
+            (
+                "GeoLite2-City_20241231/COPYRIGHT.txt",
+                EntryType::Regular,
+                b"(c) MaxMind",
+            ),
+            (
+                "GeoLite2-City_20241231/LICENSE.txt",
+                EntryType::Regular,
+                b"terms",
+            ),
+            (
+                "GeoLite2-City_20241231/GeoLite2-City-Blocks-IPv4.csv",
+                EntryType::Regular,
+                b"network,geoname_id\n",
+            ),
+            (
+                "GeoLite2-City_20241231/GeoLite2-City.mmdb",
+                EntryType::Regular,
+                &payload,
+            ),
+        ]);
+
+        let (_dir, dest, result) = extract(&archive, "GeoLite2-City.mmdb");
+
+        assert_eq!(usize::try_from(result.unwrap()).unwrap(), payload.len());
+        assert_eq!(fs::read(&dest).unwrap(), payload);
     }
 
     #[test]

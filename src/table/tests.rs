@@ -9,13 +9,13 @@
 //! Every test here stays off the public internet: a source is a URL the
 //! operator chose, and the ones exercised here are served over loopback.
 
-use std::io::Write;
 use std::net::Ipv4Addr;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
+use crate::geoip::download::testkit::{gzip, sha256_hex};
 
 /// A CSV of two networks, keyed by autonomous system number.
 const NETWORKS: &str = "asn,name,country\n13335,CLOUDFLARENET,US\n15169,GOOGLE,US\n";
@@ -59,26 +59,6 @@ fn from_csv(body: &str, index: &Index) -> Result<Table, TableError> {
     )
 }
 
-/// SHA-256 of a body as lowercase hex, the way a publisher writes it.
-fn sha256_hex(body: &[u8]) -> String {
-    use sha2::Digest;
-    use std::fmt::Write as _;
-
-    sha2::Sha256::digest(body)
-        .iter()
-        .fold(String::new(), |mut hex, byte| {
-            let _ = write!(hex, "{byte:02x}");
-            hex
-        })
-}
-
-/// A gzip stream wrapping `payload`.
-fn gzip(payload: &[u8]) -> Vec<u8> {
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    encoder.write_all(payload).unwrap();
-    encoder.finish().unwrap()
-}
-
 // ---------------------------------------------------------------------------
 // Indexing and lookup
 // ---------------------------------------------------------------------------
@@ -91,6 +71,7 @@ fn a_named_column_reaches_its_rows() {
     assert_eq!(table.key_column(), "asn");
     assert_eq!(table.len(), 2);
     assert!(!table.is_empty());
+    assert!(!table.keyed_by_address());
 
     let row = table.get("15169").unwrap();
     assert_eq!(row.get("name"), Some("GOOGLE"));
@@ -247,6 +228,10 @@ fn a_prefix_index_answers_with_the_most_specific_range() {
     let table = from_csv(body, &Index::Prefix).unwrap();
 
     assert_eq!(table.key_column(), "prefix");
+    // A text lookup on an address-keyed table answers nothing rather than
+    // failing, so the kind has to be reportable.
+    assert!(table.keyed_by_address());
+    assert!(table.get("8.8.8.0/24").is_none());
     assert_eq!(
         table
             .get_by_address(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)))
@@ -422,16 +407,6 @@ fn a_headerless_csv_without_names_is_a_config_fault() {
     source.validate().unwrap();
 }
 
-#[test]
-fn an_mmdb_payload_is_not_a_table() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("db.mmdb");
-    fs::write(&file, b"whatever").unwrap();
-
-    let err = Table::from_payload(&file, &Payload::Mmdb).unwrap_err();
-    assert!(matches!(err, TableError::NotATable), "{err:?}");
-}
-
 // ---------------------------------------------------------------------------
 // Fetching
 // ---------------------------------------------------------------------------
@@ -584,6 +559,37 @@ async fn a_replacement_that_holds_no_rows_leaves_the_previous_file_in_place() {
 
     assert_eq!(table.len(), 2);
     assert_eq!(fs::read_to_string(&file).unwrap(), NETWORKS);
+
+    // With no copy to fall back to, the refusal reaches the caller, which is
+    // the only place its variant and its detail are visible.
+    let bare = tempfile::tempdir().unwrap();
+    let err = Table::ensure(&source_at(&server, "networks.csv"), &auto(bare.path()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            TableError::Fetch(GeoIpDownloadError::Unparseable { detail, .. })
+                if detail.contains("holds no rows")
+        ),
+        "{err:?}"
+    );
+
+    // A record of the wrong width is refused by the line it started on.
+    let ragged = MockServer::start().await;
+    serve(&ragged, "networks.csv", b"asn,name\n1,one\n2,two,three\n").await;
+    let empty = tempfile::tempdir().unwrap();
+    let err = Table::ensure(&source_at(&ragged, "networks.csv"), &auto(empty.path()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            TableError::Fetch(GeoIpDownloadError::Unparseable { detail, .. })
+                if detail.contains("line 3")
+        ),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -637,4 +643,154 @@ async fn a_config_fault_costs_no_request() {
 
     assert!(matches!(err, TableError::NamesRequired), "{err:?}");
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_json_source_is_fetched_indexed_and_queried() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    let body = br#"[{"asn": 13335, "name": "CLOUDFLARENET"}, {"asn": 15169, "name": "GOOGLE"}]"#;
+    serve(&server, "networks.json", body).await;
+
+    let source = TableSource::new(
+        format!("{}/networks.json", server.uri()),
+        "networks.json",
+        TableFormat::Json,
+        Index::Column("asn".to_string()),
+    );
+
+    let table = Table::ensure(&source, &auto(dir.path())).await.unwrap();
+
+    assert_eq!(table.columns().to_vec(), ["asn", "name"]);
+    assert_eq!(table.get("15169").unwrap().get("name"), Some("GOOGLE"));
+    // The file stays on disk for the next start, the same as a CSV source.
+    assert_eq!(
+        fs::read(dir.path().join("networks.json")).unwrap(),
+        body.to_vec()
+    );
+}
+
+#[tokio::test]
+async fn a_checksum_mismatch_leaves_the_previous_file_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("networks.csv");
+    fs::write(&file, NETWORKS).unwrap();
+
+    let server = MockServer::start().await;
+    serve(
+        &server,
+        "networks.csv",
+        b"asn,name,country\n1,one,AU\n2,two,NZ\n3,three,US\n",
+    )
+    .await;
+    serve(
+        &server,
+        "networks.csv.sha256",
+        format!("{}  networks.csv\n", sha256_hex(b"what was published")).as_bytes(),
+    )
+    .await;
+
+    let mut source = source_at(&server, "networks.csv");
+    source.checksum_url = Some(format!("{}/networks.csv.sha256", server.uri()));
+
+    let table = Table::ensure(&source, &auto(dir.path())).await.unwrap();
+
+    assert_eq!(table.len(), 2);
+    assert_eq!(fs::read_to_string(&file).unwrap(), NETWORKS);
+
+    // With no copy behind it the refusal reaches the caller by name.
+    let bare = tempfile::tempdir().unwrap();
+    let err = Table::ensure(&source, &auto(bare.path()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            TableError::Fetch(GeoIpDownloadError::ChecksumMismatch { .. })
+        ),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_table_another_process_is_fetching_is_reported_rather_than_waited_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    serve(&server, "networks.csv", NETWORKS.as_bytes()).await;
+
+    // Stand in for the other process by holding the lock it would hold. A
+    // separate open file description, which is what flock excludes on.
+    let held = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.path().join("networks.csv.lock"))
+        .unwrap();
+    held.lock().unwrap();
+
+    let err = Table::ensure(&source_at(&server, "networks.csv"), &auto(dir.path()))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, TableError::Fetch(GeoIpDownloadError::Busy { .. })),
+        "{err:?}"
+    );
+    // Turned away before the request, so the other process keeps its quota.
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_injected_client_is_what_the_transfer_rides_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    serve(&server, "networks.csv", NETWORKS.as_bytes()).await;
+
+    // The user agent is the part of the request only the caller's client can
+    // have set: the default one names the crate and its version.
+    let injected = reqwest::Client::builder()
+        .user_agent("a client the operator configured")
+        .build()
+        .unwrap();
+    let source = source_at(&server, "networks.csv").with_http_client(injected);
+
+    let table = Table::ensure(&source, &auto(dir.path())).await.unwrap();
+
+    assert_eq!(table.len(), 2);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests[0].headers.get("user-agent").unwrap(),
+        "a client the operator configured"
+    );
+}
+
+#[tokio::test]
+async fn a_schema_that_names_its_columns_refuses_a_file_of_another_width() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    serve(&server, "networks.csv", NETWORKS.as_bytes()).await;
+
+    // The body is internally consistent at three columns, so nothing but the
+    // width the schema names has anything to refuse it for.
+    let mut source = source_at(&server, "networks.csv");
+    source.schema = Schema::Named(vec!["asn".to_string(), "name".to_string()]);
+
+    let err = Table::ensure(&source, &auto(dir.path())).await.unwrap_err();
+
+    assert!(
+        matches!(
+            &err,
+            TableError::Fetch(GeoIpDownloadError::Unparseable { detail, .. })
+                if detail.contains("3 fields against the expected 2")
+        ),
+        "{err:?}"
+    );
+    assert!(!dir.path().join("networks.csv").exists());
+
+    // The same body under a schema taken from the file is admitted, so it is
+    // the declared width doing the refusing.
+    source.schema = Schema::Auto;
+    let table = Table::ensure(&source, &auto(dir.path())).await.unwrap();
+    assert_eq!(table.len(), 2);
 }

@@ -36,13 +36,15 @@ What each fills in a record, not what the upstream product sells:
 
 | provider | tier | location | network | credential |
 |---|---|---|---|---|
-| `db_ip` | free | country, continent, city, region, coordinates | ASN, operator | none |
+| `db_ip` | free | country, continent, city, region, coordinates | ASN, operator name blank on every row | none |
 | `sapics_origin_asn` | free | -- | ASN, operator | none |
 | `sapics_ip_to_asn` | free | -- | ASN, registry handle | none |
 | `ip_info` | free | country, continent | ASN, operator, domain | token |
 | `max_mind` | free | country, continent, city, region, coordinates, timezone | ASN, operator | account ID + licence key |
 | `max_mind` | paid | as free | ASN, operator | account ID + licence key |
 | `custom` | -- | whatever you point it at | whatever you point it at | none |
+
+**Do not name `db_ip` for the network half.** Its free ASN database is structurally valid and matches addresses, and its operator-name column is blank on every row. A staged database that resolves nothing for the field its kind exists to carry is refused, so `provider: db_ip` across both halves loses the ASN download on every attempt and no ASN database lands. Name each half instead -- `city: db_ip`, `asn: sapics_origin_asn` -- which is what the default already is. That check needs the lookup half compiled in and `verify_content` left on; without either the database lands and every operator name reads empty.
 
 `sapics_origin_asn` names operators by their legal name where `sapics_ip_to_asn` uses the registry handle -- "Google LLC" against "GOOGLE". Prefer the former unless you are matching against registry data.
 
@@ -60,7 +62,7 @@ factbook verifies a published digest before a download is allowed to replace wha
 - **MaxMind** serves a digest of the archive at the same endpoint, gated on the same account.
 - **DB-IP** and **IPinfo** publish none. The volume floor and the content checks stand in.
 
-That gap is one reason the ASN default is `origin-asn` rather than DB-IP: the two sapics sets are the only ones needing no account whose downloads can be checked against the publisher's own digest, and the location half has no such option at all.
+That gap is one reason the ASN default is `origin-asn` rather than DB-IP: the two sapics sets are the only ones needing no account whose downloads can be checked against the publisher's own digest, and the location half has no such option at all. The blank operator column above is the second reason.
 
 ## Selecting a source
 

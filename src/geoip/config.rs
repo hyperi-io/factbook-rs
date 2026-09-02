@@ -90,6 +90,7 @@ const DEFAULT_MIN_SIZE_PERCENT: u8 = 50;
 /// publishes its terms.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GeoIpProvider {
     /// DB-IP. The free line is DB-IP Lite: anonymous, on a dated monthly URL.
     #[default]
@@ -138,6 +139,7 @@ impl GeoIpProvider {
 /// 401 at download time.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ProviderTier {
     /// The provider's free line.
     #[default]
@@ -224,7 +226,9 @@ impl Default for ProviderSelection {
     /// DB-IP is the only city source that asks for no credential. For ASN,
     /// sapics `origin-asn` publishes daily where DB-IP publishes monthly, has
     /// wider coverage, and ships a digest beside the file that DB-IP does not,
-    /// so a bad download is caught rather than trusted.
+    /// so a bad download is caught rather than trusted. DB-IP's free ASN
+    /// database also leaves its operator-name column blank on every row, which
+    /// the content check refuses, so it cannot serve this half at all.
     fn default() -> Self {
         Self {
             city: ProviderChoice::from(GeoIpProvider::DbIp),
@@ -454,6 +458,10 @@ pub struct GeoIpConfig {
 
     /// Explicit city database path. Set it and the city provider is bypassed:
     /// nothing is downloaded and nothing is checked for that kind.
+    ///
+    /// Whatever refreshes this file must replace it by RENAME. The reader
+    /// memory-maps it, and rewriting one in place under a live mapping faults
+    /// the process rather than returning an error.
     pub city_db_path: Option<PathBuf>,
 
     /// Explicit ASN database path. See [`city_db_path`](Self::city_db_path).
@@ -576,7 +584,7 @@ mod tests {
             (GeoIpProvider::MaxMind, "max_mind"),
             (GeoIpProvider::IpInfo, "ip_info"),
             (GeoIpProvider::SapicsOriginAsn, "sapics_origin_asn"),
-            (GeoIpProvider::SapicsOriginAsn, "sapics_origin_asn"),
+            (GeoIpProvider::SapicsIpToAsn, "sapics_ip_to_asn"),
             (GeoIpProvider::Custom, "custom"),
         ] {
             let quoted = format!("\"{wire}\"");

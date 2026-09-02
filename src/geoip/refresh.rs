@@ -126,24 +126,20 @@ fn reopen(source: &mut Source) -> Result<Option<Arc<Reader<Mmap>>>, GeoIpLookupE
 #[cfg(test)]
 mod tests {
     use std::fs::{self, File};
-    use std::net::IpAddr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
     use std::time::{Duration, SystemTime};
 
     use super::*;
-    use crate::geoip::enricher::CacheConfig;
+    use crate::geoip::enricher::{CacheConfig, DatabasePaths};
 
-    /// The city database MaxMind publishes for testing, under Apache-2.0.
-    const CITY_DB: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/data/GeoLite2-City-Test.mmdb"
-    );
+    /// A database in MaxMind's City schema, built by scripts/make_fixtures.py.
+    const CITY_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/city-test.mmdb");
 
-    /// The ASN database MaxMind publishes for testing, under Apache-2.0.
-    const ASN_DB: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/data/GeoLite2-ASN-Test.mmdb"
-    );
+    /// A database in MaxMind's ASN schema, built by scripts/make_fixtures.py.
+    const ASN_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/asn-test.mmdb");
 
     /// An address the city database holds and the ASN database does not.
     const BOXFORD: &str = "2.125.160.216";
@@ -209,7 +205,7 @@ mod tests {
         let path = dir.path().join("db.mmdb");
         replace(&path, CITY_DB, at(0));
 
-        let geoip = GeoIp::open(Some(&path), None, CacheConfig::default()).unwrap();
+        let geoip = GeoIp::open(DatabasePaths::city_only(&path), CacheConfig::default()).unwrap();
         assert!(geoip.lookup(ip(BOXFORD)).is_some());
         assert_eq!(geoip.cached_entries(), 1);
 
@@ -224,7 +220,7 @@ mod tests {
         let path = dir.path().join("db.mmdb");
         replace(&path, CITY_DB, at(0));
 
-        let geoip = GeoIp::open(Some(&path), None, CacheConfig::default()).unwrap();
+        let geoip = GeoIp::open(DatabasePaths::city_only(&path), CacheConfig::default()).unwrap();
         assert_eq!(city_of(&geoip, BOXFORD).as_deref(), Some("Boxford"));
         assert_eq!(geoip.cached_entries(), 1);
 
@@ -246,7 +242,7 @@ mod tests {
         let path = dir.path().join("db.mmdb");
         replace(&path, CITY_DB, at(0));
 
-        let geoip = GeoIp::open(Some(&path), None, CacheConfig::default()).unwrap();
+        let geoip = GeoIp::open(DatabasePaths::city_only(&path), CacheConfig::default()).unwrap();
         replace(&path, CITY_DB, at(60));
 
         assert!(geoip.refresh_if_changed().unwrap());
@@ -261,7 +257,14 @@ mod tests {
         replace(&city, CITY_DB, at(0));
         replace(&asn, ASN_DB, at(0));
 
-        let geoip = GeoIp::open(Some(&city), Some(&asn), CacheConfig::default()).unwrap();
+        let geoip = GeoIp::open(
+            DatabasePaths {
+                city: Some(&city),
+                asn: Some(&asn),
+            },
+            CacheConfig::default(),
+        )
+        .unwrap();
         let before = geoip.lookup(ip(LINKOPING)).unwrap();
         assert!(before.city_name.is_some());
         assert!(before.autonomous_system_number.is_some());
@@ -287,7 +290,7 @@ mod tests {
         let path = dir.path().join("db.mmdb");
         replace(&path, CITY_DB, at(0));
 
-        let geoip = GeoIp::open(Some(&path), None, CacheConfig::default()).unwrap();
+        let geoip = GeoIp::open(DatabasePaths::city_only(&path), CacheConfig::default()).unwrap();
         corrupt(&path, at(60));
 
         assert!(matches!(
@@ -309,7 +312,7 @@ mod tests {
         let path = dir.path().join("db.mmdb");
         replace(&path, CITY_DB, at(0));
 
-        let geoip = GeoIp::open(Some(&path), None, CacheConfig::default()).unwrap();
+        let geoip = GeoIp::open(DatabasePaths::city_only(&path), CacheConfig::default()).unwrap();
         fs::remove_file(&path).unwrap();
 
         assert!(!geoip.refresh_if_changed().unwrap());
@@ -319,8 +322,72 @@ mod tests {
     }
 
     #[test]
+    fn a_lookup_racing_a_refresh_never_files_an_answer_from_the_old_database() {
+        // Reversed, a lookup taking its placeholder after the clear has passed
+        // that shard reads the old file and files an answer nothing removes.
+        const PROBES: u8 = 255;
+        const FILL: u32 = 20_000;
+        const ROUNDS: u64 = 4;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.mmdb");
+        replace(&path, ASN_DB, at(0));
+
+        let geoip = GeoIp::open(DatabasePaths::asn_only(&path), CacheConfig::default()).unwrap();
+        // The allocation the ASN database answers and the city database holds
+        // no record in, so one file resolves it and the other does not.
+        let probes: Vec<IpAddr> = (0..PROBES)
+            .map(|host| IpAddr::V4(Ipv4Addr::new(1, 0, 0, host)))
+            .collect();
+
+        for round in 1..=ROUNDS {
+            // Alternate the file, so both directions of the swap are raced.
+            let (source, resolves) = if round % 2 == 1 {
+                (CITY_DB, false)
+            } else {
+                (ASN_DB, true)
+            };
+
+            // A full cache makes the clear long enough for a racing lookup to
+            // land inside it. 11.0.0.0/8 is routable, so none of it
+            // short-circuits ahead of the cache.
+            for filler in 0..FILL {
+                let _ = geoip.lookup(IpAddr::V4(Ipv4Addr::from(0x0b00_0000 + filler)));
+            }
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let hammer = {
+                let geoip = geoip.clone();
+                let probes = probes.clone();
+                let stop = Arc::clone(&stop);
+                thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        for &probe in &probes {
+                            let _ = geoip.lookup(probe);
+                        }
+                    }
+                })
+            };
+
+            replace(&path, source, at(60 * round));
+            assert!(geoip.refresh_if_changed().unwrap());
+
+            stop.store(true, Ordering::Relaxed);
+            hammer.join().unwrap();
+
+            for &probe in &probes {
+                assert_eq!(
+                    geoip.lookup(probe).is_some(),
+                    resolves,
+                    "{probe} after round {round}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn an_enricher_over_no_database_has_nothing_to_refresh() {
-        let geoip = GeoIp::open(None, None, CacheConfig::default()).unwrap();
+        let geoip = GeoIp::open(DatabasePaths::default(), CacheConfig::default()).unwrap();
 
         assert!(!geoip.refresh_if_changed().unwrap());
     }

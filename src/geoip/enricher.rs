@@ -32,12 +32,15 @@
 //! use std::net::IpAddr;
 //! use std::path::Path;
 //!
-//! use factbook::geoip::{CacheConfig, GeoIp};
+//! use factbook::geoip::{CacheConfig, DatabasePaths, GeoIp};
 //!
 //! # fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let geoip = GeoIp::open(
-//!     Some(Path::new("/var/lib/geoip/GeoLite2-City.mmdb")),
-//!     Some(Path::new("/var/lib/geoip/GeoLite2-ASN.mmdb")),
+//!     DatabasePaths {
+//!         city: Some(Path::new("/var/lib/geoip/GeoLite2-City.mmdb")),
+//!         asn: Some(Path::new("/var/lib/geoip/GeoLite2-ASN.mmdb")),
+//!         ..DatabasePaths::default()
+//!     },
 //!     CacheConfig::default(),
 //! )?;
 //!
@@ -78,12 +81,16 @@ const DEFAULT_CAPACITY: usize = 100_000;
 /// reported as `None`, and a malformed record is logged and treated the same
 /// way, because one bad record must not fail the event carrying it.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum GeoIpLookupError {
-    /// The provisioned database is CSV, which this engine does not read.
-    #[error("{} is a CSV database, a format not supported by the lookup engine", .path.display())]
+    /// The provisioned database is not a MaxMind DB, which is the only format
+    /// this engine reads.
+    #[error("{} is a {} database, a format not supported by the lookup engine", .path.display(), .format.name())]
     UnsupportedFormat {
-        /// First file of the CSV database.
+        /// First file of the database.
         path: PathBuf,
+        /// Format the provisioning half reported for it.
+        format: DatabaseFormat,
     },
 
     /// The database was provisioned with no files at all.
@@ -206,6 +213,49 @@ pub struct GeoIp {
     pub(super) inner: Arc<Inner>,
 }
 
+/// Which file serves each half of a lookup.
+///
+/// Named rather than two path arguments: both halves are `Option<&Path>`, so
+/// positional arguments compile when swapped, and the engine then reads city
+/// fields out of an ASN database and answers nothing for every address.
+///
+/// Construct it with `..DatabasePaths::default()` rather than an exhaustive
+/// literal. Providers publish more than these two kinds -- ISP, domain,
+/// connection type, anonymous IP -- so a field is added here as those are
+/// supported, and functional update takes it without a change.
+///
+/// A caller-supplied file must only ever be replaced by rename. The readers
+/// memory-map it, and writing one in place under a live mapping is undefined
+/// behaviour rather than a race.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DatabasePaths<'a> {
+    /// City, country and location database.
+    pub city: Option<&'a Path>,
+
+    /// Autonomous system database.
+    pub asn: Option<&'a Path>,
+}
+
+impl<'a> DatabasePaths<'a> {
+    /// A city database alone, resolving no ASN fields.
+    #[must_use]
+    pub const fn city_only(path: &'a Path) -> Self {
+        Self {
+            city: Some(path),
+            asn: None,
+        }
+    }
+
+    /// An ASN database alone, resolving no location fields.
+    #[must_use]
+    pub const fn asn_only(path: &'a Path) -> Self {
+        Self {
+            city: None,
+            asn: Some(path),
+        }
+    }
+}
+
 impl GeoIp {
     /// Open the databases and put a cache in front of them.
     ///
@@ -216,13 +266,9 @@ impl GeoIp {
     ///
     /// [`GeoIpLookupError::Open`] naming the file that could not be read as a
     /// MaxMind DB.
-    pub fn open(
-        city: Option<&Path>,
-        asn: Option<&Path>,
-        cache: CacheConfig,
-    ) -> Result<Self, GeoIpLookupError> {
-        let (city_source, city_reader) = city.map(open_source).transpose()?.unzip();
-        let (asn_source, asn_reader) = asn.map(open_source).transpose()?.unzip();
+    pub fn open(paths: DatabasePaths<'_>, cache: CacheConfig) -> Result<Self, GeoIpLookupError> {
+        let (city_source, city_reader) = paths.city.map(open_source).transpose()?.unzip();
+        let (asn_source, asn_reader) = paths.asn.map(open_source).transpose()?.unzip();
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -253,9 +299,11 @@ impl GeoIp {
         databases: &Databases,
         cache: CacheConfig,
     ) -> Result<Self, GeoIpLookupError> {
-        let city = mmdb_path(databases.city.as_ref(), "city")?;
-        let asn = mmdb_path(databases.asn.as_ref(), "asn")?;
-        Self::open(city, asn, cache)
+        let paths = DatabasePaths {
+            city: mmdb_path(databases.city.as_ref(), "city")?,
+            asn: mmdb_path(databases.asn.as_ref(), "asn")?,
+        };
+        Self::open(paths, cache)
     }
 
     /// Look one address up.
@@ -632,8 +680,10 @@ pub(super) fn file_mtime(path: &Path) -> Option<SystemTime> {
 ///
 /// # Errors
 ///
-/// [`GeoIpLookupError::UnsupportedFormat`] for CSV, which is deliberately out of
-/// scope: this engine reads the MaxMind DB binary format and nothing else.
+/// [`GeoIpLookupError::UnsupportedFormat`] for anything that is not a MaxMind
+/// DB, which is deliberately out of scope: this engine reads that binary format
+/// and nothing else. Tested against the format rather than against CSV alone,
+/// so a format added later is refused by name instead of reaching the reader.
 #[cfg(feature = "geoip-download")]
 fn mmdb_path<'a>(
     database: Option<&'a Database>,
@@ -645,8 +695,11 @@ fn mmdb_path<'a>(
     let Some(path) = database.files.first() else {
         return Err(GeoIpLookupError::NoFiles { kind });
     };
-    if database.format == DatabaseFormat::Csv {
-        return Err(GeoIpLookupError::UnsupportedFormat { path: path.clone() });
+    if database.format != DatabaseFormat::Mmdb {
+        return Err(GeoIpLookupError::UnsupportedFormat {
+            path: path.clone(),
+            format: database.format,
+        });
     }
 
     Ok(Some(path.as_path()))
@@ -737,17 +790,11 @@ mod tests {
 
     use super::*;
 
-    /// The city database MaxMind publishes for testing, under Apache-2.0.
-    const CITY_DB: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/data/GeoLite2-City-Test.mmdb"
-    );
+    /// A database in MaxMind's City schema, built by scripts/make_fixtures.py.
+    const CITY_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/city-test.mmdb");
 
-    /// The ASN database MaxMind publishes for testing, under Apache-2.0.
-    const ASN_DB: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/data/GeoLite2-ASN-Test.mmdb"
-    );
+    /// A database in MaxMind's ASN schema, built by scripts/make_fixtures.py.
+    const ASN_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/asn-test.mmdb");
 
     /// Boxford, the one entry in the test database with two subdivisions.
     const BOXFORD: &str = "2.125.160.216";
@@ -764,14 +811,16 @@ mod tests {
     /// An enricher over both test databases.
     fn both() -> GeoIp {
         GeoIp::open(
-            Some(Path::new(CITY_DB)),
-            Some(Path::new(ASN_DB)),
+            DatabasePaths {
+                city: Some(Path::new(CITY_DB)),
+                asn: Some(Path::new(ASN_DB)),
+            },
             CacheConfig::default(),
         )
         .unwrap()
     }
 
-    /// A database in IPinfo Lite's schema, built to match the real one.
+    /// A database in IPinfo Lite's schema, built by scripts/make_fixtures.py.
     const IPINFO_DB: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/data/IPinfo-Lite-Test.mmdb"
@@ -784,7 +833,11 @@ mod tests {
 
     /// An enricher over the IPinfo database alone.
     fn ipinfo() -> GeoIp {
-        GeoIp::open(Some(Path::new(IPINFO_DB)), None, CacheConfig::default()).unwrap()
+        GeoIp::open(
+            DatabasePaths::city_only(Path::new(IPINFO_DB)),
+            CacheConfig::default(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -876,7 +929,11 @@ mod tests {
 
     #[test]
     fn an_ipinfo_database_serves_the_asn_slot_too() {
-        let geoip = GeoIp::open(None, Some(Path::new(IPINFO_DB)), CacheConfig::default()).unwrap();
+        let geoip = GeoIp::open(
+            DatabasePaths::asn_only(Path::new(IPINFO_DB)),
+            CacheConfig::default(),
+        )
+        .unwrap();
         let record = geoip.lookup(ip("1.1.1.1")).unwrap();
 
         assert_eq!(record.autonomous_system_number, Some(13335));
@@ -1095,6 +1152,38 @@ mod tests {
         assert_eq!(geoip.cached_entries(), 1);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_async_misses_on_one_address_share_a_single_read() {
+        const TASKS: usize = 16;
+
+        let geoip = both();
+        let gate = Arc::new(tokio::sync::Barrier::new(TASKS));
+
+        let tasks: Vec<_> = (0..TASKS)
+            .map(|_| {
+                let geoip = geoip.clone();
+                let gate = Arc::clone(&gate);
+                tokio::spawn(async move {
+                    gate.wait().await;
+                    geoip.lookup_async(ip(BOXFORD)).await.unwrap()
+                })
+            })
+            .collect();
+
+        let mut records = Vec::with_capacity(TASKS);
+        for task in tasks {
+            records.push(task.await.unwrap());
+        }
+
+        // Uncoalesced misses would each have built their own record, of which
+        // only one could win the cache, so a shared allocation across every
+        // task is the observable that separates the two.
+        for record in &records {
+            assert!(Arc::ptr_eq(&records[0], record));
+        }
+        assert_eq!(geoip.cached_entries(), 1);
+    }
+
     #[tokio::test]
     async fn the_async_entry_point_short_circuits_reserved_space_too() {
         let geoip = both();
@@ -1107,8 +1196,7 @@ mod tests {
     #[test]
     fn an_answer_inside_the_age_limit_is_served_from_the_cache() {
         let geoip = GeoIp::open(
-            Some(Path::new(CITY_DB)),
-            None,
+            DatabasePaths::city_only(Path::new(CITY_DB)),
             CacheConfig {
                 max_age: Some(Duration::from_secs(3600)),
                 ..CacheConfig::default()
@@ -1125,8 +1213,7 @@ mod tests {
     #[test]
     fn an_age_limit_re_reads_the_answer_it_expired() {
         let geoip = GeoIp::open(
-            Some(Path::new(CITY_DB)),
-            None,
+            DatabasePaths::city_only(Path::new(CITY_DB)),
             CacheConfig {
                 max_age: Some(Duration::ZERO),
                 ..CacheConfig::default()
@@ -1147,8 +1234,11 @@ mod tests {
 
     #[test]
     fn a_missing_database_leaves_the_other_half_answering() {
-        let city_only =
-            GeoIp::open(Some(Path::new(CITY_DB)), None, CacheConfig::default()).unwrap();
+        let city_only = GeoIp::open(
+            DatabasePaths::city_only(Path::new(CITY_DB)),
+            CacheConfig::default(),
+        )
+        .unwrap();
         let record = city_only.lookup(ip(LINKOPING)).unwrap();
 
         assert_eq!(record.city_name.as_deref(), Some(LINKOPING_NAME));
@@ -1158,7 +1248,7 @@ mod tests {
 
     #[test]
     fn an_enricher_over_no_database_answers_nothing_and_does_not_fail() {
-        let empty = GeoIp::open(None, None, CacheConfig::default()).unwrap();
+        let empty = GeoIp::open(DatabasePaths::default(), CacheConfig::default()).unwrap();
 
         assert!(empty.lookup(ip(BOXFORD)).is_none());
         // Reserved space is still answered: that check never consults a database.
@@ -1171,7 +1261,7 @@ mod tests {
         let path = dir.path().join("not-a-database.mmdb");
         std::fs::write(&path, b"not a MaxMind DB").unwrap();
 
-        let err = GeoIp::open(Some(&path), None, CacheConfig::default()).unwrap_err();
+        let err = GeoIp::open(DatabasePaths::city_only(&path), CacheConfig::default()).unwrap_err();
 
         assert!(matches!(err, GeoIpLookupError::Open { .. }));
         assert!(err.to_string().contains("not-a-database.mmdb"));
@@ -1208,7 +1298,9 @@ mod tests {
         let rendered = format!("{geoip:?}");
 
         assert!(rendered.contains("cached_entries"), "{rendered}");
-        assert!(!rendered.contains("GeoLite2"), "{rendered}");
+        // The fixture's file name is also its `database_type`, so this catches a
+        // Debug that rendered either the path or the reader's metadata.
+        assert!(!rendered.contains("city-test"), "{rendered}");
     }
 
     #[cfg(feature = "geoip-download")]

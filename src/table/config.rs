@@ -16,8 +16,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::geoip::download::source::Payload;
-
 /// Default for [`CsvOptions::header`]: a CSV published for consumption
 /// normally names its columns on the first row.
 const fn header_default() -> bool {
@@ -30,6 +28,7 @@ const fn header_default() -> bool {
 /// YAML is deliberately absent because it would pull in a parser no source
 /// shipped here needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TableFormat {
     /// Comma-separated rows, quoted per RFC 4180.
     Csv {
@@ -47,6 +46,7 @@ pub enum TableFormat {
 /// Where the column names come from.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Schema {
     /// Derived from the file: the header row of a CSV, the keys of a JSON
     /// object.
@@ -62,6 +62,7 @@ pub enum Schema {
 ///
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Index {
     /// An IP address, in whichever column holds addresses.
     Ip,
@@ -84,6 +85,7 @@ pub enum Index {
 /// `&'static str`, which config cannot supply without leaking one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SourceArchive {
     /// The body is the file itself.
     #[default]
@@ -186,15 +188,6 @@ impl TableSource {
     pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = Some(client);
         self
-    }
-
-    /// What this source's bytes mean, as the transfer and the guard read it.
-    pub(super) fn payload(&self) -> Payload {
-        Payload::Table {
-            format: self.format,
-            schema: self.schema.clone(),
-            index: self.index.clone(),
-        }
     }
 }
 
@@ -412,19 +405,5 @@ mod tests {
 
         assert_eq!(networks(), injected);
         assert!(injected.http_client.is_some());
-    }
-
-    #[test]
-    fn the_payload_carries_the_whole_interpretation() {
-        let source = networks();
-
-        assert_eq!(
-            source.payload(),
-            Payload::Table {
-                format: TableFormat::Csv { header: true },
-                schema: Schema::Auto,
-                index: Index::Column("asn".to_string()),
-            }
-        );
     }
 }

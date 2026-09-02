@@ -128,7 +128,12 @@ async fn db_ip_lite_provisions_and_answers() {
     assert_real_databases(&databases);
     let record = record_for(&databases);
     assert_eq!(record.country_code.as_deref(), Some("US"), "{record:?}");
-    assert_names_the_operator(&record);
+
+    // DB-IP's free ASN database leaves its operator-name column blank on every
+    // row, so the content check refuses it and this provider serves the city
+    // half alone.
+    assert!(databases.asn.is_none(), "{databases:?}");
+    assert!(record.autonomous_system_number.is_none(), "{record:?}");
 }
 
 #[tokio::test]

@@ -54,18 +54,37 @@ const ARRAY: u8 = 11;
 /// Size field value that says the real size follows in a trailing byte.
 const SIZE_SPILL: u8 = 29;
 
+/// Address family a database declares it was built for.
+///
+/// A source covering IPv6 declares 6, which sends an IPv4 lookup through the
+/// reader's v4-in-v6 mapping instead of straight down the tree.
+const IPV4: u16 = 4;
+
+/// The other family, for a source published over IPv6 space.
+#[cfg(feature = "geoip-lookup")]
+const IPV6: u16 = 6;
+
+/// The record an ASN database answers with.
+fn asn_record(number: u32, organisation: &str) -> Vec<u8> {
+    map(&[
+        ("autonomous_system_number", uint32(number)),
+        ("autonomous_system_organization", string(organisation)),
+    ])
+}
+
 /// An ASN database answering every address with one number and one name.
 ///
 /// An empty `organisation` is the `dbip-asn` defect: a valid record carrying a
 /// number and a blank name.
 pub(crate) fn asn_mmdb(number: u32, organisation: &str) -> Vec<u8> {
-    database(
-        &map(&[
-            ("autonomous_system_number", uint32(number)),
-            ("autonomous_system_organization", string(organisation)),
-        ]),
-        "GeoLite2-ASN",
-    )
+    database(&asn_record(number, organisation), "GeoLite2-ASN", IPV4)
+}
+
+/// The same database, declared for IPv6 the way a source covering that space
+/// publishes it.
+#[cfg(feature = "geoip-lookup")]
+pub(crate) fn asn_mmdb_v6(number: u32, organisation: &str) -> Vec<u8> {
+    database(&asn_record(number, organisation), "GeoLite2-ASN", IPV6)
 }
 
 /// A city database answering every address with one country, MaxMind's shape.
@@ -73,6 +92,17 @@ pub(crate) fn city_mmdb(iso_code: &str) -> Vec<u8> {
     database(
         &map(&[("country", map(&[("iso_code", string(iso_code))]))]),
         "GeoLite2-City",
+        IPV4,
+    )
+}
+
+/// The same database, declared for IPv6.
+#[cfg(feature = "geoip-lookup")]
+pub(crate) fn city_mmdb_v6(iso_code: &str) -> Vec<u8> {
+    database(
+        &map(&[("country", map(&[("iso_code", string(iso_code))]))]),
+        "GeoLite2-City",
+        IPV6,
     )
 }
 
@@ -84,11 +114,12 @@ pub(crate) fn flat_city_mmdb(country_code: &str) -> Vec<u8> {
             ("continent_code", string("OC")),
         ]),
         "ipinfo lite",
+        IPV4,
     )
 }
 
 /// A whole database file around one data record.
-fn database(record: &[u8], database_type: &str) -> Vec<u8> {
+fn database(record: &[u8], database_type: &str, ip_version: u16) -> Vec<u8> {
     // The record value a tree slot carries for data at offset zero.
     let pointer = NODE_COUNT + SEPARATOR_LEN;
 
@@ -100,19 +131,19 @@ fn database(record: &[u8], database_type: &str) -> Vec<u8> {
     file.extend_from_slice(&SEPARATOR);
     file.extend_from_slice(record);
     file.extend_from_slice(MARKER);
-    file.extend_from_slice(&metadata(database_type));
+    file.extend_from_slice(&metadata(database_type, ip_version));
     file
 }
 
 /// The nine metadata fields a reader requires before it will open a file.
-fn metadata(database_type: &str) -> Vec<u8> {
+fn metadata(database_type: &str, ip_version: u16) -> Vec<u8> {
     map(&[
         ("binary_format_major_version", uint16(2)),
         ("binary_format_minor_version", uint16(0)),
         ("build_epoch", uint64(0)),
         ("database_type", string(database_type)),
         ("description", map(&[("en", string("fixture"))])),
-        ("ip_version", uint16(4)),
+        ("ip_version", uint16(ip_version)),
         ("languages", array(&[string("en")])),
         ("node_count", uint32(NODE_COUNT)),
         ("record_size", uint16(RECORD_SIZE)),

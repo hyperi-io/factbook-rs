@@ -80,11 +80,15 @@ pub(super) fn read(
 /// # Errors
 ///
 /// The errors [`read`] raises.
-pub(crate) fn probe(path: &Path, format: TableFormat) -> Result<(), TableError> {
+pub(crate) fn probe(
+    path: &Path,
+    format: TableFormat,
+    declared: Option<usize>,
+) -> Result<(), TableError> {
     let reader = BufReader::new(fs::File::open(path)?);
 
     match format {
-        TableFormat::Csv { header } => validate_csv(reader, header),
+        TableFormat::Csv { header } => validate_csv(reader, header, declared),
 
         // A JSON document has to be read whole to be known valid at all, so the
         // probe is the same read the load performs.
@@ -92,13 +96,20 @@ pub(crate) fn probe(path: &Path, format: TableFormat) -> Result<(), TableError> 
     }
 }
 
-/// Whether every record is as wide as the first.
+/// Whether every record is as wide as the load will require.
+///
+/// `declared` is the width the schema names. Without it the probe would admit a
+/// file the load then rejects, after the good copy had already been replaced.
 ///
 /// Records are checked and dropped as they are read, so the whole file is
 /// covered without holding it in memory.
-fn validate_csv(mut reader: impl BufRead, header: bool) -> Result<(), TableError> {
+fn validate_csv(
+    mut reader: impl BufRead,
+    header: bool,
+    declared: Option<usize>,
+) -> Result<(), TableError> {
     let mut csv = Csv::new();
-    let mut width: Option<usize> = None;
+    let mut width: Option<usize> = declared;
     let mut seen: usize = 0;
 
     loop {
@@ -125,7 +136,10 @@ fn validate_csv(mut reader: impl BufRead, header: bool) -> Result<(), TableError
     Ok(())
 }
 
-/// Check the records read so far against the first one's width, then drop them.
+/// Check the records read so far against the expected width, then drop them.
+///
+/// `width` is seeded from the schema where it names the columns, and otherwise
+/// takes the first record's width.
 fn drain(
     records: &mut Vec<Record>,
     width: &mut Option<usize>,
@@ -136,10 +150,7 @@ fn drain(
         if fields.len() != expected {
             return Err(TableError::Malformed {
                 line,
-                detail: format!(
-                    "{} fields against {expected} in the first row",
-                    fields.len()
-                ),
+                detail: format!("{} fields against the expected {expected}", fields.len()),
             });
         }
         *seen += 1;
@@ -149,7 +160,7 @@ fn drain(
 
 /// Read a CSV into columns and rows.
 fn read_csv(reader: impl BufRead, header: bool, schema: &Schema) -> Result<Parsed, TableError> {
-    let mut records = records(reader, None)?.into_iter();
+    let mut records = records(reader)?.into_iter();
 
     // The header row is consumed whether or not its names are used, so naming
     // the columns explicitly overrides a header rather than shifting the rows.
@@ -258,32 +269,23 @@ fn cell_of_value(value: Option<&Value>) -> Cell {
     }
 }
 
-/// Read CSV records, stopping after `limit` of them when one is given.
-fn records(mut reader: impl BufRead, limit: Option<usize>) -> Result<Vec<Record>, TableError> {
+/// Read every CSV record in the reader.
+///
+/// One exit, through `finish`, because that is where an unterminated quoted
+/// field is caught: a second exit that skipped it would accept a malformed file.
+fn records(mut reader: impl BufRead) -> Result<Vec<Record>, TableError> {
     let mut csv = Csv::new();
-    let enough = |csv: &Csv| limit.is_some_and(|limit| csv.records.len() >= limit);
 
     loop {
-        let mut consumed = 0;
-        let mut stop = false;
-
         let chunk = reader.fill_buf()?;
         if chunk.is_empty() {
             break;
         }
+        let consumed = chunk.len();
         for &byte in chunk {
             csv.byte(byte)?;
-            consumed += 1;
-            if enough(&csv) {
-                stop = true;
-                break;
-            }
         }
         reader.consume(consumed);
-
-        if stop {
-            return Ok(strip_bom(csv.records));
-        }
     }
 
     Ok(strip_bom(csv.finish()?))
@@ -344,7 +346,22 @@ struct Csv {
     /// Whether the current record has had any content, which is what tells a
     /// blank line from a record of one empty field.
     started: bool,
+
+    /// Whether the previous byte ended a record as the CR of a CRLF.
+    after_cr: bool,
 }
+
+/// Longest one field may grow before the input is called malformed.
+///
+/// A field is held whole until it closes, so without a ceiling an unclosed
+/// quote buffers the entire file into one field. No real column is near this.
+const MAX_FIELD: usize = 8 * 1024 * 1024;
+
+/// Most fields one record may carry before the input is called malformed.
+///
+/// Records are only checked and dropped once they close, so a record that never
+/// closes is the other way the reader grows without bound.
+const MAX_FIELDS: usize = 4096;
 
 impl Csv {
     /// A reader positioned at the first byte of the first line.
@@ -357,11 +374,33 @@ impl Csv {
             line: 1,
             record_line: 1,
             started: false,
+            after_cr: false,
         }
+    }
+
+    /// Hold one byte of the field being read.
+    fn push(&mut self, byte: u8) -> Result<(), TableError> {
+        if self.field.len() >= MAX_FIELD {
+            return Err(TableError::Malformed {
+                line: self.record_line,
+                detail: format!("a field is longer than {MAX_FIELD} bytes"),
+            });
+        }
+        self.field.push(byte);
+        Ok(())
     }
 
     /// Feed one byte.
     fn byte(&mut self, byte: u8) -> Result<(), TableError> {
+        // A record ends at CR, LF or CRLF. The CR of a CRLF ends it, so the LF
+        // behind it is already spoken for. Inside a quoted field both are data.
+        if self.state != State::Quoted {
+            if byte == b'\n' && std::mem::take(&mut self.after_cr) {
+                return Ok(());
+            }
+            self.after_cr = false;
+        }
+
         match self.state {
             State::FieldStart => match byte {
                 QUOTE => {
@@ -373,12 +412,13 @@ impl Csv {
                     self.end_field()?;
                 }
                 b'\n' => self.newline()?,
-                // A bare carriage return outside a quoted field is the first
-                // half of a CRLF and carries nothing of its own.
-                b'\r' => {}
+                b'\r' => {
+                    self.after_cr = true;
+                    self.newline()?;
+                }
                 _ => {
                     self.begin();
-                    self.field.push(byte);
+                    self.push(byte)?;
                     self.state = State::Unquoted;
                 }
             },
@@ -386,29 +426,35 @@ impl Csv {
             State::Unquoted => match byte {
                 DELIMITER => self.end_field()?,
                 b'\n' => self.newline()?,
-                b'\r' => {}
+                b'\r' => {
+                    self.after_cr = true;
+                    self.newline()?;
+                }
                 // A quote that did not open the field is data: some publishers
                 // write inches and apostrophes unescaped.
-                _ => self.field.push(byte),
+                _ => self.push(byte)?,
             },
 
             State::Quoted => match byte {
                 QUOTE => self.state = State::QuoteInQuoted,
                 b'\n' => {
                     self.line += 1;
-                    self.field.push(byte);
+                    self.push(byte)?;
                 }
-                _ => self.field.push(byte),
+                _ => self.push(byte)?,
             },
 
             State::QuoteInQuoted => match byte {
                 QUOTE => {
-                    self.field.push(QUOTE);
+                    self.push(QUOTE)?;
                     self.state = State::Quoted;
                 }
                 DELIMITER => self.end_field()?,
                 b'\n' => self.newline()?,
-                b'\r' => {}
+                b'\r' => {
+                    self.after_cr = true;
+                    self.newline()?;
+                }
                 _ => {
                     return Err(TableError::Malformed {
                         line: self.record_line,
@@ -431,6 +477,13 @@ impl Csv {
 
     /// Close the field being read.
     fn end_field(&mut self) -> Result<(), TableError> {
+        if self.fields.len() >= MAX_FIELDS {
+            return Err(TableError::Malformed {
+                line: self.record_line,
+                detail: format!("a record carries more than {MAX_FIELDS} fields"),
+            });
+        }
+
         let bytes = std::mem::take(&mut self.field);
         let text = String::from_utf8(bytes).map_err(|_| TableError::Malformed {
             line: self.record_line,
@@ -724,7 +777,7 @@ mod tests {
         body.push_str("1,too,many,fields\n");
         fs::write(&file, &body).unwrap();
 
-        let err = probe(&file, TableFormat::Csv { header: true }).unwrap_err();
+        let err = probe(&file, TableFormat::Csv { header: true }, None).unwrap_err();
         assert!(
             matches!(err, TableError::Malformed { line: 5002, .. }),
             "{err:?}"
@@ -743,7 +796,7 @@ mod tests {
         }
         fs::write(&file, &body).unwrap();
 
-        probe(&file, TableFormat::Csv { header: true }).unwrap();
+        probe(&file, TableFormat::Csv { header: true }, None).unwrap();
     }
 
     #[test]
@@ -753,20 +806,92 @@ mod tests {
 
         fs::write(&file, b"asn,name\n").unwrap();
         assert!(matches!(
-            probe(&file, TableFormat::Csv { header: true }).unwrap_err(),
+            probe(&file, TableFormat::Csv { header: true }, None).unwrap_err(),
             TableError::Empty
         ));
 
         fs::write(&file, b"asn,name\n1,two,three\n").unwrap();
         assert!(matches!(
-            probe(&file, TableFormat::Csv { header: true }).unwrap_err(),
+            probe(&file, TableFormat::Csv { header: true }, None).unwrap_err(),
             TableError::Malformed { .. }
         ));
 
         fs::write(&file, b"{\"relays\": []}").unwrap();
         assert!(matches!(
-            probe(&file, TableFormat::Json).unwrap_err(),
+            probe(&file, TableFormat::Json, None).unwrap_err(),
             TableError::NotAnArrayOfObjects { .. }
         ));
+    }
+
+    #[test]
+    fn a_probe_holds_the_file_to_the_width_the_schema_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rows.csv");
+        // Internally consistent at three columns, so checking against the first
+        // record admits it. The load wants the two the schema names.
+        fs::write(&file, b"asn,name,extra\n1,one,x\n2,two,y\n").unwrap();
+
+        probe(&file, TableFormat::Csv { header: true }, None).unwrap();
+
+        let err = probe(&file, TableFormat::Csv { header: true }, Some(2)).unwrap_err();
+        assert!(
+            matches!(err, TableError::Malformed { line: 1, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_lone_carriage_return_ends_a_record_rather_than_vanishing() {
+        // Classic Mac line endings. Dropping the byte instead would silently
+        // glue every row into one.
+        let parsed = csv("asn,name\r1,one\r2,two\r").unwrap();
+
+        assert_eq!(parsed.columns, ["asn", "name"]);
+        assert_eq!(cells(&parsed), [["1", "one"], ["2", "two"]]);
+    }
+
+    #[test]
+    fn a_crlf_line_ending_is_one_record_and_one_line() {
+        let err = csv("asn,name\r\n1,one\r\n2,three,too many\r\n").unwrap_err();
+
+        // Line 3, not 5: the CR and the LF of one ending are one line between
+        // them.
+        assert!(
+            matches!(err, TableError::Malformed { line: 3, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_carriage_return_inside_a_quoted_field_stays_data() {
+        let parsed = csv("asn,name\n1,\"a\rb\"\n").unwrap();
+
+        assert_eq!(cells(&parsed), [["1", "a\rb"]]);
+    }
+
+    #[test]
+    fn a_field_that_never_closes_is_refused_rather_than_buffered() {
+        // An unclosed quote otherwise holds the whole file in one field, so a
+        // large download decides how much memory the reader takes.
+        let mut body = String::from("asn,name\n1,\"");
+        body.push_str(&"x".repeat(MAX_FIELD + 1));
+
+        let err = csv(&body).unwrap_err();
+        assert!(
+            matches!(&err, TableError::Malformed { detail, .. } if detail.contains("longer than")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_record_that_never_ends_is_refused_rather_than_buffered() {
+        let mut body = String::from("asn,name\n");
+        body.push_str(&"a,".repeat(MAX_FIELDS + 1));
+
+        let err = csv(&body).unwrap_err();
+        assert!(
+            matches!(&err, TableError::Malformed { detail, .. } if detail.contains("more than")),
+            "{err:?}"
+        );
     }
 }

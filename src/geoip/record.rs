@@ -44,6 +44,7 @@ static PRIVATE: LazyLock<Arc<GeoIpRecord>> = LazyLock::new(|| Arc::new(GeoIpReco
 /// distinction rather than rendering everything as text for the consumer to
 /// parse back.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum FieldValue<'a> {
     /// A text field, borrowed from the record.
     Str(&'a str),
@@ -198,75 +199,71 @@ impl GeoIpRecord {
     pub fn to_schema_map(&self) -> Vec<(&'static str, FieldValue<'_>)> {
         let mut fields = Vec::with_capacity(FIELD_COUNT);
 
-        push_str(&mut fields, "city_name", self.city_name.as_deref());
-        push_str(
+        push(&mut fields, "city_name", self.city_name.as_deref());
+        push(
             &mut fields,
             "continent_code",
             self.continent_code.as_deref(),
         );
-        push_str(&mut fields, "country_code", self.country_code.as_deref());
-        push_str(&mut fields, "country_name", self.country_name.as_deref());
-        push_str(&mut fields, "region_name", self.region_name.as_deref());
-        push_str(&mut fields, "region_code", self.region_code.as_deref());
-        push_str(&mut fields, "postal_code", self.postal_code.as_deref());
-        push_str(&mut fields, "timezone", self.timezone.as_deref());
-        push_float(&mut fields, "latitude", self.latitude);
-        push_float(&mut fields, "longitude", self.longitude);
-        push_uint(&mut fields, "metro_code", self.metro_code.map(u32::from));
-        push_uint(
+        push(&mut fields, "country_code", self.country_code.as_deref());
+        push(&mut fields, "country_name", self.country_name.as_deref());
+        push(&mut fields, "region_name", self.region_name.as_deref());
+        push(&mut fields, "region_code", self.region_code.as_deref());
+        push(&mut fields, "postal_code", self.postal_code.as_deref());
+        push(&mut fields, "timezone", self.timezone.as_deref());
+        push(&mut fields, "latitude", self.latitude);
+        push(&mut fields, "longitude", self.longitude);
+        push(&mut fields, "metro_code", self.metro_code.map(u32::from));
+        push(
             &mut fields,
             "accuracy_radius",
             self.accuracy_radius.map(u32::from),
         );
-        push_uint(
+        push(
             &mut fields,
             "autonomous_system_number",
             self.autonomous_system_number,
         );
-        push_str(
+        push(
             &mut fields,
             "autonomous_system_organization",
             self.autonomous_system_organization.as_deref(),
         );
         fields.push(("is_private", FieldValue::Bool(self.is_private)));
-        push_str(&mut fields, "network", self.network.as_deref());
-        push_str(&mut fields, "asn_network", self.asn_network.as_deref());
-        push_str(&mut fields, "as_domain", self.as_domain.as_deref());
+        push(&mut fields, "network", self.network.as_deref());
+        push(&mut fields, "asn_network", self.asn_network.as_deref());
+        push(&mut fields, "as_domain", self.as_domain.as_deref());
 
         fields
     }
 }
 
-/// Append a text field when the lookup resolved one.
-fn push_str<'a>(
+impl<'a> From<&'a str> for FieldValue<'a> {
+    fn from(value: &'a str) -> Self {
+        Self::Str(value)
+    }
+}
+
+impl From<f64> for FieldValue<'_> {
+    fn from(value: f64) -> Self {
+        Self::Float(value)
+    }
+}
+
+impl From<u32> for FieldValue<'_> {
+    fn from(value: u32) -> Self {
+        Self::UInt(value)
+    }
+}
+
+/// Append a field when the lookup resolved one.
+fn push<'a, T: Into<FieldValue<'a>>>(
     fields: &mut Vec<(&'static str, FieldValue<'a>)>,
     key: &'static str,
-    value: Option<&'a str>,
+    value: Option<T>,
 ) {
     if let Some(value) = value {
-        fields.push((key, FieldValue::Str(value)));
-    }
-}
-
-/// Append a coordinate when the lookup resolved one.
-fn push_float(
-    fields: &mut Vec<(&'static str, FieldValue<'_>)>,
-    key: &'static str,
-    value: Option<f64>,
-) {
-    if let Some(value) = value {
-        fields.push((key, FieldValue::Float(value)));
-    }
-}
-
-/// Append a whole-number field when the lookup resolved one.
-fn push_uint(
-    fields: &mut Vec<(&'static str, FieldValue<'_>)>,
-    key: &'static str,
-    value: Option<u32>,
-) {
-    if let Some(value) = value {
-        fields.push((key, FieldValue::UInt(value)));
+        fields.push((key, value.into()));
     }
 }
 

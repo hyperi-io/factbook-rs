@@ -28,7 +28,6 @@ use crate::Secret;
 use crate::geoip::config::{
     AutoDownloadConfig, GeoIpProvider, ProviderChoice, ProviderSelection, ProviderTier,
 };
-use crate::table::{Index, Schema, TableFormat};
 
 /// A day, the unit every cadence below is a multiple of.
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -98,47 +97,6 @@ fn dated(template: &str, month: DateTime<Utc>) -> String {
     template.replace(MONTH, &month.format("%Y-%m").to_string())
 }
 
-/// What the fetched bytes mean.
-///
-/// This is the axis acquisition does not predict, so it is stated rather than
-/// inferred from the URL or the archive. The file name is not here: what to
-/// call the bytes is a property of where they are being put, not of what they
-/// mean.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Payload {
-    /// MaxMind DB binary format, read by an MMDB reader.
-    Mmdb,
-
-    /// Rows and columns, read into a [`Table`](crate::table::Table).
-    ///
-    /// The three fields are the whole interpretation: how the rows are
-    /// encoded, where their column names come from, and which key reaches
-    /// them.
-    Table {
-        /// How the rows are encoded.
-        format: TableFormat,
-
-        /// Where the column names come from.
-        schema: Schema,
-
-        /// Key the rows are reachable by.
-        index: Index,
-    },
-}
-
-impl Payload {
-    /// Format a consumer picks its reader by.
-    pub(crate) const fn format(&self) -> DatabaseFormat {
-        match self {
-            Self::Mmdb => DatabaseFormat::Mmdb,
-            Self::Table { format, .. } => match format {
-                TableFormat::Csv { .. } => DatabaseFormat::Csv,
-                TableFormat::Json => DatabaseFormat::Json,
-            },
-        }
-    }
-}
-
 /// A credential in the download settings, and where an operator sets it.
 ///
 /// The path is carried so a missing or refused credential names the field to
@@ -154,15 +112,22 @@ struct CredentialSlot {
 impl CredentialSlot {
     /// The configured credential, or the error naming what to set.
     ///
+    /// A blank value counts as unset. A secrets layer that resolves a missing
+    /// key to an empty string would otherwise look configured here and fail
+    /// later as a rejected credential, which names the provider rather than the
+    /// field the operator has to populate.
+    ///
     /// # Errors
     ///
-    /// [`GeoIpDownloadError::MissingCredential`] when the field is unset.
+    /// [`GeoIpDownloadError::MissingCredential`] when the field is unset or
+    /// blank.
     fn require(
         self,
         provider: &'static str,
         auto: &AutoDownloadConfig,
     ) -> Result<Secret, GeoIpDownloadError> {
         (self.read)(auto)
+            .filter(|secret| !secret.is_empty())
             .cloned()
             .ok_or(GeoIpDownloadError::MissingCredential {
                 provider,
@@ -299,8 +264,8 @@ pub(super) struct SourceSpec {
     /// Name the file is written under.
     file: &'static str,
 
-    /// What the bytes mean.
-    payload: Payload,
+    /// Format a consumer picks its reader by.
+    format: DatabaseFormat,
 }
 
 impl SourceSpec {
@@ -354,7 +319,7 @@ impl SourceSpec {
     /// What this source publishes, as the freshness check reads it.
     pub(super) fn database(&'static self) -> DatabaseSpec {
         DatabaseSpec {
-            format: self.payload.format(),
+            format: self.format,
             names: slice::from_ref(&self.file),
         }
     }
@@ -384,7 +349,7 @@ impl SourceSpec {
             checksum_url: self.checksum.map(|checksum| checksum.resolve(edition).0),
             dest: auto.data_dir.join(self.file),
             archive: self.archive,
-            format: self.payload.format(),
+            format: self.format,
             credential: self.credential.resolve(self.provider.label(), auto)?,
         })
     }
@@ -463,7 +428,7 @@ static SOURCES: &[SourceSpec] = &[
         min_interval: None,
         terms_url: DB_IP_LITE_TERMS,
         file: "dbip-city-lite.mmdb",
-        payload: Payload::Mmdb,
+        format: DatabaseFormat::Mmdb,
     },
     SourceSpec {
         provider: GeoIpProvider::DbIp,
@@ -481,7 +446,7 @@ static SOURCES: &[SourceSpec] = &[
         min_interval: None,
         terms_url: DB_IP_LITE_TERMS,
         file: "dbip-asn-lite.mmdb",
-        payload: Payload::Mmdb,
+        format: DatabaseFormat::Mmdb,
     },
     SourceSpec {
         provider: GeoIpProvider::MaxMind,
@@ -504,7 +469,7 @@ static SOURCES: &[SourceSpec] = &[
         min_interval: Some(DAY),
         terms_url: MAXMIND_GEOLITE2_TERMS,
         file: "GeoLite2-City.mmdb",
-        payload: Payload::Mmdb,
+        format: DatabaseFormat::Mmdb,
     },
     SourceSpec {
         provider: GeoIpProvider::MaxMind,
@@ -525,7 +490,7 @@ static SOURCES: &[SourceSpec] = &[
         min_interval: Some(DAY),
         terms_url: MAXMIND_GEOLITE2_TERMS,
         file: "GeoLite2-ASN.mmdb",
-        payload: Payload::Mmdb,
+        format: DatabaseFormat::Mmdb,
     },
     SourceSpec {
         provider: GeoIpProvider::MaxMind,
@@ -546,7 +511,7 @@ static SOURCES: &[SourceSpec] = &[
         min_interval: Some(DAY),
         terms_url: MAXMIND_GEOIP2_TERMS,
         file: "GeoIP2-City.mmdb",
-        payload: Payload::Mmdb,
+        format: DatabaseFormat::Mmdb,
     },
     SourceSpec {
         provider: GeoIpProvider::MaxMind,
@@ -569,7 +534,7 @@ static SOURCES: &[SourceSpec] = &[
         min_interval: Some(DAY),
         terms_url: MAXMIND_GEOIP2_TERMS,
         file: "GeoIP2-ISP.mmdb",
-        payload: Payload::Mmdb,
+        format: DatabaseFormat::Mmdb,
     },
     SourceSpec {
         provider: GeoIpProvider::IpInfo,
@@ -591,7 +556,7 @@ static SOURCES: &[SourceSpec] = &[
         min_interval: Some(DAY),
         terms_url: IPINFO_LITE_TERMS,
         file: "ipinfo-lite.mmdb",
-        payload: Payload::Mmdb,
+        format: DatabaseFormat::Mmdb,
     },
     SourceSpec {
         provider: GeoIpProvider::SapicsOriginAsn,
@@ -610,7 +575,7 @@ static SOURCES: &[SourceSpec] = &[
         min_interval: None,
         terms_url: SAPICS_TERMS,
         file: "origin-asn.mmdb",
-        payload: Payload::Mmdb,
+        format: DatabaseFormat::Mmdb,
     },
     SourceSpec {
         provider: GeoIpProvider::SapicsIpToAsn,
@@ -629,7 +594,7 @@ static SOURCES: &[SourceSpec] = &[
         min_interval: None,
         terms_url: SAPICS_TERMS,
         file: "iptoasn-asn.mmdb",
-        payload: Payload::Mmdb,
+        format: DatabaseFormat::Mmdb,
     },
 ];
 

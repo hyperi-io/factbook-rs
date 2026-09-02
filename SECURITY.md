@@ -38,8 +38,8 @@ We will not pursue legal action against security researchers who:
 ## Recognition
 
 With your permission, we will credit you for the discovery of confirmed
-vulnerabilities. We do not currently offer monetary bounties, but we value
-and appreciate responsible disclosure.
+vulnerabilities. We do not offer monetary bounties. We value and appreciate
+responsible disclosure regardless.
 
 ## Out of Scope
 

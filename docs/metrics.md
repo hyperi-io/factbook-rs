@@ -20,7 +20,9 @@ Freshness is a separate question and still counts from the local write, so a dat
 
 ## Acquisition, on by default
 
-The `metrics` feature is in the default set. It runs once per database per refresh, so the cost is a `stat` on a daily or monthly cadence.
+The `metrics` feature is in the default set. The age gauge is read once per database on every `ensure_databases` call, including the calls that download nothing, and the download counter only where a download was attempted.
+
+What the gauge costs depends on the build. A default build takes the age from the publisher's build stamp, which means opening the database as a memory map and parsing its metadata. A `geoip-download`-only build has no reader to do that with, and `age_from_source: false` asks for the local write time instead; either of those costs one `stat`.
 
 | metric | type | labels | what it says |
 |---|---|---|---|
@@ -29,7 +31,7 @@ The `metrics` feature is in the default set. It runs once per database per refre
 
 `kind` is `city` or `asn`. `type` is `geoip` on every series.
 
-### The `result` label separates three different problems
+### The `result` label separates five outcomes
 
 | value | means | what to do |
 |---|---|---|
@@ -60,9 +62,9 @@ Watch the hit percentage. If it is low against data you expect repeat hits on, r
 
 If raising it does not move the percentage, the traffic is not repeating and the cache is not what to tune. Check `enrichment_duration_seconds` instead: a miss costs a database read, so a workload that is mostly misses is bounded by the reader rather than by cache size.
 
-## Names are shared, not private
+## Treat the four lookup names as a contract
 
-These four lookup names match descriptors a consumer already registers, so the series land in the group it has rather than beside it. Renaming one does not fail loudly: it records without a description and shows up as an unrelated series. Treat the names as a contract.
+The names are bare and each carries a `type` label, so one recorder hosts factbook beside other enrichers without the series colliding. Where a host has already described a metric under one of these names, that description attaches to what factbook records. Rename one in a fork and it records without a description, under a name nothing is watching.
 
 ## Turning it all off
 

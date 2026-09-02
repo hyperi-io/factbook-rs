@@ -33,19 +33,13 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use factbook::geoip::{CacheConfig, GeoIp};
+use factbook::geoip::{CacheConfig, DatabasePaths, GeoIp};
 
-/// The city database MaxMind publishes for testing, under Apache-2.0.
-const CITY_DB: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/data/GeoLite2-City-Test.mmdb"
-);
+/// A database in MaxMind's City schema, built by scripts/make_fixtures.py.
+const CITY_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/city-test.mmdb");
 
-/// The ASN database MaxMind publishes for testing, under Apache-2.0.
-const ASN_DB: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/data/GeoLite2-ASN-Test.mmdb"
-);
+/// A database in MaxMind's ASN schema, built by scripts/make_fixtures.py.
+const ASN_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/asn-test.mmdb");
 
 /// Every IPv4 network the committed city fixture holds, base address and prefix.
 ///
@@ -78,7 +72,7 @@ const POOL_SIZE: usize = 4096;
 /// One pool slot in this many is an address no database holds.
 const ABSENT_SHARE: usize = 4;
 
-/// Rows in the batch, the size dfe-loader flushes.
+/// Rows in the batch, the size a batching loader flushes.
 const BATCH_ROWS: usize = 20_000;
 
 /// Addresses read per cold-read iteration, enough to swamp the timer.
@@ -192,8 +186,10 @@ impl Fixture {
     /// Open the fixtures, build the distribution and verify every probe.
     fn build() -> Self {
         let geoip = GeoIp::open(
-            Some(Path::new(CITY_DB)),
-            Some(Path::new(ASN_DB)),
+            DatabasePaths {
+                city: Some(Path::new(CITY_DB)),
+                asn: Some(Path::new(ASN_DB)),
+            },
             CacheConfig::default(),
         )
         .expect("the committed fixture databases open");
@@ -359,7 +355,7 @@ fn interleave(located: &[IpAddr], absent: &[IpAddr]) -> Vec<IpAddr> {
     pool
 }
 
-/// One address at a time, the VRL transform's shape.
+/// One address at a time, the shape a per-event transform takes.
 fn per_event(c: &mut Criterion) {
     let fixture = &*FIXTURE;
     fixture.warm();

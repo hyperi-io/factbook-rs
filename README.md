@@ -135,9 +135,9 @@ if let Some(row) = table.get("13335") {
 # }
 ```
 
-**CSV and JSON**, raw or gzipped, indexed by an address or by any column the
-data has. Column names come from the file by default, and from config for the
-headerless case that has no other answer:
+**CSV and JSON**, raw or gzipped, indexed by an address, by a CIDR range, or by
+any column the data has. Column names come from the file by default, and from
+config for the headerless case that has no other answer:
 
 ```yaml
 format:
@@ -162,7 +162,7 @@ keeps being served. A hit costs tens of nanoseconds against microseconds for
 the database read behind it, and private or reserved addresses never reach the
 cache at all.
 
-Why that ordering makes the memory map safe, and what the five checks are:
+Why that ordering makes the memory map safe, and what the six checks are:
 [docs/architecture.md](https://github.com/hyperi-io/factbook-rs/blob/main/docs/architecture.md).
 
 ## Documentation

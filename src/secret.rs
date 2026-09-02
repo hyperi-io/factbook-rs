@@ -157,6 +157,8 @@ mod tests {
         assert_eq!(secret.expose(), "token-wxyz");
     }
 
+    // AutoDownloadConfig only exists under geoip-download.
+    #[cfg(feature = "geoip-download")]
     #[test]
     fn a_whole_config_serialises_without_its_credentials() {
         // The failure this guards is a consumer logging its resolved config as

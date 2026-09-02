@@ -17,7 +17,7 @@
 //!
 //! Acquisition turns out not to be a geo concern at all, so [`table`] opens the
 //! same fetch-verify-replace path to any CSV or JSON a deployment names in its
-//! own config, indexed by an address or by any column it has.
+//! own config, indexed by an address, by a CIDR range, or by any column it has.
 //!
 //! # Features
 //!
@@ -25,7 +25,7 @@
 //! |---|---|
 //! | `geoip` *(default)* | `geoip-download` + `geoip-lookup` |
 //! | `geoip-download` | resolve, freshness-check, download, unpack, refresh, and [`table`] |
-//! | `geoip-lookup` | mmap readers, the cache, [`GeoIpRecord`] |
+//! | `geoip-lookup` | mmap readers, the cache, [`geoip::GeoIpRecord`] |
 //! | `metrics` | emit through the `metrics` facade |
 //! | `metrics-lookup` | cache hit, miss, size and lookup duration |
 //!
@@ -61,6 +61,17 @@ pub mod table;
 pub mod secret;
 
 pub use secret::Secret;
+
+// Both appear in this crate's public API -- a client goes in, a reader error
+// comes out -- so a consumer needs the exact versions linked here rather than
+// whichever its own manifest resolves.
+#[cfg(feature = "geoip-download")]
+#[cfg_attr(docsrs, doc(cfg(feature = "geoip-download")))]
+pub use reqwest;
+
+#[cfg(feature = "geoip-lookup")]
+#[cfg_attr(docsrs, doc(cfg(feature = "geoip-lookup")))]
+pub use maxminddb;
 
 /// Crate version, for the user-agent a provider sees.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

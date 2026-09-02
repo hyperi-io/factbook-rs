@@ -43,7 +43,7 @@ The defaults fetch DB-IP Lite for location and sapics `origin-asn` for networks,
 Expect a record naming the country and the operating network:
 
 ```
-GeoIpRecord { city_name: Some("Mountain View"), continent_code: Some("NA"), country_code: Some("US"), country_name: Some("United States"), region_name: Some("California"), region_code: None, postal_code: None, timezone: None, latitude: Some(37.422), longitude: Some(-122.085), metro_code: None, accuracy_radius: None, autonomous_system_number: Some(15169), autonomous_system_organization: Some("Google LLC"), is_private: false, network: Some("8.8.8.0/24"), asn_network: Some("8.8.8.0/24") }
+GeoIpRecord { city_name: Some("Mountain View"), continent_code: Some("NA"), country_code: Some("US"), country_name: Some("United States"), region_name: Some("California"), region_code: None, postal_code: None, timezone: None, latitude: Some(37.422), longitude: Some(-122.085), metro_code: None, accuracy_radius: None, autonomous_system_number: Some(15169), autonomous_system_organization: Some("Google LLC"), is_private: false, network: Some("8.8.8.0/24"), asn_network: Some("8.8.8.0/24"), as_domain: None }
 ```
 
 Every field is present in the output whether or not the source filled it, and which ones come back populated depends on the source rather than on factbook. The first run moves both databases and takes as long as the link allows -- the location half is the larger by an order of magnitude. Progress is logged every 30 seconds through the `tracing` facade, so install a subscriber if you want to watch it.

@@ -78,9 +78,9 @@ use ipnet::IpNet;
 use prefix_trie::joint::JointPrefixMap;
 use tracing::{debug, warn};
 
-use crate::geoip::config::AutoDownloadConfig;
+use crate::geoip::AutoDownloadConfig;
+use crate::geoip::DatabaseFormat;
 use crate::geoip::download::fetch::{self, Archive, Credential, Transfer};
-use crate::geoip::download::source::Payload;
 use crate::geoip::download::verify::Guard;
 use crate::geoip::download::{GeoIpDownloadError, SECS_PER_DAY, is_fresh};
 use parse::Parsed;
@@ -105,6 +105,7 @@ type Cell = Option<Box<str>>;
 
 /// Errors raised while provisioning or reading a table.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TableError {
     /// The file could not be fetched.
     #[error("fetching the table failed: {0}")]
@@ -180,10 +181,6 @@ pub enum TableError {
         /// Columns the source actually has.
         columns: String,
     },
-
-    /// The payload fetched is not a table.
-    #[error("the source's payload is not a table")]
-    NotATable,
 }
 
 /// How the rows of a table are reached.
@@ -257,7 +254,6 @@ impl Table {
         source.validate()?;
 
         let dest = auto.data_dir.join(&source.file);
-        let payload = source.payload();
 
         if !auto.enabled {
             debug!(file = %dest.display(), "auto-download is off, reading what is on disk");
@@ -270,8 +266,8 @@ impl Table {
                 Duration::from_secs(auto.read_timeout_secs),
             )?;
 
-            let transfer = transfer(source, dest.clone(), &payload);
-            let guard = Guard::for_table(source.format, auto);
+            let transfer = transfer(source, dest.clone());
+            let guard = Guard::for_table(source.format, &source.schema, auto);
 
             if let Err(e) = transfer.run_guarded(&client, guard).await {
                 if !dest.exists() {
@@ -285,7 +281,7 @@ impl Table {
             }
         }
 
-        Self::from_payload(&dest, &payload)
+        Self::load(&dest, source.format, &source.schema, &source.index)
     }
 
     /// Read a table off disk.
@@ -335,6 +331,17 @@ impl Table {
         &self.columns[self.key_column]
     }
 
+    /// Whether rows are reached by an address or by the text of a column.
+    ///
+    /// A lookup that does not match answers nothing rather than failing, so a
+    /// source whose `index` was edited from a column to a prefix builds, reports
+    /// its full [`len`](Self::len), and returns `None` from every
+    /// [`get`](Self::get). This is how a caller tells the two apart.
+    #[must_use]
+    pub const fn keyed_by_address(&self) -> bool {
+        matches!(self.keys, Keys::Address(_) | Keys::Prefix(_))
+    }
+
     /// How many rows the table holds.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -357,6 +364,9 @@ impl Table {
     }
 
     /// The first row filed under a text key.
+    ///
+    /// Answers nothing on a table keyed by address, which
+    /// [`keyed_by_address`](Self::keyed_by_address) reports.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<Row<'_>> {
         self.positions_of(key).first().map(|&at| self.row(at))
@@ -372,6 +382,9 @@ impl Table {
     }
 
     /// The first row filed under an address.
+    ///
+    /// Answers nothing on a table keyed by a column, which
+    /// [`keyed_by_address`](Self::keyed_by_address) reports.
     #[must_use]
     pub fn get_by_address(&self, address: IpAddr) -> Option<Row<'_>> {
         self.positions_at(address).first().map(|&at| self.row(at))
@@ -383,21 +396,6 @@ impl Table {
         Rows {
             table: self,
             positions: Positions::Listed(self.positions_at(address).iter()),
-        }
-    }
-
-    /// Read a table off disk, as the payload states it.
-    fn from_payload(path: &Path, payload: &Payload) -> Result<Self, TableError> {
-        match payload {
-            Payload::Table {
-                format,
-                schema,
-                index,
-            } => Self::load(path, *format, schema, index),
-
-            // An operator-supplied MMDB source is provisioned like any other
-            // file, but it is a database rather than a table.
-            Payload::Mmdb => Err(TableError::NotATable),
         }
     }
 
@@ -413,16 +411,18 @@ impl Table {
                     column: name.clone(),
                     columns: columns.join(", "),
                 })?,
-            Index::Ip => {
-                address_column(&columns, &rows).ok_or_else(|| TableError::NoAddressColumn {
-                    columns: columns.join(", "),
-                })?
-            }
-            Index::Prefix => {
-                prefix_column(&columns, &rows).ok_or_else(|| TableError::NoPrefixColumn {
-                    columns: columns.join(", "),
-                })?
-            }
+            Index::Ip => keyed_column(&columns, &rows, &ADDRESS_COLUMNS, |text| {
+                as_address(text).is_some()
+            })
+            .ok_or_else(|| TableError::NoAddressColumn {
+                columns: columns.join(", "),
+            })?,
+            Index::Prefix => keyed_column(&columns, &rows, &PREFIX_COLUMNS, |text| {
+                as_prefix(text).is_some()
+            })
+            .ok_or_else(|| TableError::NoPrefixColumn {
+                columns: columns.join(", "),
+            })?,
         };
 
         let mut reachable = 0;
@@ -637,7 +637,7 @@ impl<'a> Iterator for Rows<'a> {
 impl ExactSizeIterator for Rows<'_> {}
 
 /// The transfer that fetches one table source.
-fn transfer(source: &TableSource, dest: PathBuf, payload: &Payload) -> Transfer {
+fn transfer(source: &TableSource, dest: PathBuf) -> Transfer {
     Transfer {
         url: source.url.clone(),
         // A user-supplied source states one URL: there is no publication month
@@ -649,7 +649,10 @@ fn transfer(source: &TableSource, dest: PathBuf, payload: &Payload) -> Transfer 
             SourceArchive::Raw => Archive::Raw,
             SourceArchive::Gzip => Archive::Gzip,
         },
-        format: payload.format(),
+        format: match source.format {
+            TableFormat::Csv { .. } => DatabaseFormat::Csv,
+            TableFormat::Json => DatabaseFormat::Json,
+        },
         credential: Credential::None,
     }
 }
@@ -674,72 +677,44 @@ fn as_prefix(text: &str) -> Option<IpNet> {
         .or_else(|| as_address(text).map(IpNet::from))
 }
 
-/// Which column an [`Index::Prefix`] source is keyed by.
-fn prefix_column(columns: &[String], rows: &[Vec<Cell>]) -> Option<usize> {
-    let named = columns
-        .iter()
-        .position(|column| PREFIX_COLUMNS.contains(&column.to_ascii_lowercase().as_str()));
-
-    if let Some(at) = named
-        && holds_prefixes(rows, at)
-    {
-        return Some(at);
-    }
-
-    (0..columns.len()).find(|&at| holds_prefixes(rows, at))
-}
-
-/// Whether the sampled values of a column are all CIDR ranges.
-fn holds_prefixes(rows: &[Vec<Cell>], at: usize) -> bool {
-    let mut seen = 0;
-
-    for row in rows.iter().take(ADDRESS_SAMPLE) {
-        let Some(text) = cell(row, at) else {
-            continue;
-        };
-        if as_prefix(text).is_none() {
-            return false;
-        }
-        seen += 1;
-    }
-
-    seen > 0
-}
-
-/// Which column an [`Index::Ip`] source is keyed by.
+/// Which column a source is keyed by.
 ///
 /// A conventional name is preferred, and a source that uses none is sampled
-/// instead, because the field holding the address is named differently by every
-/// publisher.
-fn address_column(columns: &[String], rows: &[Vec<Cell>]) -> Option<usize> {
-    let named = columns
-        .iter()
-        .position(|column| ADDRESS_COLUMNS.contains(&column.to_ascii_lowercase().as_str()));
+/// instead, because the field is named differently by every publisher. The
+/// sampling policy is shared by both key kinds and changes for both at once.
+fn keyed_column(
+    columns: &[String],
+    rows: &[Vec<Cell>],
+    names: &[&str],
+    parses: fn(&str) -> bool,
+) -> Option<usize> {
+    let holds = |at: usize| {
+        let mut seen = 0;
 
-    if let Some(at) = named
-        && holds_addresses(rows, at)
+        for row in rows.iter().take(ADDRESS_SAMPLE) {
+            let Some(text) = cell(row, at) else {
+                continue;
+            };
+            if !parses(text) {
+                return false;
+            }
+            seen += 1;
+        }
+
+        seen > 0
+    };
+
+    let conventional = columns
+        .iter()
+        .position(|column| names.contains(&column.to_ascii_lowercase().as_str()));
+
+    if let Some(at) = conventional
+        && holds(at)
     {
         return Some(at);
     }
 
-    (0..columns.len()).find(|&at| holds_addresses(rows, at))
-}
-
-/// Whether the sampled values of a column are all addresses.
-fn holds_addresses(rows: &[Vec<Cell>], at: usize) -> bool {
-    let mut seen = 0;
-
-    for row in rows.iter().take(ADDRESS_SAMPLE) {
-        let Some(text) = cell(row, at) else {
-            continue;
-        };
-        if as_address(text).is_none() {
-            return false;
-        }
-        seen += 1;
-    }
-
-    seen > 0
+    (0..columns.len()).find(|&at| holds(at))
 }
 
 #[cfg(test)]

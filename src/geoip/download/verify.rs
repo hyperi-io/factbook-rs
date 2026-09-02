@@ -28,7 +28,7 @@ use std::path::Path;
 
 use super::{DatabaseFormat, GeoIpDownloadError, Kind};
 use crate::geoip::config::AutoDownloadConfig;
-use crate::table::TableFormat;
+use crate::table::{Schema, TableFormat};
 
 #[cfg(feature = "geoip-lookup")]
 use std::net::{IpAddr, Ipv4Addr};
@@ -53,6 +53,10 @@ pub(crate) struct Guard {
     /// or the payload is not a table.
     parses: Option<TableFormat>,
 
+    /// Column count the source names, which is the width the load will require.
+    /// Absent when the schema takes its names from the file.
+    declared: Option<usize>,
+
     /// Smallest percentage of the copy on disk a replacement may be, zero for
     /// no floor.
     min_size_percent: u8,
@@ -65,6 +69,7 @@ impl Guard {
     pub(super) const OFF: Self = Self {
         probe: None,
         parses: None,
+        declared: None,
         min_size_percent: 0,
     };
 
@@ -77,6 +82,7 @@ impl Guard {
                 None
             },
             parses: None,
+            declared: None,
             min_size_percent: auto.min_size_percent,
         }
     }
@@ -84,14 +90,23 @@ impl Guard {
     /// The guard the operator's settings ask for on a table.
     ///
     /// A table has no address to probe, so the content question it answers is
-    /// whether the bytes hold rows of the format the source states.
-    pub(crate) const fn for_table(format: TableFormat, auto: &AutoDownloadConfig) -> Self {
+    /// whether the bytes hold rows of the format the source states, at the width
+    /// its schema names.
+    pub(crate) fn for_table(
+        format: TableFormat,
+        schema: &Schema,
+        auto: &AutoDownloadConfig,
+    ) -> Self {
         Self {
             probe: None,
             parses: if auto.verify_content {
                 Some(format)
             } else {
                 None
+            },
+            declared: match schema {
+                Schema::Named(names) => Some(names.len()),
+                Schema::Auto => None,
             },
             min_size_percent: auto.min_size_percent,
         }
@@ -122,7 +137,7 @@ impl Guard {
         }
 
         if let Some(table) = self.parses {
-            parses(staged, dest, table)?;
+            parses(staged, dest, table, self.declared)?;
         }
 
         Ok(())
@@ -267,8 +282,13 @@ fn probe(
 /// Bounded rather than exhaustive: this runs before the rename, where the
 /// question is whether the bytes are a table at all, and a fault deeper in the
 /// file is reported by the load that follows.
-fn parses(staged: &Path, dest: &Path, format: TableFormat) -> Result<(), GeoIpDownloadError> {
-    crate::table::probe(staged, format).map_err(|e| GeoIpDownloadError::Unparseable {
+fn parses(
+    staged: &Path,
+    dest: &Path,
+    format: TableFormat,
+    declared: Option<usize>,
+) -> Result<(), GeoIpDownloadError> {
+    crate::table::probe(staged, format, declared).map_err(|e| GeoIpDownloadError::Unparseable {
         path: dest.display().to_string(),
         detail: e.to_string(),
     })
@@ -531,6 +551,38 @@ mod tests {
                 ),
                 "{err:?}"
             );
+        }
+
+        #[test]
+        fn a_database_published_for_ipv6_is_probed_the_same_way() {
+            // A source covering IPv6 declares ip_version 6, which sends every
+            // lookup through the reader's v4-in-v6 mapping rather than straight
+            // down the tree.
+            admit(&fixtures::asn_mmdb_v6(13_335, "CLOUDFLARENET"), Kind::Asn).unwrap();
+            admit(&fixtures::city_mmdb_v6("US"), Kind::City).unwrap();
+
+            let err = admit(&fixtures::asn_mmdb_v6(13_335, ""), Kind::Asn).unwrap_err();
+            assert!(
+                matches!(err, GeoIpDownloadError::Unpopulated { .. }),
+                "{err:?}"
+            );
+        }
+
+        #[test]
+        fn an_ipv6_address_answers_from_a_database_published_for_it() {
+            // Every probe address is IPv4, so this is the only place the
+            // content check is asked an IPv6 question at all.
+            let dir = tempfile::tempdir().unwrap();
+            let staged = dir.path().join("db.mmdb.staged");
+            fs::write(&staged, fixtures::asn_mmdb_v6(13_335, "CLOUDFLARENET")).unwrap();
+
+            let reader = crate::geoip::enricher::open_reader(&staged).unwrap();
+            let resolver: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+
+            assert!(answers(&reader, resolver, Kind::Asn));
+            // The kind decides the field, so an ASN database answers no country
+            // over IPv6 either.
+            assert!(!answers(&reader, resolver, Kind::City));
         }
 
         #[test]
