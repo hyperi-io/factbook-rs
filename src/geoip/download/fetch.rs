@@ -42,6 +42,12 @@ const PART_EXT: &str = "part";
 /// Extension of the fully-materialised file awaiting its rename.
 const STAGE_EXT: &str = "staged";
 
+/// Extension of the file the transfer's advisory lock is held on.
+///
+/// Its own file because the part file is unlinked and recreated mid-transfer,
+/// and a lock follows the inode rather than the name.
+const LOCK_EXT: &str = "lock";
+
 /// How often a transfer in flight reports progress.
 ///
 /// A half-hour transfer that says nothing is indistinguishable from a hang, and
@@ -214,14 +220,19 @@ impl Transfer {
         // Two processes sharing a data directory would otherwise interleave
         // writes into one part file. The kernel drops this lock when the
         // process holding it dies, so a crash cannot leave it held.
-        // Never truncating: a part file already holding a prefix is what the
-        // resume continues from.
+        //
+        // The lock lives on its own file, never on the part file: a lock is
+        // held on an inode rather than a path, and the transfer unlinks and
+        // recreates the part file on the fallback and on every refusal. A
+        // second process opening the fresh inode would then take a lock nobody
+        // was holding and write alongside the first.
+        let lock_path = with_extension(&self.dest, LOCK_EXT);
         let lock = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(&part)?;
+            .open(&lock_path)?;
         match lock.try_lock() {
             Ok(()) => {}
             Err(fs::TryLockError::WouldBlock) => {
@@ -352,7 +363,14 @@ impl Transfer {
         url: &str,
         part: &Path,
     ) -> Result<u64, GeoIpDownloadError> {
-        let resume_from = resumable_offset(part);
+        // Called either way: it also drops a part file past the resume window,
+        // which has to happen whether or not the offset is usable.
+        let offset = resumable_offset(part);
+        let resume_from = if resume_is_checkable(self.archive, self.checksum_url.is_some()) {
+            offset
+        } else {
+            0
+        };
         let mut request = self.credential.apply(client.get(url));
         if resume_from > 0 {
             request = request.header(reqwest::header::RANGE, format!("bytes={resume_from}-"));
@@ -494,6 +512,18 @@ fn refused(
         url: url.to_string(),
         status: status.as_u16(),
     }
+}
+
+/// Whether continuing a part file can be checked afterwards.
+///
+/// Nothing binds a resumed range to the bytes it resumed from -- no `If-Range`,
+/// and a server may answer 206 from a rebuilt file -- so a prefix from one build
+/// can be spliced onto the tail of the next. The splice has to be caught after
+/// the fact, and only two things catch it: a digest the publisher signs the
+/// whole file with, or a compressed container whose own integrity check fails on
+/// a seam. A raw body with no digest has neither, so it starts again.
+const fn resume_is_checkable(archive: Archive, has_digest: bool) -> bool {
+    has_digest || !matches!(archive, Archive::Raw)
 }
 
 /// Bytes already transferred that are worth continuing from.

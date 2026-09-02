@@ -162,6 +162,15 @@ fn raw_transfer(url: String, dest: PathBuf) -> Transfer {
     }
 }
 
+/// A transfer that is allowed to continue a part file, because a digest is
+/// published for it.
+fn resumable_transfer(url: String, dest: PathBuf, checksum_url: String) -> Transfer {
+    Transfer {
+        checksum_url: Some(checksum_url),
+        ..raw_transfer(url, dest)
+    }
+}
+
 /// Bytes shaped like a MaxMind DB: a payload, then the metadata marker the
 /// format ends with.
 fn mmdb_body(payload: &[u8]) -> Vec<u8> {
@@ -260,11 +269,17 @@ fn tar_gz(member: &str, payload: &[u8]) -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
-/// Names of everything left in a directory.
+/// Names of everything left in a directory that a reader might open.
+///
+/// Lock files are excluded. They persist by design -- a lock follows the inode,
+/// so removing one is how two processes end up writing the same part file --
+/// and what these assertions are really asking is whether a partial or refused
+/// download was left where something could mistake it for a database.
 fn entries(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| Path::new(name).extension() != Some("lock".as_ref()))
         .collect();
     names.sort();
     names
@@ -995,13 +1010,13 @@ async fn a_second_writer_is_turned_away_rather_than_interleaved() {
 
     // Stand in for the other process by holding the lock it would hold. A
     // separate open file description, which is what flock excludes on.
-    let part = dir.path().join("origin-asn.mmdb.part");
+    let lock_path = dir.path().join("origin-asn.mmdb.lock");
     let held = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&part)
+        .open(&lock_path)
         .unwrap();
     held.lock().unwrap();
 
@@ -1805,6 +1820,7 @@ async fn an_interrupted_transfer_resumes_from_the_part_file() {
 
     // A server honouring the range sends what is missing, and says so with 206.
     Mock::given(method("GET"))
+        .and(path("/db.mmdb"))
         .respond_with(
             ResponseTemplate::new(206)
                 .insert_header(
@@ -1815,11 +1831,20 @@ async fn an_interrupted_transfer_resumes_from_the_part_file() {
         )
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/db.mmdb.sha256"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sha256_hex(&body)))
+        .mount(&server)
+        .await;
 
-    let written = raw_transfer(format!("{}/db.mmdb", server.uri()), dest)
-        .run(&default_client())
-        .await
-        .unwrap();
+    let written = resumable_transfer(
+        format!("{}/db.mmdb", server.uri()),
+        dest,
+        format!("{}/db.mmdb.sha256", server.uri()),
+    )
+    .run(&default_client())
+    .await
+    .unwrap();
 
     assert_eq!(fs::read(&written).unwrap(), body);
     let requests = server.received_requests().await.unwrap();
@@ -1839,6 +1864,44 @@ async fn a_server_that_ignores_the_range_restarts_the_file() {
     fs::write(&part, &body[..8]).unwrap();
 
     Mock::given(method("GET"))
+        .and(path("/db.mmdb"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/db.mmdb.sha256"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sha256_hex(&body)))
+        .mount(&server)
+        .await;
+
+    let written = resumable_transfer(
+        format!("{}/db.mmdb", server.uri()),
+        dest,
+        format!("{}/db.mmdb.sha256", server.uri()),
+    )
+    .run(&default_client())
+    .await
+    .unwrap();
+
+    assert_eq!(fs::read(&written).unwrap(), body);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests[0].headers.get("range").unwrap(), "bytes=8-");
+}
+
+#[tokio::test]
+async fn a_raw_body_with_no_digest_is_never_continued() {
+    // Nothing binds the range to the bytes it resumed from, so a prefix from one
+    // build can be spliced onto the tail of the next. With no digest and no
+    // container to fail on the seam, the splice would reach the destination.
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("db.mmdb");
+    let part = dir.path().join("db.mmdb.part");
+
+    let body = mmdb_body(b"the whole database body");
+    fs::write(&part, b"a prefix of yesterday's build").unwrap();
+
+    Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
         .mount(&server)
         .await;
@@ -1850,7 +1913,10 @@ async fn a_server_that_ignores_the_range_restarts_the_file() {
 
     assert_eq!(fs::read(&written).unwrap(), body);
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests[0].headers.get("range").unwrap(), "bytes=8-");
+    assert!(
+        requests[0].headers.get("range").is_none(),
+        "the request must not ask for a range it cannot check"
+    );
 }
 
 #[tokio::test]

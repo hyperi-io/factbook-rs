@@ -76,6 +76,18 @@ fn is_private_v6(ip: Ipv6Addr) -> bool {
         || ip.is_multicast()
         || ip.is_unique_local()
         || ip.is_unicast_link_local()
+        || is_documentation_v6(ip)
+}
+
+/// Documentation space, `2001:db8::/32` per RFC 3849.
+///
+/// `Ipv6Addr::is_documentation` covers this but is still unstable. The IPv4
+/// side gets this from `is_documentation`, so without it the two families
+/// disagree about an address that can never be answered.
+#[inline]
+fn is_documentation_v6(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0x2001 && segments[1] == 0x0db8
 }
 
 #[cfg(test)]
@@ -145,6 +157,16 @@ mod tests {
     fn unique_local_ipv6_is_private() {
         assert!(is_private(ip("fc00::1")));
         assert!(is_private(ip("fd12:3456:789a::1")));
+    }
+
+    #[test]
+    fn documentation_space_is_private_in_both_families() {
+        assert!(is_private(ip("192.0.2.1")));
+        assert!(is_private(ip("2001:db8::1")));
+        assert!(is_private(ip("2001:db8:ffff:ffff::1")));
+        // The prefix is 32 bits, so the neighbouring blocks are routable.
+        assert!(!is_private(ip("2001:db9::1")));
+        assert!(!is_private(ip("2001:db7::1")));
     }
 
     #[test]
