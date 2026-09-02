@@ -50,7 +50,7 @@ What each fills in a record, not what the upstream product sells:
 
 IPinfo publishes one file carrying both halves, so selecting it for location fills the network fields too.
 
-The paid MaxMind line downloads GeoIP2-ISP for the network half, and its distinguishing fields -- the ISP and organisation names, which differ from the network's registered operator -- have nowhere to go: `GeoIpRecord` carries no field for them. Selecting the paid tier does not surface them.
+The paid MaxMind line downloads GeoIP2-ISP for the network half. Its distinguishing fields -- the ISP and organisation names, which differ from the network's registered operator, and the mobile country and network codes -- have no typed field on `GeoIpRecord`, so they arrive in `record.extra` under the names the database writes: `isp`, `organization`, `mobile_country_code`, `mobile_network_code`. The same holds for anything else a source carries that the typed fields do not name, free builds included -- geoname ids, confidence scores, `traits`, and names in languages other than English.
 
 `custom` downloads nothing. Set `city_db_path` and `asn_db_path` and factbook reads what is already there.
 

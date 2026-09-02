@@ -48,6 +48,15 @@ pub(crate) mod fetch;
 pub(crate) mod source;
 pub(crate) mod verify;
 
+// Writing the format needs the reader that reads it: a conversion is refused
+// unless it reads back, and this crate's only reader is the lookup half.
+#[cfg(feature = "geoip-lookup")]
+#[allow(
+    dead_code,
+    reason = "the converter is verified ahead of the call site that will use it"
+)]
+pub(crate) mod mmdb;
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};

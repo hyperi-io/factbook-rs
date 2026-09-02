@@ -41,6 +41,17 @@ const CITY_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/city-test
 /// A database in MaxMind's ASN schema, built by scripts/make_fixtures.py.
 const ASN_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/asn-test.mmdb");
 
+/// The City schema at the size a published build writes it, which is what
+/// prices reading a whole record rather than the handful of fields the lean
+/// fixtures hold.
+const CITY_RICH_DB: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/data/city-rich-test.mmdb"
+);
+
+/// The rich fixture's own /24, the one network wide enough to read cold.
+const RICH_NETWORK: (&str, u32) = ("81.2.69.0", 24);
+
 /// Every IPv4 network the committed city fixture holds, base address and prefix.
 ///
 /// Enumerated from the file itself rather than taken from MaxMind's
@@ -164,6 +175,10 @@ impl Zipf {
 struct Fixture {
     /// The enricher under measurement.
     geoip: GeoIp,
+    /// The same enricher over a record the size a published build writes.
+    rich: GeoIp,
+    /// Addresses read cold out of that record's network.
+    cold_rich: Vec<IpAddr>,
     /// Pool addresses in rank order, rank 1 first.
     pool: Vec<IpAddr>,
     /// The rank-1 address, the one a repeat-hit benchmark uses.
@@ -194,6 +209,12 @@ impl Fixture {
         )
         .expect("the committed fixture databases open");
 
+        let rich = GeoIp::open(
+            DatabasePaths::city_only(Path::new(CITY_RICH_DB)),
+            CacheConfig::default(),
+        )
+        .expect("the rich fixture database opens");
+
         let absent_count = POOL_SIZE / ABSENT_SHARE;
         let located = located_addresses(POOL_SIZE - absent_count);
         let absent = absent_addresses(absent_count);
@@ -211,7 +232,9 @@ impl Fixture {
             hottest: pool[0],
             cold_located: located[..COLD_READS].to_vec(),
             cold_absent: absent[..COLD_READS].to_vec(),
+            cold_rich: hosts_in(RICH_NETWORK, COLD_READS),
             geoip,
+            rich,
             pool,
             probe,
             batch,
@@ -257,6 +280,18 @@ impl Fixture {
             "reserved addresses spent cache entries"
         );
         self.geoip.clear_cache();
+
+        for &ip in &self.cold_rich {
+            let record = self
+                .rich
+                .lookup(ip)
+                .unwrap_or_else(|| panic!("{ip} is not held by the rich fixture"));
+            assert!(
+                !record.extra.is_empty(),
+                "{ip} resolved no source fields, so the rich read is the lean one"
+            );
+        }
+        self.rich.clear_cache();
     }
 
     /// Print what the distribution came out as, so the numbers can be read.
@@ -320,6 +355,25 @@ fn located_addresses(count: usize) -> Vec<IpAddr> {
         );
         host += 1;
     }
+}
+
+/// The first `count` host addresses of one network.
+fn hosts_in(network: (&str, u32), count: usize) -> Vec<IpAddr> {
+    let (base, prefix) = network;
+    let base: Ipv4Addr = base.parse().expect("a fixture network literal parses");
+    let size = 1u32 << (32 - prefix);
+    assert!(
+        u64::from(size) >= count as u64,
+        "{base}/{prefix} holds fewer than {count} addresses"
+    );
+
+    (0..count)
+        .map(|host| {
+            IpAddr::V4(Ipv4Addr::from_bits(
+                base.to_bits() + u32::try_from(host).unwrap(),
+            ))
+        })
+        .collect()
 }
 
 /// Distinct addresses no database holds, taken in sequence from `198.18.0.0/15`.
@@ -431,6 +485,20 @@ fn cold_read(c: &mut Criterion) {
             |()| {
                 for &ip in &fixture.cold_absent {
                     black_box(fixture.geoip.lookup(black_box(ip)));
+                }
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    // The lean fixtures hold a tenth of the fields a published build writes, so
+    // this is what a miss costs on a record the size a deployment reads.
+    group.bench_function("rich", |b| {
+        b.iter_batched(
+            || fixture.rich.clear_cache(),
+            |()| {
+                for &ip in &fixture.cold_rich {
+                    black_box(fixture.rich.lookup(black_box(ip)));
                 }
             },
             BatchSize::PerIteration,

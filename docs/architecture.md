@@ -32,7 +32,9 @@ Nothing passes a record between the halves. Acquisition finishes when the file i
 
 ## The atomic rename is what makes the memory map safe
 
-A reader holds a memory map of the file. Writing a refresh into that file in place changes bytes underneath a live mapping, which is undefined behaviour. Downloading to a `.part` file and renaming means the mapped inode is never written to, so the old reader keeps answering from it until something reopens it.
+A reader over the resident ceiling holds a memory map of the file. Writing a refresh into that file in place changes bytes underneath a live mapping, which is undefined behaviour. Downloading to a `.part` file and renaming means the mapped inode is never written to, so the old reader keeps answering from it until something reopens it.
+
+A resident reader has no mapping to invalidate, so it is not exposed to that. The rename still matters for it: a reader opened part way through an in-place write would read half of one build and half of another.
 
 `refresh_if_changed` is that something. It stats each file, reopens whichever moved, and swaps the reader set in one atomic store. Nothing starts a timer -- a library that spawns its own thread imposes that thread on every consumer, so the schedule belongs to the caller.
 
@@ -90,12 +92,14 @@ Providers disagree about how a record is written. MaxMind nests, and DB-IP and s
 
 Each database names its own schema in its metadata, so the reader dispatches on the file rather than on config. A pre-seeded or mounted file is handled the same as a downloaded one. Every schema lands on the same flat record, which is what lets answers from different sources merge.
 
+The typed fields are the ones every provider publishes. A source carries more than that, and none of it is discarded: after the typed decode the record is read a second time with no schema, flattened to dotted paths -- `city.names.de`, `subdivisions.0.iso_code`, `isp` -- and everything the typed decode did not take lands in `record.extra`. So a paid edition, a richer free build or a provider nobody has written a field for delivers its fields with no change here. The test is on the value rather than the path alone, which is what keeps a superseded subdivision, or a field whose wire type the typed shape refused, in the map instead of lost. The cost is a second record decode on the miss path, which the cache pays once per address; the located cold read measures 1.7 microseconds against 2.7, and 2.1 against 5.4 on a record the size a city build writes.
+
 ## Features draw the dependency line
 
 | feature | pulls in | for |
 |---|---|---|
 | `geoip-download` | HTTP, TLS, gzip, tar | fetching and verifying |
-| `geoip-lookup` | mmap reader, cache | answering |
+| `geoip-lookup` | resident or mapped reader, cache | answering |
 | `metrics` *(default)* | the `metrics` facade | download outcomes and database age |
 | `metrics-lookup` | the same facade | cache hits, misses, size and lookup duration |
 

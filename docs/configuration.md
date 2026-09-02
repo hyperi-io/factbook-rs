@@ -37,6 +37,7 @@ Setting a path bypasses the provider for that half only. The other half still pr
 | `verify_content` | bool | `true` | Check that a download is the kind of thing it claims to be |
 | `min_size_percent` | u8 | `50` | Refuse a replacement below this fraction of the copy on disk. Zero disables the floor |
 | `age_from_source` | bool | `true` | Report database age from the publisher's build stamp rather than the local write time. Metric only; freshness still counts from the write |
+| `resident_max_bytes` | u64 | `134217728` | Read a database this size or smaller onto the heap when it is opened; map a larger one. Zero maps everything |
 
 A geo provider reads `max_age_days` against its own published cadence: the window is that cadence, shortened by this ceiling, then floored at whatever minimum interval between fetches the provider's row states. MaxMind and IPinfo state one day, which is what their download caps allow. DB-IP and sapics state none, so nothing floors the ceiling there.
 
@@ -45,6 +46,16 @@ A table source has neither a cadence nor a minimum, so `max_age_days` is used as
 There is deliberately no total request timeout. A whole-request budget puts a ceiling on the link speed a deployment is allowed to have, which fails a slow but healthy transfer. The idle bound fails a stalled one inside a minute and lets a progressing one finish.
 
 The three credential keys are redacted in debug and display output, and never reach a URL or a process argument.
+
+## A resident database cannot stall a lookup; a mapped one can
+
+`resident_max_bytes` decides how an opened database is held. At or under it the file is read onto the heap, so no lookup can take a page fault partway through a tree traversal. Above it the file is mapped and its pages arrive when the operating system supplies them. **The database occupies its own size either way** -- what changes is whether a lookup can stall, not how much memory it costs.
+
+The 128 MiB default clears every database this crate models: sapics `origin-asn` at 10 MB, IPinfo Lite at 23 MB, GeoLite2-City at 70 MB, and DB-IP Lite at 100 to 120 MB expanded. The paid GeoIP2-City is the first to cross it as it grows, which is the right place for the line -- a deployment paying for that database can raise the ceiling, and one on the free pair never meets it.
+
+Set it to zero to map everything, which is what a deployment wants when the host is short of memory and can afford a page fault more readily than the resident copy.
+
+The same key exists on `CacheConfig`, which is what the lookup half acts on. Two fields rather than one because the lookup half compiles without the download half, so it cannot read `auto_download` at all, and `GeoIp::open` takes no download settings -- provisioning and lookup are separate calls by design. A host that configures one copies it across.
 
 ### Cache
 

@@ -751,7 +751,7 @@ fn materialise_guarded(
         Archive::Gzip => {
             let decoder = MultiGzDecoder::new(io::BufReader::new(source));
             let mut out = io::BufWriter::new(fs::File::create(staged)?);
-            copy_bounded(decoder, &mut out, dest)?;
+            copy_bounded(decoder, &mut out, dest, MAX_EXPANDED_BYTES)?;
         }
         Archive::TarGz { member } => {
             extract_member(source, staged, member, dest)?;
@@ -795,18 +795,21 @@ fn materialise_guarded(
 ///
 /// Reads one byte past the limit so a body sitting exactly on it is admitted
 /// rather than reported as an overrun.
+/// The limit is a parameter rather than read from the constant, so a test can
+/// reach the refusal without expanding four gigabytes.
 fn copy_bounded(
     source: impl io::Read,
     out: &mut impl io::Write,
     dest: &Path,
+    limit: u64,
 ) -> Result<(), GeoIpDownloadError> {
-    let written = io::copy(&mut source.take(MAX_EXPANDED_BYTES + 1), out)?;
+    let written = io::copy(&mut source.take(limit + 1), out)?;
     io::Write::flush(out)?;
 
-    if written > MAX_EXPANDED_BYTES {
+    if written > limit {
         return Err(GeoIpDownloadError::TooLarge {
             url: dest.display().to_string(),
-            limit: MAX_EXPANDED_BYTES,
+            limit,
         });
     }
 
@@ -835,7 +838,7 @@ fn extract_member(
         let is_match = is_file && entry.path()?.file_name().is_some_and(|name| name == member);
         if is_match {
             let mut out = io::BufWriter::new(fs::File::create(staged)?);
-            copy_bounded(&mut entry, &mut out, dest)?;
+            copy_bounded(&mut entry, &mut out, dest, MAX_EXPANDED_BYTES)?;
             return Ok(());
         }
     }
@@ -912,6 +915,25 @@ mod tests {
         let rendered = format!("{transfer:?}");
         assert!(!rendered.contains("token-wxyz"), "{rendered}");
         assert!(rendered.contains("REDACTED"), "{rendered}");
+    }
+
+    #[test]
+    fn a_body_that_expands_past_the_ceiling_is_refused() {
+        // A gzip header states nothing about the expanded size, so the ceiling
+        // is the only thing standing between a hostile body and a full disk.
+        let dest = Path::new("/tmp/db.mmdb");
+        let mut out = Vec::new();
+
+        // Exactly on the limit is admitted.
+        copy_bounded(&b"12345678"[..], &mut out, dest, 8).unwrap();
+        assert_eq!(out, b"12345678");
+
+        let mut out = Vec::new();
+        let err = copy_bounded(&b"123456789"[..], &mut out, dest, 8).unwrap_err();
+        assert!(
+            matches!(err, GeoIpDownloadError::TooLarge { limit: 8, .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -1114,9 +1136,8 @@ mod tests {
 
     #[test]
     fn materialise_tar_gz_takes_the_first_member_carrying_the_name() {
-        // A rebuilt archive can carry the name twice. Taking the later one
-        // would make which copy lands depend on the order entries were written
-        // in, which no publisher states.
+        // A rebuilt archive can carry the name twice, and taking the later one
+        // would make which copy lands depend on an order no publisher states.
         let first = mmdb_body(b"the copy the extraction stops at");
         let second = mmdb_body(b"a second copy filed under the same name");
         let archive = tar_gz_of(&[

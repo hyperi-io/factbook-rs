@@ -63,16 +63,21 @@ use maxminddb::{Mmap, Reader, geoip2};
 use quick_cache::sync::{Cache, GuardResult};
 use tracing::debug;
 
+use super::DEFAULT_RESIDENT_MAX_BYTES;
 #[cfg(feature = "geoip-download")]
 use super::download::{Database, DatabaseFormat, Databases};
+use super::extra;
 use super::private::is_private;
 use super::record::GeoIpRecord;
 
 /// Addresses held in the cache by default.
 ///
-/// A cached record is on the order of a hundred bytes, so this is a low tens of
-/// megabytes -- small next to the database it is standing in front of, and
-/// enough to hold the working set of a busy feed.
+/// Enough to hold the working set of a busy feed. A record carries every field
+/// its databases wrote, so its size follows the source: a few hundred bytes on
+/// a lean ASN table, and two to four kilobytes on a city build whose records
+/// carry geoname ids, confidence scores and names in eight languages. At this
+/// capacity that is tens of megabytes at the low end and a few hundred at the
+/// high one, against a database of 10 to 120 MB.
 const DEFAULT_CAPACITY: usize = 100_000;
 
 /// Errors raised while opening or refreshing the databases.
@@ -85,12 +90,14 @@ const DEFAULT_CAPACITY: usize = 100_000;
 pub enum GeoIpLookupError {
     /// The provisioned database is not a MaxMind DB, which is the only format
     /// this engine reads.
-    #[error("{} is a {} database, a format not supported by the lookup engine", .path.display(), .format.name())]
+    // The format is a name rather than a `DatabaseFormat`, which lives behind
+    // `geoip-download` and would not exist in a lookup-only build.
+    #[error("{} is a {format} database, a format not supported by the lookup engine", .path.display())]
     UnsupportedFormat {
         /// First file of the database.
         path: PathBuf,
         /// Format the provisioning half reported for it.
-        format: DatabaseFormat,
+        format: &'static str,
     },
 
     /// The database was provisioned with no files at all.
@@ -111,11 +118,12 @@ pub enum GeoIpLookupError {
     },
 }
 
-/// How the lookup cache is sized and aged.
+/// How the lookup side is set up: the cache, and how a database is held.
 ///
-/// The knobs stop here on purpose. Shard count, ghost-queue allocation, weighers,
-/// eviction listeners and hashers are the cache implementation's business, and
-/// exposing them would make its version a part of this crate's contract.
+/// The cache knobs stop here on purpose. Shard count, ghost-queue allocation,
+/// weighers, eviction listeners and hashers are the cache implementation's
+/// business, and exposing them would make its version a part of this crate's
+/// contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CacheConfig {
     /// Addresses held before eviction starts.
@@ -129,6 +137,15 @@ pub struct CacheConfig {
     /// when it does. A time limit would evict correct answers early and still
     /// leave a staleness window, where clearing on the swap leaves none.
     pub max_age: Option<Duration>,
+
+    /// Largest file, in bytes, read into memory rather than mapped.
+    ///
+    /// At or under this a database is read onto the heap when it is opened, so
+    /// no lookup can fault on a page; above it the file is mapped and its pages
+    /// arrive at the operating system's discretion. The database occupies its
+    /// own size either way -- what changes is whether a lookup can stall.
+    /// Zero maps every database.
+    pub resident_max_bytes: u64,
 }
 
 impl Default for CacheConfig {
@@ -136,6 +153,60 @@ impl Default for CacheConfig {
         Self {
             capacity: DEFAULT_CAPACITY,
             max_age: None,
+            resident_max_bytes: DEFAULT_RESIDENT_MAX_BYTES,
+        }
+    }
+}
+
+/// Where an open database's bytes live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DatabaseBacking {
+    /// Read onto the heap when the database was opened.
+    Resident,
+
+    /// Mapped, with the pages arriving as the operating system supplies them.
+    Mapped,
+}
+
+impl DatabaseBacking {
+    /// Label used in metric series and log fields.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Resident => "resident",
+            Self::Mapped => "mapped",
+        }
+    }
+}
+
+/// Which backing each open database got.
+///
+/// A kind is `None` when no database of that kind was provisioned.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DatabaseBackings {
+    /// City database, when one was provisioned.
+    pub city: Option<DatabaseBacking>,
+
+    /// ASN database, when one was provisioned.
+    pub asn: Option<DatabaseBacking>,
+}
+
+/// One open database, over whichever backing its size selected.
+pub(super) enum Backing {
+    /// The file, read onto the heap.
+    Resident(Reader<Vec<u8>>),
+
+    /// The file, mapped.
+    Mapped(Reader<Mmap>),
+}
+
+impl Backing {
+    /// Which backing this is, for the accessor and the metric.
+    const fn reported(&self) -> DatabaseBacking {
+        match self {
+            Self::Resident(_) => DatabaseBacking::Resident,
+            Self::Mapped(_) => DatabaseBacking::Mapped,
         }
     }
 }
@@ -143,9 +214,19 @@ impl Default for CacheConfig {
 /// The open readers, swapped as a set so a refresh is one atomic store.
 pub(super) struct Readers {
     /// City database, when one was provisioned.
-    pub(super) city: Option<Arc<Reader<Mmap>>>,
+    pub(super) city: Option<Arc<Backing>>,
     /// ASN database, when one was provisioned.
-    pub(super) asn: Option<Arc<Reader<Mmap>>>,
+    pub(super) asn: Option<Arc<Backing>>,
+}
+
+impl Readers {
+    /// Which backing each open database got.
+    fn backings(&self) -> DatabaseBackings {
+        DatabaseBackings {
+            city: self.city.as_deref().map(Backing::reported),
+            asn: self.asn.as_deref().map(Backing::reported),
+        }
+    }
 }
 
 /// One database file and the modification time its reader was opened from.
@@ -186,6 +267,8 @@ pub(super) struct Inner {
     pub(super) sources: Mutex<Sources>,
     /// Age limit for a cached answer, off by default.
     max_age: Option<Duration>,
+    /// Ceiling under which a reopened database is read into memory.
+    pub(super) resident_max_bytes: u64,
 }
 
 impl Inner {
@@ -197,9 +280,11 @@ impl Inner {
     /// lookup that misses during the swap reads the new file rather than
     /// repopulating from the old one.
     pub(super) fn swap_readers(&self, readers: Readers) {
+        let backings = readers.backings();
         self.readers.store(Arc::new(readers));
         self.cache.clear();
         telemetry::size(self.cache.len());
+        backing_telemetry::backings(backings);
     }
 }
 
@@ -224,9 +309,9 @@ pub struct GeoIp {
 /// connection type, anonymous IP -- so a field is added here as those are
 /// supported, and functional update takes it without a change.
 ///
-/// A caller-supplied file must only ever be replaced by rename. The readers
-/// memory-map it, and writing one in place under a live mapping is undefined
-/// behaviour rather than a race.
+/// A caller-supplied file must only ever be replaced by rename. A file past the
+/// resident ceiling is memory-mapped, and writing one in place under a live
+/// mapping is undefined behaviour rather than a race.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DatabasePaths<'a> {
     /// City, country and location database.
@@ -267,21 +352,26 @@ impl GeoIp {
     /// [`GeoIpLookupError::Open`] naming the file that could not be read as a
     /// MaxMind DB.
     pub fn open(paths: DatabasePaths<'_>, cache: CacheConfig) -> Result<Self, GeoIpLookupError> {
-        let (city_source, city_reader) = paths.city.map(open_source).transpose()?.unzip();
-        let (asn_source, asn_reader) = paths.asn.map(open_source).transpose()?.unzip();
+        let open = |path| open_source(path, cache.resident_max_bytes);
+        let (city_source, city_reader) = paths.city.map(open).transpose()?.unzip();
+        let (asn_source, asn_reader) = paths.asn.map(open).transpose()?.unzip();
+
+        let readers = Readers {
+            city: city_reader,
+            asn: asn_reader,
+        };
+        backing_telemetry::backings(readers.backings());
 
         Ok(Self {
             inner: Arc::new(Inner {
-                readers: ArcSwap::from_pointee(Readers {
-                    city: city_reader,
-                    asn: asn_reader,
-                }),
+                readers: ArcSwap::from_pointee(readers),
                 cache: Cache::new(cache.capacity),
                 sources: Mutex::new(Sources {
                     city: city_source,
                     asn: asn_source,
                 }),
                 max_age: cache.max_age,
+                resident_max_bytes: cache.resident_max_bytes,
             }),
         })
     }
@@ -404,6 +494,15 @@ impl GeoIp {
         self.inner.cache.len()
     }
 
+    /// Which backing each open database got.
+    ///
+    /// Chosen per file from its size, at open and again whenever a refresh
+    /// reopens it, so this is reported rather than configured.
+    #[must_use]
+    pub fn backings(&self) -> DatabaseBackings {
+        self.inner.readers.load().backings()
+    }
+
     /// Drop every cached answer.
     ///
     /// A refresh does this on its own, so this is for a consumer with its own
@@ -460,11 +559,19 @@ fn read(readers: &Readers, ip: IpAddr) -> Option<GeoIpRecord> {
     let mut record = GeoIpRecord::default();
     let mut found = false;
 
-    if let Some(reader) = readers.city.as_deref() {
-        found |= read_city(reader, ip, &mut record);
+    // The backing is matched once per database rather than per tree node, so
+    // the traversal itself stays monomorphic.
+    if let Some(backing) = readers.city.as_deref() {
+        found |= match backing {
+            Backing::Resident(reader) => read_city(reader, ip, &mut record),
+            Backing::Mapped(reader) => read_city(reader, ip, &mut record),
+        };
     }
-    if let Some(reader) = readers.asn.as_deref() {
-        found |= read_asn(reader, ip, &mut record);
+    if let Some(backing) = readers.asn.as_deref() {
+        found |= match backing {
+            Backing::Resident(reader) => read_asn(reader, ip, &mut record),
+            Backing::Mapped(reader) => read_asn(reader, ip, &mut record),
+        };
     }
 
     found.then_some(record)
@@ -481,6 +588,8 @@ struct IpInfoRecord<'a> {
     #[serde(borrow, default)]
     continent_code: Option<&'a str>,
     #[serde(borrow, default)]
+    continent: Option<&'a str>,
+    #[serde(borrow, default)]
     asn: Option<&'a str>,
     #[serde(borrow, default)]
     as_name: Option<&'a str>,
@@ -492,17 +601,17 @@ struct IpInfoRecord<'a> {
 ///
 /// Every database names its own schema in its metadata, so this holds for a
 /// file that was pre-seeded or mounted rather than downloaded.
-fn is_ipinfo(reader: &Reader<Mmap>) -> bool {
+fn is_ipinfo<S: AsRef<[u8]>>(reader: &Reader<S>) -> bool {
     reader.metadata().database_type.starts_with("ipinfo")
 }
 
 /// IPinfo writes `AS15169` where every other source writes `15169`.
-fn asn_number(text: &str) -> Option<u32> {
+pub(super) fn asn_number(text: &str) -> Option<u32> {
     text.strip_prefix("AS").unwrap_or(text).parse().ok()
 }
 
 /// Fill the fields an IPinfo database carries, location and network together.
-fn read_ipinfo(reader: &Reader<Mmap>, ip: IpAddr, record: &mut GeoIpRecord) -> bool {
+fn read_ipinfo<S: AsRef<[u8]>>(reader: &Reader<S>, ip: IpAddr, record: &mut GeoIpRecord) -> bool {
     let Some(result) = lookup_in(reader, ip, "ipinfo") else {
         return false;
     };
@@ -518,6 +627,7 @@ fn read_ipinfo(reader: &Reader<Mmap>, ip: IpAddr, record: &mut GeoIpRecord) -> b
     record.country_code = found.country_code.map(CompactString::from);
     record.country_name = found.country.map(CompactString::from);
     record.continent_code = found.continent_code.map(CompactString::from);
+    record.continent_name = found.continent.map(CompactString::from);
     record.autonomous_system_number = found.asn.and_then(asn_number);
     record.autonomous_system_organization = found.as_name.map(CompactString::from);
     record.as_domain = found.as_domain.map(CompactString::from);
@@ -526,11 +636,14 @@ fn read_ipinfo(reader: &Reader<Mmap>, ip: IpAddr, record: &mut GeoIpRecord) -> b
     record.network.clone_from(&network);
     record.asn_network = network;
 
+    // Collected last, so the typed fields it is filtered against are set.
+    extra::collect(&result, record);
+
     true
 }
 
 /// Fill the location fields, reporting whether the database held the address.
-fn read_city(reader: &Reader<Mmap>, ip: IpAddr, record: &mut GeoIpRecord) -> bool {
+fn read_city<S: AsRef<[u8]>>(reader: &Reader<S>, ip: IpAddr, record: &mut GeoIpRecord) -> bool {
     if is_ipinfo(reader) {
         return read_ipinfo(reader, ip, record);
     }
@@ -551,6 +664,7 @@ fn read_city(reader: &Reader<Mmap>, ip: IpAddr, record: &mut GeoIpRecord) -> boo
 
     record.city_name = city.city.names.english.map(CompactString::from);
     record.continent_code = city.continent.code.map(CompactString::from);
+    record.continent_name = city.continent.names.english.map(CompactString::from);
     record.country_code = city.country.iso_code.map(CompactString::from);
     record.country_name = city.country.names.english.map(CompactString::from);
 
@@ -569,11 +683,13 @@ fn read_city(reader: &Reader<Mmap>, ip: IpAddr, record: &mut GeoIpRecord) -> boo
     record.accuracy_radius = city.location.accuracy_radius;
     record.network = network_of(&result);
 
+    extra::collect(&result, record);
+
     true
 }
 
 /// Fill the ASN fields, reporting whether the database held the address.
-fn read_asn(reader: &Reader<Mmap>, ip: IpAddr, record: &mut GeoIpRecord) -> bool {
+fn read_asn<S: AsRef<[u8]>>(reader: &Reader<S>, ip: IpAddr, record: &mut GeoIpRecord) -> bool {
     if is_ipinfo(reader) {
         return read_ipinfo(reader, ip, record);
     }
@@ -595,6 +711,8 @@ fn read_asn(reader: &Reader<Mmap>, ip: IpAddr, record: &mut GeoIpRecord) -> bool
         asn.autonomous_system_organization.map(CompactString::from);
     record.asn_network = network_of(&result);
 
+    extra::collect(&result, record);
+
     true
 }
 
@@ -602,11 +720,11 @@ fn read_asn(reader: &Reader<Mmap>, ip: IpAddr, record: &mut GeoIpRecord) -> bool
 ///
 /// An IPv6 address offered to an IPv4-only database is the case that reaches
 /// here, and it is a property of the deployed database rather than of the event.
-fn lookup_in<'a>(
-    reader: &'a Reader<Mmap>,
+fn lookup_in<'a, S: AsRef<[u8]>>(
+    reader: &'a Reader<S>,
     ip: IpAddr,
     kind: &'static str,
-) -> Option<maxminddb::LookupResult<'a, Mmap>> {
+) -> Option<maxminddb::LookupResult<'a, S>> {
     match reader.lookup(ip) {
         Ok(result) => Some(result),
         Err(e) => {
@@ -621,7 +739,7 @@ fn lookup_in<'a>(
 /// The reader hands this back as a type from a crate this one does not depend
 /// on, so it is rendered rather than stored, which is also the shape a schema
 /// column and an event field both want.
-fn network_of(result: &maxminddb::LookupResult<'_, Mmap>) -> Option<CompactString> {
+fn network_of<S: AsRef<[u8]>>(result: &maxminddb::LookupResult<'_, S>) -> Option<CompactString> {
     result
         .network()
         .ok()
@@ -629,27 +747,55 @@ fn network_of(result: &maxminddb::LookupResult<'_, Mmap>) -> Option<CompactStrin
 }
 
 /// Open one database file and note the modification time it was opened at.
-fn open_source(path: &Path) -> Result<(Source, Arc<Reader<Mmap>>), GeoIpLookupError> {
+fn open_source(
+    path: &Path,
+    resident_max_bytes: u64,
+) -> Result<(Source, Arc<Backing>), GeoIpLookupError> {
     // The time is read first: a replacement landing between the two calls then
     // costs one redundant reopen, where the other order would record the new
     // time against the old reader and never notice the change.
     let mtime = file_mtime(path);
-    let reader = open_reader(path)?;
+    let backing = open_backing(path, resident_max_bytes)?;
 
     Ok((
         Source {
             path: path.to_path_buf(),
             mtime,
         },
-        Arc::new(reader),
+        Arc::new(backing),
     ))
+}
+
+/// Open one database, resident at or under `resident_max_bytes` and mapped
+/// above it.
+///
+/// A file whose length will not read is mapped, since an unknown size is not
+/// one to read onto the heap.
+///
+/// # Errors
+///
+/// [`GeoIpLookupError::Open`] naming the file that could not be read as a
+/// MaxMind DB.
+pub(super) fn open_backing(
+    path: &Path,
+    resident_max_bytes: u64,
+) -> Result<Backing, GeoIpLookupError> {
+    if file_len(path).is_none_or(|len| len > resident_max_bytes) {
+        return open_reader(path).map(Backing::Mapped);
+    }
+
+    Reader::open_readfile(path)
+        .map(Backing::Resident)
+        .map_err(|source| GeoIpLookupError::Open {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 /// Map one database file into the address space.
 ///
-/// A city database runs to around 70 MB, and reading it onto the heap costs
-/// that per process. The map costs it once per node, shared through the page
-/// cache, which is the defect this crate was extracted to fix.
+/// The pages are shared through the page cache, so a database past the resident
+/// ceiling costs its size once per node rather than once per process.
 #[expect(
     unsafe_code,
     reason = "the reader offers no safe mmap constructor, and the provisioning \
@@ -676,6 +822,11 @@ pub(super) fn file_mtime(path: &Path) -> Option<SystemTime> {
         .ok()
 }
 
+/// Length of `path` in bytes, or `None` when it cannot be read.
+fn file_len(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).map(|metadata| metadata.len()).ok()
+}
+
 /// The single MMDB file of a provisioned database.
 ///
 /// # Errors
@@ -698,7 +849,7 @@ fn mmdb_path<'a>(
     if database.format != DatabaseFormat::Mmdb {
         return Err(GeoIpLookupError::UnsupportedFormat {
             path: path.clone(),
-            format: database.format,
+            format: database.format.name(),
         });
     }
 
@@ -783,12 +934,59 @@ mod telemetry {
     pub(super) const fn size(_entries: usize) {}
 }
 
+/// The backing each database got, through the facade.
+///
+/// On the same footing as the download and age metrics rather than the lookup
+/// ones: it is emitted once per database per open or refresh, so it costs
+/// nothing a lookup can feel.
+#[cfg(feature = "metrics")]
+mod backing_telemetry {
+    use super::{DatabaseBacking, DatabaseBackings};
+
+    /// Value of the `type` label on every series.
+    const TYPE: &str = "geoip";
+
+    /// Report the backing of each open database.
+    pub(super) fn backings(chosen: DatabaseBackings) {
+        if let Some(city) = chosen.city {
+            report("city", city);
+        }
+        if let Some(asn) = chosen.asn {
+            report("asn", asn);
+        }
+    }
+
+    /// Set every backing's series, so a refresh that flips one leaves no series
+    /// still claiming the backing it replaced.
+    fn report(kind: &'static str, chosen: DatabaseBacking) {
+        for candidate in [DatabaseBacking::Resident, DatabaseBacking::Mapped] {
+            metrics::gauge!(
+                "enrichment_database_backing",
+                "type" => TYPE,
+                "kind" => kind,
+                "backing" => candidate.label(),
+            )
+            .set(if candidate == chosen { 1.0 } else { 0.0 });
+        }
+    }
+}
+
+/// Backing emission, compiled out.
+#[cfg(not(feature = "metrics"))]
+mod backing_telemetry {
+    use super::DatabaseBackings;
+
+    /// Report the backing of each open database.
+    pub(super) const fn backings(_chosen: DatabaseBackings) {}
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Barrier;
     use std::thread;
 
     use super::*;
+    use crate::geoip::ExtraValue;
 
     /// A database in MaxMind's City schema, built by scripts/make_fixtures.py.
     const CITY_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/city-test.mmdb");
@@ -826,6 +1024,16 @@ mod tests {
         "/tests/data/IPinfo-Lite-Test.mmdb"
     );
 
+    /// The City schema as a current build writes it, with the geoname ids,
+    /// confidence scores, languages and traits no typed field names.
+    const CITY_RICH_DB: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/city-rich-test.mmdb"
+    );
+
+    /// A database in MaxMind's paid ISP schema, built by scripts/make_fixtures.py.
+    const ISP_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/isp-test.mmdb");
+
     /// Parse a literal the tests are asserting about.
     fn ip(literal: &str) -> IpAddr {
         literal.parse().unwrap()
@@ -846,6 +1054,7 @@ mod tests {
 
         assert_eq!(record.country_code.as_deref(), Some("JP"));
         assert_eq!(record.continent_code.as_deref(), Some("AS"));
+        assert_eq!(record.continent_name.as_deref(), Some("Asia"));
         assert_eq!(record.network.as_deref(), Some("2001:218::/32"));
         assert!(!record.is_private);
     }
@@ -955,6 +1164,7 @@ mod tests {
 
         assert_eq!(record.city_name.as_deref(), Some("Boxford"));
         assert_eq!(record.continent_code.as_deref(), Some("EU"));
+        assert_eq!(record.continent_name.as_deref(), Some("Europe"));
         assert_eq!(record.country_code.as_deref(), Some("GB"));
         assert_eq!(record.country_name.as_deref(), Some("United Kingdom"));
         assert_eq!(record.postal_code.as_deref(), Some("OX1"));
@@ -1301,6 +1511,293 @@ mod tests {
         // The fixture's file name is also its `database_type`, so this catches a
         // Debug that rendered either the path or the reader's metadata.
         assert!(!rendered.contains("city-test"), "{rendered}");
+    }
+
+    /// Length of a fixture on disk, for a ceiling set relative to it.
+    fn size_of(path: &str) -> u64 {
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    /// An enricher over both test databases, under the given ceiling.
+    fn both_under(resident_max_bytes: u64) -> GeoIp {
+        GeoIp::open(
+            DatabasePaths {
+                city: Some(Path::new(CITY_DB)),
+                asn: Some(Path::new(ASN_DB)),
+            },
+            CacheConfig {
+                resident_max_bytes,
+                ..CacheConfig::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_database_under_the_ceiling_is_held_in_memory() {
+        // The committed fixtures are kilobytes, so the default ceiling takes
+        // both of them.
+        assert_eq!(
+            both().backings(),
+            DatabaseBackings {
+                city: Some(DatabaseBacking::Resident),
+                asn: Some(DatabaseBacking::Resident),
+            }
+        );
+    }
+
+    #[test]
+    fn a_database_over_the_ceiling_is_mapped() {
+        // The ceiling lands on the ASN file exactly, so the larger city file is
+        // the one over it.
+        let geoip = both_under(size_of(ASN_DB));
+
+        assert_eq!(
+            geoip.backings(),
+            DatabaseBackings {
+                city: Some(DatabaseBacking::Mapped),
+                asn: Some(DatabaseBacking::Resident),
+            }
+        );
+    }
+
+    #[test]
+    fn the_ceiling_admits_a_file_of_exactly_its_size() {
+        let exact = size_of(CITY_DB);
+
+        assert_eq!(
+            both_under(exact).backings().city,
+            Some(DatabaseBacking::Resident)
+        );
+        assert_eq!(
+            both_under(exact - 1).backings().city,
+            Some(DatabaseBacking::Mapped)
+        );
+    }
+
+    #[test]
+    fn a_zero_ceiling_maps_every_database() {
+        assert_eq!(
+            both_under(0).backings(),
+            DatabaseBackings {
+                city: Some(DatabaseBacking::Mapped),
+                asn: Some(DatabaseBacking::Mapped),
+            }
+        );
+    }
+
+    #[test]
+    fn the_two_backings_answer_the_same_record() {
+        let resident = both();
+        let mapped = both_under(0);
+
+        for literal in [BOXFORD, LINKOPING, "1.0.0.1", "2001:218::1", ABSENT] {
+            assert_eq!(
+                resident.lookup(ip(literal)).map(|record| (*record).clone()),
+                mapped.lookup(ip(literal)).map(|record| (*record).clone()),
+                "{literal}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_enricher_over_no_database_reports_no_backing() {
+        let empty = GeoIp::open(DatabasePaths::default(), CacheConfig::default()).unwrap();
+
+        assert_eq!(empty.backings(), DatabaseBackings::default());
+    }
+
+    /// An enricher over the rich city database alone.
+    fn city_rich() -> GeoIp {
+        GeoIp::open(
+            DatabasePaths::city_only(Path::new(CITY_RICH_DB)),
+            CacheConfig::default(),
+        )
+        .unwrap()
+    }
+
+    /// The value at a source path, for a test asserting one field.
+    fn extra(record: &GeoIpRecord, path: &str) -> ExtraValue {
+        record
+            .extra
+            .get(path)
+            .unwrap_or_else(|| panic!("{path} is in the map: {:?}", record.extra))
+            .clone()
+    }
+
+    /// A text value at a source path.
+    fn extra_str(record: &GeoIpRecord, path: &str) -> CompactString {
+        match extra(record, path) {
+            ExtraValue::Str(text) => text,
+            other => panic!("{path} is text, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_field_no_typed_field_names_reaches_the_map() {
+        let record = city_rich().lookup(ip(BOXFORD)).unwrap();
+
+        // A paid or current build writes all of this, and none of it has a
+        // typed field to land in.
+        assert_eq!(extra_str(&record, "city.names.de"), "Boxford");
+        assert_eq!(
+            extra(&record, "city.geoname_id"),
+            ExtraValue::UInt(2_655_045)
+        );
+        assert_eq!(extra(&record, "city.confidence"), ExtraValue::UInt(25));
+        assert_eq!(
+            extra(&record, "country.is_in_european_union"),
+            ExtraValue::Bool(false)
+        );
+        assert_eq!(
+            extra(&record, "location.average_income"),
+            ExtraValue::UInt(32_323)
+        );
+        assert_eq!(extra(&record, "traits.is_anycast"), ExtraValue::Bool(true));
+        assert_eq!(extra_str(&record, "traits.user_type"), "residential");
+        assert_eq!(extra_str(&record, "represented_country.type"), "military");
+        assert_eq!(extra_str(&record, "registered_country.iso_code"), "GB");
+    }
+
+    #[test]
+    fn a_nested_name_keeps_its_own_characters() {
+        let record = city_rich().lookup(ip(BOXFORD)).unwrap();
+
+        // Escaped to keep the source ASCII: katakana for Boxford.
+        assert_eq!(
+            extra_str(&record, "city.names.ja"),
+            "\u{30dc}\u{30c3}\u{30af}\u{30b9}\u{30d5}\u{30a9}\u{30fc}\u{30c9}"
+        );
+    }
+
+    #[test]
+    fn the_typed_fields_still_resolve_beside_the_map() {
+        let record = city_rich().lookup(ip(BOXFORD)).unwrap();
+
+        assert_eq!(record.city_name.as_deref(), Some("Boxford"));
+        assert_eq!(record.continent_name.as_deref(), Some("Europe"));
+        assert_eq!(record.country_code.as_deref(), Some("GB"));
+        assert_eq!(record.region_name.as_deref(), Some("West Berkshire"));
+        assert_eq!(record.region_code.as_deref(), Some("WBK"));
+        assert_eq!(record.postal_code.as_deref(), Some("OX1"));
+        assert_eq!(record.timezone.as_deref(), Some("Europe/London"));
+        assert_eq!(record.accuracy_radius, Some(100));
+        assert_eq!(record.network.as_deref(), Some("2.125.160.216/29"));
+    }
+
+    #[test]
+    fn a_field_a_typed_field_took_is_not_in_the_map_as_well() {
+        let record = city_rich().lookup(ip(BOXFORD)).unwrap();
+
+        for path in [
+            "city.names.en",
+            "continent.code",
+            "continent.names.en",
+            "country.iso_code",
+            "country.names.en",
+            "postal.code",
+            "location.time_zone",
+            "location.latitude",
+            "location.longitude",
+            "location.accuracy_radius",
+        ] {
+            assert!(record.extra.get(path).is_none(), "{path}");
+        }
+    }
+
+    #[test]
+    fn an_array_is_carried_under_its_indices() {
+        let record = city_rich().lookup(ip(BOXFORD)).unwrap();
+
+        // England lost the region field to West Berkshire, so the map is the
+        // only place it survives at all.
+        assert_eq!(extra_str(&record, "subdivisions.0.names.en"), "England");
+        assert_eq!(extra_str(&record, "subdivisions.0.iso_code"), "ENG");
+        assert_eq!(
+            extra(&record, "subdivisions.0.geoname_id"),
+            ExtraValue::UInt(6_269_131)
+        );
+        // The subdivision the typed fields did take is not repeated, but the
+        // rest of its entry still is.
+        assert!(record.extra.get("subdivisions.1.names.en").is_none());
+        assert!(record.extra.get("subdivisions.1.iso_code").is_none());
+        assert_eq!(
+            extra(&record, "subdivisions.1.confidence"),
+            ExtraValue::UInt(40)
+        );
+    }
+
+    #[test]
+    fn the_isp_edition_delivers_the_fields_it_is_bought_for() {
+        let geoip = GeoIp::open(
+            DatabasePaths::asn_only(Path::new(ISP_DB)),
+            CacheConfig::default(),
+        )
+        .unwrap();
+        let record = geoip.lookup(ip("1.0.0.1")).unwrap();
+
+        assert_eq!(record.autonomous_system_number, Some(15169));
+        assert_eq!(
+            record.autonomous_system_organization.as_deref(),
+            Some("Google Inc.")
+        );
+        // The distinguishing fields of the paid edition, which the record has
+        // never had a typed slot for.
+        assert_eq!(extra_str(&record, "isp"), "Telstra Mobile");
+        assert_eq!(extra_str(&record, "organization"), "Telstra Mobile Data");
+        assert_eq!(extra_str(&record, "mobile_country_code"), "505");
+        assert_eq!(extra_str(&record, "mobile_network_code"), "01");
+        assert!(record.extra.get("autonomous_system_number").is_none());
+        assert!(record.extra.get("autonomous_system_organization").is_none());
+    }
+
+    #[test]
+    fn the_lean_fixtures_were_discarding_fields_too() {
+        let record = both().lookup(ip(BOXFORD)).unwrap();
+
+        // England has never had a typed field to reach, on a database shape the
+        // suite has been asserting about since the beginning.
+        assert_eq!(extra_str(&record, "subdivisions.0.names.en"), "England");
+        assert_eq!(extra_str(&record, "subdivisions.0.iso_code"), "ENG");
+    }
+
+    #[test]
+    fn a_source_the_record_fully_names_carries_no_map() {
+        let record = ipinfo().lookup(ip("8.8.8.8")).unwrap();
+
+        // Every field IPinfo Lite writes has a typed field, so there is nothing
+        // left over and nothing repeated.
+        assert_eq!(record.continent_name.as_deref(), Some("North America"));
+        assert!(record.extra.is_empty(), "{:?}", record.extra);
+    }
+
+    #[test]
+    fn a_reserved_address_carries_no_source_fields() {
+        let record = city_rich().lookup(ip("10.0.0.1")).unwrap();
+
+        assert!(record.is_private);
+        assert!(record.extra.is_empty());
+    }
+
+    #[test]
+    fn both_databases_contribute_to_one_map() {
+        let geoip = GeoIp::open(
+            DatabasePaths {
+                city: Some(Path::new(CITY_RICH_DB)),
+                asn: Some(Path::new(ISP_DB)),
+            },
+            CacheConfig::default(),
+        )
+        .unwrap();
+        let record = geoip.lookup(ip(LINKOPING)).unwrap();
+
+        // The city half holds nothing for this address, so the answer is the
+        // ISP half's alone.
+        assert_eq!(extra_str(&record, "isp"), "Bredband2 AB");
+        assert_eq!(extra_str(&record, "organization"), "Bredband2 Customer");
+
+        let boxford = geoip.lookup(ip(BOXFORD)).unwrap();
+        assert_eq!(extra_str(&boxford, "traits.user_type"), "residential");
     }
 
     #[cfg(feature = "geoip-download")]

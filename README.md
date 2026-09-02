@@ -154,8 +154,9 @@ caught when the config loads rather than at the first fetch.
 
 Four stages, and every source goes through the same ones: **acquire** over a
 link that may be slow or throttled, **verify** before anything becomes live
-data, **maintain** on the source's own cadence, and **serve** from a
-memory-mapped reader behind a cache.
+data, **maintain** on the source's own cadence, and **serve** from a reader
+behind a cache -- reading the database onto the heap when it fits under the
+configured ceiling, mapping it when it does not.
 
 A refused download never replaces a good database -- the file already on disk
 keeps being served. A hit costs tens of nanoseconds against microseconds for

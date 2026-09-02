@@ -42,6 +42,9 @@
 //!     # turn either off for a database this crate models badly.
 //!     verify_content: true
 //!     min_size_percent: 50
+//!     # A database at or under this is read into memory when it is opened;
+//!     # a larger one is memory-mapped. Zero maps everything.
+//!     resident_max_bytes: 134217728
 //!     # Credentials are Secret: redacted in Debug and Display. Supply them
 //!     # through the secrets layer, not as literals.
 //!     maxmind_account_id: null
@@ -424,6 +427,15 @@ pub struct AutoDownloadConfig {
     /// so a database whose build stamp is older than the staleness window is
     /// not re-fetched on every run.
     pub age_from_source: bool,
+
+    /// Largest file, in bytes, the lookup engine reads into memory rather than
+    /// mapping. Zero maps every database.
+    ///
+    /// The config-file side of `CacheConfig::resident_max_bytes`, which is what
+    /// the reader acts on: provisioning and lookup are separate calls, so a
+    /// host that loads this config passes the value across when it opens the
+    /// enricher.
+    pub resident_max_bytes: u64,
 }
 
 impl Default for AutoDownloadConfig {
@@ -440,6 +452,7 @@ impl Default for AutoDownloadConfig {
             verify_content: true,
             min_size_percent: DEFAULT_MIN_SIZE_PERCENT,
             age_from_source: true,
+            resident_max_bytes: super::DEFAULT_RESIDENT_MAX_BYTES,
         }
     }
 }
@@ -459,9 +472,9 @@ pub struct GeoIpConfig {
     /// Explicit city database path. Set it and the city provider is bypassed:
     /// nothing is downloaded and nothing is checked for that kind.
     ///
-    /// Whatever refreshes this file must replace it by RENAME. The reader
-    /// memory-maps it, and rewriting one in place under a live mapping faults
-    /// the process rather than returning an error.
+    /// Whatever refreshes this file must replace it by RENAME. A file past
+    /// `resident_max_bytes` is memory-mapped, and rewriting one in place under
+    /// a live mapping faults the process rather than returning an error.
     pub city_db_path: Option<PathBuf>,
 
     /// Explicit ASN database path. See [`city_db_path`](Self::city_db_path).
@@ -722,6 +735,26 @@ mod tests {
         // timeout is an idle one, so it is not sized by the file.
         assert_eq!(auto.connect_timeout_secs, 30);
         assert_eq!(auto.read_timeout_secs, 60);
+        // 128 MiB, which clears every free database and leaves the largest paid
+        // city builds to map.
+        assert_eq!(auto.resident_max_bytes, 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_resident_ceiling_is_operator_tunable() {
+        let auto: AutoDownloadConfig =
+            serde_json::from_str(r#"{"resident_max_bytes": 0}"#).unwrap();
+
+        assert_eq!(auto.resident_max_bytes, 0);
+        // Unset keys keep their defaults, so mapping everything does not clear
+        // the rest of the settings.
+        assert_eq!(auto.max_age_days, 30);
+
+        let dumped = serde_json::to_string(&auto).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AutoDownloadConfig>(&dumped).unwrap(),
+            auto
+        );
     }
 
     #[test]

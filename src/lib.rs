@@ -25,7 +25,7 @@
 //! |---|---|
 //! | `geoip` *(default)* | `geoip-download` + `geoip-lookup` |
 //! | `geoip-download` | resolve, freshness-check, download, unpack, refresh, and [`table`] |
-//! | `geoip-lookup` | mmap readers, the cache, [`geoip::GeoIpRecord`] |
+//! | `geoip-lookup` | resident or mapped readers, the cache, [`geoip::GeoIpRecord`] |
 //! | `metrics` | emit through the `metrics` facade |
 //! | `metrics-lookup` | cache hit, miss, size and lookup duration |
 //!

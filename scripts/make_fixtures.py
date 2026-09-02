@@ -6,11 +6,17 @@
 #
 # License:   Apache-2.0
 # Copyright: (c) 2026 HYPERI PTY LIMITED
-"""Write the three test databases under tests/data.
+"""Write the five test databases under tests/data.
 
 Each carries the MMDB binary format and one published record shape -- MaxMind's
-City and ASN schemas, and IPinfo Lite's flat one -- holding the handful of
+City, ASN and ISP schemas, and IPinfo Lite's flat one -- holding the handful of
 public values the Rust tests assert. No provider's data is redistributed.
+
+Two of the five exist for the fields no typed record field names. city-rich
+carries the full City shape a paid or a current free build writes -- geoname
+ids, confidence scores, names in several languages, traits, a represented
+country -- and isp carries the GeoIP2-ISP shape. Both prove a lookup answers
+with what the source holds rather than with what the record was written for.
 
 Every network here is either asserted by a test in src/geoip/enricher.rs or
 src/geoip/refresh.rs, or enumerated by benches/geoip_lookup.rs, which re-checks
@@ -287,6 +293,139 @@ ASN_RECORDS: list[tuple[str, dict[str, Any]]] = [
     ),
 ]
 
+# Katakana for Boxford, escaped so the source file stays ASCII.
+BOXFORD_JA = "\u30dc\u30c3\u30af\u30b9\u30d5\u30a9\u30fc\u30c9"
+
+# The City shape as a current build actually writes it: the typed record names
+# eight of these paths and the rest have nowhere to go but the extra map.
+CITY_RICH_RECORDS: list[tuple[str, dict[str, Any]]] = [
+    (
+        "2.125.160.216/29",
+        {
+            "city": {
+                "confidence": 25,
+                "geoname_id": 2655045,
+                "names": {"de": "Boxford", "en": "Boxford", "ja": BOXFORD_JA},
+            },
+            "continent": {
+                "code": "EU",
+                "geoname_id": 6255148,
+                "names": {"en": "Europe", "fr": "Europe"},
+            },
+            "country": {
+                "confidence": 99,
+                "geoname_id": 2635167,
+                "is_in_european_union": False,
+                "iso_code": "GB",
+                "names": {"en": "United Kingdom", "fr": "Royaume-Uni"},
+            },
+            "location": {
+                "accuracy_radius": 100,
+                "average_income": 32323,
+                "latitude": 51.75,
+                "longitude": -1.25,
+                "population_density": 348,
+                "time_zone": "Europe/London",
+            },
+            "postal": {"code": "OX1", "confidence": 20},
+            "registered_country": {
+                "geoname_id": 2635167,
+                "is_in_european_union": False,
+                "iso_code": "GB",
+                "names": {"en": "United Kingdom"},
+            },
+            "represented_country": {
+                "geoname_id": 6252001,
+                "iso_code": "US",
+                "names": {"en": "United States"},
+                "type": "military",
+            },
+            # Largest first, so the typed region field takes the second and the
+            # first survives only in the extra map.
+            "subdivisions": [
+                {"confidence": 40, "geoname_id": 6269131, "iso_code": "ENG",
+                 "names": {"en": "England"}},
+                {"confidence": 40, "geoname_id": 3333217, "iso_code": "WBK",
+                 "names": {"en": "West Berkshire"}},
+            ],
+            "traits": {
+                "is_anycast": True,
+                "is_satellite_provider": False,
+                "user_type": "residential",
+            },
+        },
+    ),
+    # A whole /24, so the benchmark has 256 distinct addresses to read cold.
+    (
+        "81.2.69.0/24",
+        {
+            "city": {
+                "confidence": 60,
+                "geoname_id": 2643743,
+                "names": {"de": "London", "en": "London", "fr": "Londres"},
+            },
+            "continent": {
+                "code": "EU",
+                "geoname_id": 6255148,
+                "names": {"en": "Europe", "fr": "Europe"},
+            },
+            "country": {
+                "confidence": 99,
+                "geoname_id": 2635167,
+                "is_in_european_union": False,
+                "iso_code": "GB",
+                "names": {"en": "United Kingdom", "fr": "Royaume-Uni"},
+            },
+            "location": {
+                "accuracy_radius": 10,
+                "average_income": 41000,
+                "latitude": 51.5074,
+                "longitude": -0.1278,
+                "population_density": 5701,
+                "time_zone": "Europe/London",
+            },
+            "postal": {"code": "EC1A", "confidence": 40},
+            "registered_country": {
+                "geoname_id": 2635167,
+                "is_in_european_union": False,
+                "iso_code": "GB",
+                "names": {"en": "United Kingdom"},
+            },
+            "subdivisions": [
+                {"confidence": 70, "geoname_id": 6269131, "iso_code": "ENG",
+                 "names": {"en": "England"}},
+            ],
+            "traits": {"is_anycast": False, "user_type": "business"},
+        },
+    ),
+]
+
+# GeoIP2-ISP, the paid edition whose distinguishing fields the record has never
+# had a slot for. Only the ASN pair is typed; isp, organization and the mobile
+# codes reach a consumer through the extra map or not at all.
+ISP_RECORDS: list[tuple[str, dict[str, Any]]] = [
+    (
+        "89.160.20.112/28",
+        {
+            "autonomous_system_number": 29518,
+            "autonomous_system_organization": "Bredband2 AB",
+            "isp": "Bredband2 AB",
+            "organization": "Bredband2 Customer",
+        },
+    ),
+    (
+        "1.0.0.0/24",
+        {
+            "autonomous_system_number": 15169,
+            "autonomous_system_organization": "Google Inc.",
+            "isp": "Telstra Mobile",
+            "mobile_country_code": "505",
+            "mobile_network_code": "01",
+            "organization": "Telstra Mobile Data",
+        },
+    ),
+]
+
 # IPinfo publishes no test database, so the decoder would otherwise only be
 # exercised by a live run with a token. Field names, types and the AS-prefixed
 # asn string are copied from the real 23 MB download.
@@ -379,6 +518,10 @@ def main() -> int:
     build("asn-test.mmdb", "factbook-asn-test", ASN_RECORDS, int_type="u32")
     # The reader keys the flat schema off this exact database_type prefix.
     build("IPinfo-Lite-Test.mmdb", "ipinfo bundle_location_lite.mmdb", IPINFO_RECORDS)
+    # accuracy_radius is still the only integer the typed decode reads here.
+    build("city-rich-test.mmdb", "factbook-city-rich-test", CITY_RICH_RECORDS)
+    # autonomous_system_number is a u32 in the ISP schema too.
+    build("isp-test.mmdb", "factbook-isp-test", ISP_RECORDS, int_type="u32")
 
     return 0
 

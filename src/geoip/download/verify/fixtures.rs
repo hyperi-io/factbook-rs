@@ -88,6 +88,9 @@ pub(crate) fn asn_mmdb_v6(number: u32, organisation: &str) -> Vec<u8> {
 }
 
 /// A city database answering every address with one country, MaxMind's shape.
+///
+/// Only the probe reads it, and the probe needs a reader compiled in.
+#[cfg(feature = "geoip-lookup")]
 pub(crate) fn city_mmdb(iso_code: &str) -> Vec<u8> {
     database(
         &map(&[("country", map(&[("iso_code", string(iso_code))]))]),
@@ -107,6 +110,9 @@ pub(crate) fn city_mmdb_v6(iso_code: &str) -> Vec<u8> {
 }
 
 /// A city database naming the country at the top level, IPinfo Lite's shape.
+///
+/// Only the probe reads it, and the probe needs a reader compiled in.
+#[cfg(feature = "geoip-lookup")]
 pub(crate) fn flat_city_mmdb(country_code: &str) -> Vec<u8> {
     database(
         &map(&[

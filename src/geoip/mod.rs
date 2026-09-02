@@ -54,6 +54,8 @@ pub(crate) mod download;
 #[cfg(feature = "geoip-lookup")]
 pub(crate) mod enricher;
 #[cfg(feature = "geoip-lookup")]
+mod extra;
+#[cfg(feature = "geoip-lookup")]
 mod private;
 #[cfg(feature = "geoip-lookup")]
 mod record;
@@ -71,8 +73,19 @@ pub use download::{
 };
 
 #[cfg(feature = "geoip-lookup")]
-pub use enricher::{CacheConfig, DatabasePaths, GeoIp, GeoIpLookupError};
+pub use enricher::{
+    CacheConfig, DatabaseBacking, DatabaseBackings, DatabasePaths, GeoIp, GeoIpLookupError,
+};
 #[cfg(feature = "geoip-lookup")]
 pub use private::is_private;
 #[cfg(feature = "geoip-lookup")]
-pub use record::{FieldValue, GeoIpRecord};
+pub use record::{ExtraFields, ExtraValue, FieldValue, GeoIpRecord};
+
+/// Default ceiling, in bytes, under which a database is read into memory rather
+/// than mapped.
+///
+/// 128 MiB clears every database measured -- sapics `origin-asn` at 10 MB,
+/// IPinfo Lite at 23 MB, GeoLite2-City at 70 MB and DB-IP Lite at 100-120 MB
+/// expanded -- leaving the 120 MB paid city builds as the first to cross it as
+/// they grow.
+pub(crate) const DEFAULT_RESIDENT_MAX_BYTES: u64 = 128 * 1024 * 1024;

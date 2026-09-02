@@ -31,7 +31,7 @@ use crate::geoip::config::AutoDownloadConfig;
 use crate::table::{Schema, TableFormat};
 
 #[cfg(feature = "geoip-lookup")]
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[cfg(not(feature = "geoip-lookup"))]
 use tracing::debug;
@@ -186,8 +186,10 @@ impl Guard {
 /// database drops it. None is taken from a test fixture: a fixture address is
 /// absent from every real provider database, so probing for one would refuse
 /// every legitimate download.
+/// Both families, because a source covering only IPv6 space would otherwise be
+/// refused as unpopulated: the probe passes on the first address that answers.
 #[cfg(feature = "geoip-lookup")]
-const PROBE_ADDRESSES: [IpAddr; 3] = [
+const PROBE_ADDRESSES: [IpAddr; 6] = [
     // Google Public DNS, in Google's own 8.8.8.0/24, AS15169.
     IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
     // Cloudflare's resolver, in 1.1.1.0/24, AS13335 -- the allocation whose
@@ -195,6 +197,10 @@ const PROBE_ADDRESSES: [IpAddr; 3] = [
     IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
     // Quad9, in 9.9.9.0/24, AS19281.
     IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+    // The same three operators' IPv6 resolvers.
+    IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
+    IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+    IpAddr::V6(Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x00fe)),
 ];
 
 /// Paths a city database publishes its country identifier under.
@@ -264,6 +270,9 @@ fn probe(
 /// that provisions files for someone else's reader has nothing to ask the file
 /// with.
 #[cfg(not(feature = "geoip-lookup"))]
+// The signature matches the feature-gated sibling because one call site invokes
+// both, so the result cannot be dropped here.
+#[allow(clippy::unnecessary_wraps)]
 fn probe(
     staged: &Path,
     _dest: &Path,

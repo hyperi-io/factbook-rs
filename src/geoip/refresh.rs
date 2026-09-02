@@ -9,10 +9,11 @@
 //! Noticing that a database has been replaced.
 //!
 //! The provisioning half rewrites a database when it goes stale, and a process
-//! holding a memory map of the old file keeps answering from it until something
-//! reopens it. [`refresh_if_changed`](GeoIp::refresh_if_changed) is that
-//! something: one `stat` per database, a reopen for whichever moved, and a
-//! lock-free swap of the reader set.
+//! holding the old file open keeps answering from it until something reopens
+//! it. [`refresh_if_changed`](GeoIp::refresh_if_changed) is that something: one
+//! `stat` per database, a reopen for whichever moved, and a lock-free swap of
+//! the reader set. A reopen re-reads the file's size, so a database that has
+//! grown past the resident ceiling comes back mapped.
 //!
 //! # Caller-driven
 //!
@@ -40,9 +41,9 @@
 
 use std::sync::Arc;
 
-use maxminddb::{Mmap, Reader};
-
-use super::enricher::{GeoIp, GeoIpLookupError, Readers, Source, file_mtime, open_reader};
+use super::enricher::{
+    Backing, GeoIp, GeoIpLookupError, Readers, Source, file_mtime, open_backing,
+};
 
 impl GeoIp {
     /// Reopen any database whose file has changed since it was opened.
@@ -74,8 +75,10 @@ impl GeoIp {
         };
         let mut changed = false;
         let mut failure = None;
+        let resident_max_bytes = self.inner.resident_max_bytes;
+        let reopen = |source: &mut Source| reopen(source, resident_max_bytes);
 
-        match sources.city.as_mut().map(reopen) {
+        match sources.city.as_mut().map(&reopen) {
             Some(Ok(Some(reader))) => {
                 next.city = Some(reader);
                 changed = true;
@@ -84,7 +87,7 @@ impl GeoIp {
             Some(Ok(None)) | None => {}
         }
 
-        match sources.asn.as_mut().map(reopen) {
+        match sources.asn.as_mut().map(&reopen) {
             Some(Ok(Some(reader))) => {
                 next.asn = Some(reader);
                 changed = true;
@@ -106,21 +109,25 @@ impl GeoIp {
 /// Reopen one database when its file has moved, updating the recorded time.
 ///
 /// `Ok(None)` means the file is where it was, which is the answer nearly every
-/// call gets.
-fn reopen(source: &mut Source) -> Result<Option<Arc<Reader<Mmap>>>, GeoIpLookupError> {
+/// call gets. A reopen re-reads the size, so the backing is chosen again from
+/// the file that is there now.
+fn reopen(
+    source: &mut Source,
+    resident_max_bytes: u64,
+) -> Result<Option<Arc<Backing>>, GeoIpLookupError> {
     let mtime = file_mtime(&source.path);
 
-    // A file that cannot be stat'ed keeps the reader already mapped: a check
+    // A file that cannot be stat'ed keeps the reader already open: a check
     // landing mid-replacement must not take enrichment down with it.
     if mtime.is_none() || mtime == source.mtime {
         return Ok(None);
     }
 
-    let reader = open_reader(&source.path)?;
+    let backing = open_backing(&source.path, resident_max_bytes)?;
     // Recorded only once the reopen succeeded, so a bad file is retried.
     source.mtime = mtime;
 
-    Ok(Some(Arc::new(reader)))
+    Ok(Some(Arc::new(backing)))
 }
 
 #[cfg(test)]
@@ -133,7 +140,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::*;
-    use crate::geoip::enricher::{CacheConfig, DatabasePaths};
+    use crate::geoip::enricher::{CacheConfig, DatabaseBacking, DatabasePaths};
 
     /// A database in MaxMind's City schema, built by scripts/make_fixtures.py.
     const CITY_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/city-test.mmdb");
@@ -297,7 +304,7 @@ mod tests {
             geoip.refresh_if_changed(),
             Err(GeoIpLookupError::Open { .. })
         ));
-        // The mapped reader was never replaced, so enrichment carries on.
+        // The open reader was never replaced, so enrichment carries on.
         assert_eq!(city_of(&geoip, BOXFORD).as_deref(), Some("Boxford"));
         // The time was not recorded either, so the next call tries again.
         assert!(matches!(
@@ -307,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn a_vanished_file_keeps_the_mapped_reader_answering() {
+    fn a_vanished_file_keeps_the_open_reader_answering() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db.mmdb");
         replace(&path, CITY_DB, at(0));
@@ -316,9 +323,73 @@ mod tests {
         fs::remove_file(&path).unwrap();
 
         assert!(!geoip.refresh_if_changed().unwrap());
-        // The lookup path performs no filesystem access, and the map outlives
-        // the directory entry it was made through.
+        // The lookup path performs no filesystem access, and an open database
+        // outlives the directory entry it was opened through.
         assert_eq!(city_of(&geoip, BOXFORD).as_deref(), Some("Boxford"));
+    }
+
+    #[test]
+    fn a_mapped_database_is_reopened_the_same_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.mmdb");
+        replace(&path, CITY_DB, at(0));
+
+        // A zero ceiling maps whatever is behind the path, so this is the whole
+        // swap driven over the other backing.
+        let geoip = GeoIp::open(
+            DatabasePaths::city_only(&path),
+            CacheConfig {
+                resident_max_bytes: 0,
+                ..CacheConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(geoip.backings().city, Some(DatabaseBacking::Mapped));
+        assert_eq!(city_of(&geoip, BOXFORD).as_deref(), Some("Boxford"));
+        assert_eq!(geoip.cached_entries(), 1);
+
+        replace(&path, ASN_DB, at(60));
+
+        assert!(geoip.refresh_if_changed().unwrap());
+        assert_eq!(geoip.cached_entries(), 0);
+        assert_eq!(geoip.backings().city, Some(DatabaseBacking::Mapped));
+        // The ASN database holds no record for this address, so the reader
+        // behind the path really did change.
+        assert!(geoip.lookup(ip(BOXFORD)).is_none());
+    }
+
+    #[test]
+    fn a_refresh_re_reads_the_size_and_chooses_the_backing_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.mmdb");
+        replace(&path, ASN_DB, at(0));
+
+        // The ceiling sits between the two fixtures, so replacing one with the
+        // other crosses it in either direction.
+        let ceiling = fs::metadata(ASN_DB).unwrap().len();
+        assert!(fs::metadata(CITY_DB).unwrap().len() > ceiling);
+
+        let geoip = GeoIp::open(
+            DatabasePaths::asn_only(&path),
+            CacheConfig {
+                resident_max_bytes: ceiling,
+                ..CacheConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(geoip.backings().asn, Some(DatabaseBacking::Resident));
+
+        replace(&path, CITY_DB, at(60));
+        assert!(geoip.refresh_if_changed().unwrap());
+        assert_eq!(geoip.backings().asn, Some(DatabaseBacking::Mapped));
+        // The city database answers this address and the ASN one does not, so
+        // the swap took effect rather than only the backing being relabelled.
+        assert!(geoip.lookup(ip(BOXFORD)).is_some());
+
+        replace(&path, ASN_DB, at(120));
+        assert!(geoip.refresh_if_changed().unwrap());
+        assert_eq!(geoip.backings().asn, Some(DatabaseBacking::Resident));
+        assert!(geoip.lookup(ip(BOXFORD)).is_none());
     }
 
     #[test]

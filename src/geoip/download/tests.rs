@@ -1002,9 +1002,8 @@ fn a_refused_download_is_counted_apart_from_one_that_never_arrived() {
 
 #[test]
 fn a_408_is_the_one_4xx_worth_coming_back_from() {
-    // A request timeout is the server inviting a retry. The rest of the 4xx
-    // range is its answer about this request and will not change on its own,
-    // so retrying it spends the provider's quota and hides the cause.
+    // A request timeout is the server inviting a retry; the rest of the 4xx
+    // range is its answer about this request and will not change on its own.
     let at = |status| GeoIpDownloadError::UnexpectedStatus {
         url: "https://example.invalid/db".into(),
         status,
@@ -1092,9 +1091,8 @@ async fn a_transfer_in_flight_turns_a_second_transfer_of_the_same_database_away(
 
 #[tokio::test]
 async fn a_destination_that_cannot_be_renamed_over_leaves_no_staged_file() {
-    // The rename is the last step and can still fail -- a directory sitting
-    // where the database belongs is the reachable case -- and the staged file
-    // has to go with it rather than sit there as a second copy.
+    // A directory where the database belongs fails the final rename, and the
+    // staged file has to go with it rather than sit there as a second copy.
     let server = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("db.mmdb");
@@ -1543,6 +1541,9 @@ async fn served(server: &MockServer, dest: PathBuf, body: Vec<u8>) -> Transfer {
     raw_transfer(format!("{}/db.mmdb", server.uri()), dest)
 }
 
+// The content probe is a no-op without a reader compiled in, so the refusal
+// this asserts only exists in a build that has one.
+#[cfg(feature = "geoip-lookup")]
 #[tokio::test]
 async fn a_database_that_answers_nothing_leaves_the_previous_one_in_place() {
     // The dbip-asn defect: a valid MaxMind DB whose operator-name column is
@@ -1605,6 +1606,7 @@ async fn a_populated_database_replaces_the_previous_one() {
     assert_eq!(fs::read(&dest).unwrap(), published);
 }
 
+#[cfg(feature = "geoip-lookup")]
 #[tokio::test]
 async fn a_city_database_that_resolves_no_country_leaves_the_previous_one() {
     let server = MockServer::start().await;

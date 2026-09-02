@@ -60,11 +60,12 @@ geoip-download = [
     "dep:sha2",
     "dep:prefix-trie",
     "dep:ipnet",
+    "dep:maxminddb-writer",
 ]
 
-# Read and cache. `mmap` keeps the database off the heap -- GeoLite2-City is
-# around 70 MB, and a per-pod heap copy of it was the defect this crate was
-# extracted to fix. `simdutf8` speeds the string decode every lookup performs.
+# Read and cache. A database is read into memory when it fits under the resident
+# ceiling and mapped when it does not, so `mmap` is what keeps an oversized one
+# openable. `simdutf8` speeds the string decode every lookup performs.
 geoip-lookup = [
     "dep:maxminddb",
     "dep:quick_cache",
@@ -127,6 +128,10 @@ prefix-trie = { version = ">=0.10.1, <0.11", default-features = false, features 
 # The CIDR type and its parser, neither of which std has. Every one of its own
 # dependencies is optional, so it arrives on its own.
 ipnet = { version = ">=2.12.1, <3", default-features = false, optional = true }
+# Writes the format the reader already reads, so a source too large to hold in
+# memory becomes a prefix trie with a deduplicated data section. Its only
+# required dependencies are serde and thiserror, both already here.
+maxminddb-writer = { version = ">=0.1.2, <0.2", optional = true }
 
 # --- geoip-lookup ---
 # 0.30.3 (2026-08-24) is also what vector-vrl's bindings resolve to, so the

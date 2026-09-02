@@ -64,6 +64,15 @@
 mod config;
 mod parse;
 
+// A text key has no address to be filed under, so it is hashed into one. That
+// needs the writer, which in turn needs the reader that checks what it wrote.
+#[cfg(feature = "geoip-lookup")]
+#[allow(
+    dead_code,
+    reason = "the conversion is verified ahead of the call site that will use it"
+)]
+mod hashed;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;

@@ -28,8 +28,15 @@ What the gauge costs depends on the build. A default build takes the age from th
 |---|---|---|---|
 | `enrichment_database_age_seconds` | gauge | `type`, `kind` | Seconds since the publisher built the database. The oldest file of a set, because a database is only as current as its stalest half |
 | `enrichment_download_total` | counter | `type`, `kind`, `result` | One per download attempt, by how it ended |
+| `enrichment_database_backing` | gauge | `type`, `kind`, `backing` | Whether an open database was read onto the heap or mapped. Both `backing` series are written, 1 for the chosen one and 0 for the other |
 
-`kind` is `city` or `asn`. `type` is `geoip` on every series.
+`kind` is `city` or `asn`. `type` is `geoip` on every series. `backing` is
+`resident` or `mapped`.
+
+Both `backing` series are written so a refresh that flips a database leaves none
+still reporting the backing it no longer has. A mapped database can stall a
+lookup on a page fault where a resident one cannot, so this is the series to
+read when lookup latency has a tail the cache does not explain.
 
 ### The `result` label separates five outcomes
 
