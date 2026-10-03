@@ -78,7 +78,7 @@ impl GeoIp {
         let resident_max_bytes = self.inner.resident_max_bytes;
         let reopen = |source: &mut Source| reopen(source, resident_max_bytes);
 
-        match sources.city.as_mut().map(&reopen) {
+        match sources.city.as_mut().map(reopen) {
             Some(Ok(Some(reader))) => {
                 next.city = Some(reader);
                 changed = true;
@@ -87,7 +87,7 @@ impl GeoIp {
             Some(Ok(None)) | None => {}
         }
 
-        match sources.asn.as_mut().map(&reopen) {
+        match sources.asn.as_mut().map(reopen) {
             Some(Ok(Some(reader))) => {
                 next.asn = Some(reader);
                 changed = true;
