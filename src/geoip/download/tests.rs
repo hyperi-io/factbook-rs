@@ -2357,7 +2357,10 @@ fn a_selection_reports_where_its_terms_are_published() {
 
     // Nothing is fetched for an operator-supplied file, so there is nothing to
     // point at.
-    assert!(source_terms(ProviderSelection::from(GeoIpProvider::Custom)).is_empty());
+    assert_eq!(
+        source_terms(ProviderSelection::from(GeoIpProvider::Custom)),
+        Vec::new()
+    );
 }
 
 #[test]

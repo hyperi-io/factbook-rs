@@ -665,7 +665,10 @@ mod tests {
         // The same key, the other status: the index narrows to two rows and the
         // second condition is what refuses one of them.
         let neither = [eq("country", "AU"), eq("status", "dissolved")];
-        assert!(found(&table, Query::new(&neither), "city").is_empty());
+        assert_eq!(
+            found(&table, Query::new(&neither), "city"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -774,7 +777,10 @@ mod tests {
         let table = places();
         let conditions = [eq("country", "AU"), eq("city", "Perth")];
 
-        assert!(table.unknown_columns(Query::new(&conditions)).is_empty());
+        assert_eq!(
+            table.unknown_columns(Query::new(&conditions)),
+            Vec::<&str>::new()
+        );
     }
 
     #[test]
@@ -889,7 +895,7 @@ mod tests {
 
         // No cell holds "*", so nothing matches even though the wildcard is set.
         let query = Query::new(&conditions).wildcard("*");
-        assert!(found(&plain, query, "city").is_empty());
+        assert_eq!(found(&plain, query, "city"), Vec::<String>::new());
 
         // A wildcard the data does carry is what the fallback is for.
         let carried = table(
