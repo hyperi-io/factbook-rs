@@ -15,7 +15,7 @@ Thumbs.db
 .env.*
 .env.local
 .env.*.local
-!.env.example
+!.env*.example
 !.env.example.*
 
 # Build
@@ -39,17 +39,18 @@ coverage.lcov
 tarpaulin-report.json
 cobertura.xml
 
-# cargo
-.cargo/
+# cargo -- glob the contents, not the directory: git cannot re-include a file
+# whose parent directory is excluded.
+.cargo/*
 !.cargo/config.toml
 !.cargo/audit.toml
 
 # Git worktrees (local dev convenience)
 .worktrees/
 
-# AI agent working files -- local-only, never committed. Mirrored in
-# .git/info/exclude, because a tracked .gitignore alone does not protect a
-# clone that has not pulled it yet.
+# Local working files (not committed)
+# Mirrored in .git/info/exclude, because a tracked .gitignore alone does not
+# protect a clone that has not pulled it yet.
 docs/superpowers/
 .hyperi-ai
 CLAUDE.md
@@ -63,6 +64,10 @@ GEMINI.md
 .codex/
 .cursor/
 .gemini/
+.superpowers/
+.playwright-mcp/
+.kube/
+.secrets/
 
 # Local scratch / tmp (CORE.md: scratch goes here, gitignored, NOT
 # /tmp). Bare patterns (no leading slash) match a tmp dir at ANY
