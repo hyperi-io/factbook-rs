@@ -41,7 +41,7 @@ The defaults fetch DB-IP Lite for location and sapics `origin-asn` for networks,
 
 Expect a record naming the country and the operating network:
 
-```
+```text
 GeoIpRecord { city_name: Some("Mountain View"), continent_code: Some("NA"), continent_name: Some("North America"), country_code: Some("US"), country_name: Some("United States"), region_name: Some("California"), region_code: None, postal_code: None, timezone: None, latitude: Some(37.422), longitude: Some(-122.085), metro_code: None, accuracy_radius: None, autonomous_system_number: Some(15169), autonomous_system_organization: Some("Google LLC"), is_private: false, network: Some("8.8.8.0/24"), asn_network: Some("8.8.8.0/24"), as_domain: None, extra: ExtraFields { fields: [("city.geoname_id", UInt(5375480)), ("country.is_in_european_union", Bool(false)), ("city.names.de", Str("Mountain View"))] } }
 ```
 
@@ -100,7 +100,7 @@ fn catalogue() -> TableSource {
 }
 ```
 
-```
+```csv
 sku,description,unit,hazard_class
 AX-1180,Sodium hydroxide pellets,kg,8
 BR-4402,Acetone,L,3

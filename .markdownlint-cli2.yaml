@@ -1,4 +1,19 @@
 # markdownlint-cli2 configuration
+# A repo config replaces hyperi-ci's default rules outright, so the house rules
+# are restated here alongside the ignores.
+config:
+  default: true
+  # Markdown has no width limit: a paragraph is one line, soft-wrapped by the editor.
+  MD013: false
+  # Table pipe spacing renders the same either way.
+  MD060: false
+  # Docs embed raw HTML deliberately (<details>, sized <img>).
+  MD033: false
+  # A heading may repeat under a different parent.
+  MD024:
+    siblings_only: true
+  # A doc may open with a licence comment, badges or front matter.
+  MD041: false
 # Ignores override the globs passed by CI action
 ignores:
   - "node_modules/**"
