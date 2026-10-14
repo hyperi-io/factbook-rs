@@ -5,9 +5,10 @@
 If you discover a security vulnerability in this project, please report it
 responsibly. We take security seriously and will respond promptly.
 
-**Email**: security@hyperi.io
+**Email**: <security@hyperi.io>
 
 Please include:
+
 - A description of the vulnerability
 - The affected component or version
 - Steps to reproduce the issue
@@ -47,21 +48,17 @@ factbook downloads reference databases from sources the deploying operator
 names, and then decodes whatever arrives. **Treat a database as trusted
 input, and the URL it comes from as part of your trust boundary.**
 
-A deliberately crafted MaxMind DB file can make a single lookup take
-unbounded time. The format's data section is a pointer graph, and the
-decoder follows pointers with a limit on nesting depth but not on how many
-values a record expands to. A file of a few hundred bytes can therefore
-describe a record with billions of leaves. We have measured a 624-byte file
-that stops a lookup returning at all, which takes the calling thread with it.
+A deliberately crafted MaxMind DB file can describe a record far larger than
+the file. The format's data section is a pointer graph, so a file of a few
+hundred bytes can expand to billions of leaves. Before `maxminddb` 0.31 the
+reader bounded nesting depth but not expansion, and we measured a 624-byte
+file that stopped a lookup returning at all.
 
-What factbook bounds today: the map of unmodelled source fields on each
-record, at 512 fields and 64 KiB, enforced by stopping the decode as the
-limit is reached rather than after. That closes the memory exhaustion and
-most of the time cost.
-
-What it does not bound: the decode of the fields the record models by name,
-which walks the same pointer graph inside the `maxminddb` reader. A
-sufficiently deep crafted file still hangs a lookup there.
+What bounds it now: `maxminddb` 0.31 and later caps the values and the string
+and byte data a single decode expands, and returns `ResourceLimit` past the
+cap rather than continuing. factbook also bounds the map of unmodelled source
+fields on each record, at 512 fields and 64 KiB, by stopping the decode as the
+limit is reached rather than after.
 
 So: fetch over TLS, from sources you have reason to trust, and check the
 published digest where a publisher offers one -- factbook verifies it for
@@ -84,6 +81,6 @@ The following are generally out of scope:
 
 ## Contact
 
-**Security reports**: security@hyperi.io
+**Security reports**: <security@hyperi.io>
 
 For non-security issues, please use the project's issue tracker.

@@ -40,10 +40,12 @@
 //! # Bounded, because a record is not trusted input
 //!
 //! The data section of a MaxMind DB is a pointer graph, not a tree. The reader
-//! follows a pointer wherever it appears and caps only nesting depth, so a
-//! record written as nested two-key maps whose branches both point at the level
-//! below expands to two leaves per level: forty levels is a four-hundred-byte
-//! file and a million million leaves. Whoever supplies the database supplies
+//! follows a pointer wherever it appears, so a record written as nested two-key
+//! maps whose branches both point at the level below expands to two leaves per
+//! level: forty levels is a four-hundred-byte file and a million million
+//! leaves. `maxminddb` 0.31 caps how much one decode expands, but that cap is
+//! sized for the reader, not for what this map may retain per record. Whoever
+//! supplies the database supplies
 //! the digest it is checked against, so a compromised provider or a hostile URL
 //! puts that record inside the reader with nothing upstream to catch it.
 //!
