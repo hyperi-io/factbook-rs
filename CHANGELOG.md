@@ -3,6 +3,13 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [0.1.2](https://github.com/hyperi-io/factbook-rs/compare/v0.1.1...v0.1.2) (2026-10-31)
+
+### Bug Fixes
+
+* admit only table downloads that load and refuse unworkable download settings ([#12](https://github.com/hyperi-io/factbook-rs/issues/12)) ([34606e2](https://github.com/hyperi-io/factbook-rs/commit/34606e208e850c14baa091e81a6dba911661cdd2))
+* **deps:** take tokio 1.54.1 and arc-swap 1.9.3 ([#11](https://github.com/hyperi-io/factbook-rs/issues/11)) ([bf032b0](https://github.com/hyperi-io/factbook-rs/commit/bf032b0867371bc78b97b1913eac076a3ae6d618))
+
 ## [0.1.1](https://github.com/hyperi-io/factbook-rs/compare/v0.1.0...v0.1.1) (2026-10-14)
 
 ### Bug Fixes
