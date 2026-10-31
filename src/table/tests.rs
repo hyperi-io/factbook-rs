@@ -673,6 +673,45 @@ async fn a_replacement_the_load_would_refuse_leaves_the_previous_file_in_place()
 }
 
 #[tokio::test]
+async fn a_setting_that_can_only_fail_is_refused_before_any_request() {
+    for (edit, key) in [
+        (
+            (|a: &mut AutoDownloadConfig| a.read_timeout_secs = 0) as fn(&mut AutoDownloadConfig),
+            "auto_download.read_timeout_secs",
+        ),
+        (
+            |a| a.connect_timeout_secs = 0,
+            "auto_download.connect_timeout_secs",
+        ),
+        (
+            |a| a.min_size_percent = 101,
+            "auto_download.min_size_percent",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        // A copy is on disk, so the refusal is the setting's and not a missing file's.
+        fs::write(dir.path().join("networks.csv"), NETWORKS).unwrap();
+        let server = MockServer::start().await;
+
+        let mut settings = auto(dir.path());
+        edit(&mut settings);
+        let err = Table::ensure(&source_at(&server, "networks.csv"), &settings)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                TableError::Fetch(GeoIpDownloadError::InvalidSetting { .. })
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains(key), "{err}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn a_replacement_under_the_size_floor_leaves_the_previous_file_in_place() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("networks.csv");

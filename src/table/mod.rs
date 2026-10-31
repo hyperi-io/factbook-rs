@@ -109,7 +109,7 @@ use crate::geoip::AutoDownloadConfig;
 use crate::geoip::DatabaseFormat;
 use crate::geoip::download::fetch::{self, Archive, Credential, Transfer};
 use crate::geoip::download::verify::Guard;
-use crate::geoip::download::{GeoIpDownloadError, SECS_PER_DAY, is_fresh};
+use crate::geoip::download::{self, GeoIpDownloadError, SECS_PER_DAY, is_fresh};
 use parse::Parsed;
 
 pub use config::{Index, Schema, SourceArchive, TableFormat, TableSource};
@@ -347,6 +347,7 @@ impl Table {
         } else if is_fresh(&dest, u64::from(auto.max_age_days) * SECS_PER_DAY) {
             debug!(file = %dest.display(), "table is fresh");
         } else {
+            download::check_settings(auto, source.http_client.is_some())?;
             let client = fetch::client(
                 source.http_client.as_ref(),
                 Duration::from_secs(auto.connect_timeout_secs),
