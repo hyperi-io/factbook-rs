@@ -15,7 +15,8 @@ description = "A high-speed, self-maintaining fact enricher for data at scale. P
 license = "Apache-2.0"
 repository = "https://github.com/hyperi-io/factbook-rs"
 documentation = "https://docs.rs/factbook"
-readme = "README.md"
+# The crates.io page. README.md stays the GitHub front page.
+readme = "docs/crate.md"
 publish = true
 keywords = ["geoip", "mmdb", "maxmind", "enrichment", "reference-data"]
 categories = ["network-programming", "caching", "database"]
@@ -29,6 +30,7 @@ include = [
     "/benches/**",
     "/tests/data/**",
     "/README.md",
+    "/docs/crate.md",
     "/LICENSE",
     "/NOTICE",
     "/SOURCES.md",
