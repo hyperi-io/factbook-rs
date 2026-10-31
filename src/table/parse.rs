@@ -48,8 +48,8 @@ use serde::Deserializer as _;
 use serde::de;
 use serde_json::Value;
 
-use super::config::{Schema, TableFormat};
-use super::{Cell, TableError};
+use super::config::{Index, Schema, TableFormat};
+use super::{Cell, Table, TableError};
 
 /// Byte a CSV quotes a field with.
 const QUOTE: u8 = b'"';
@@ -109,91 +109,25 @@ pub(super) fn read(
     }
 }
 
-/// Whether `path` holds rows of `format`, all the way to the end.
+/// Whether the file at `path` loads as the table the source states.
 ///
-/// This runs against a staged file before it replaces the copy on disk, so a
-/// fault it does not catch is one that destroys a good database and then fails
-/// at load, with nothing left to fall back to.
+/// Runs against a staged file before it replaces the copy on disk, so it reads
+/// the way the load does: the same width, ceiling and key column. A fault it
+/// does not catch destroys a good database and then fails at load, with nothing
+/// left to fall back to. The parsed table is released on return.
 ///
 /// # Errors
 ///
-/// The errors [`read`] raises.
+/// The errors [`read`] and [`Table::build`](super::Table::build) raise.
 pub(crate) fn probe(
     path: &Path,
     format: TableFormat,
-    declared: Option<usize>,
+    schema: &Schema,
+    index: &Index,
+    ceiling: u64,
 ) -> Result<(), TableError> {
     let reader = BufReader::new(fs::File::open(path)?);
-
-    match format {
-        TableFormat::Csv { header } => validate_csv(reader, header, declared),
-
-        TableFormat::Json => validate_json(reader),
-    }
-}
-
-/// Whether every record is as wide as the load will require.
-///
-/// `declared` is the width the schema names. Without it the probe would admit a
-/// file the load then rejects, after the good copy had already been replaced.
-///
-/// Records are checked and dropped as they are read, so the whole file is
-/// covered without holding it in memory.
-fn validate_csv(
-    mut reader: impl BufRead,
-    header: bool,
-    declared: Option<usize>,
-) -> Result<(), TableError> {
-    // The probe drops every record as it reads it, so it holds nothing the
-    // ceiling would be counting.
-    let mut csv = Csv::new(u64::MAX);
-    let mut width: Option<usize> = declared;
-    let mut seen: usize = 0;
-
-    loop {
-        let chunk = reader.fill_buf()?;
-        if chunk.is_empty() {
-            break;
-        }
-        let consumed = chunk.len();
-        for &byte in chunk {
-            csv.byte(byte)?;
-        }
-        reader.consume(consumed);
-        drain(&mut csv.records, &mut width, &mut seen)?;
-    }
-
-    let mut tail = csv.finish()?;
-    drain(&mut tail, &mut width, &mut seen)?;
-
-    // A header and nothing under it is not a table, and neither is an empty
-    // file.
-    if seen <= usize::from(header) {
-        return Err(TableError::Empty);
-    }
-    Ok(())
-}
-
-/// Check the records read so far against the expected width, then drop them.
-///
-/// `width` is seeded from the schema where it names the columns, and otherwise
-/// takes the first record's width.
-fn drain(
-    records: &mut Vec<Record>,
-    width: &mut Option<usize>,
-    seen: &mut usize,
-) -> Result<(), TableError> {
-    for (line, fields) in records.drain(..) {
-        let expected = *width.get_or_insert(fields.len());
-        if fields.len() != expected {
-            return Err(TableError::Malformed {
-                line,
-                detail: format!("{} fields against the expected {expected}", fields.len()),
-            });
-        }
-        *seen += 1;
-    }
-    Ok(())
+    Table::build(read(reader, format, schema, ceiling)?, index).map(drop)
 }
 
 /// Read a CSV into columns and rows.
@@ -264,31 +198,6 @@ fn read_json(reader: impl BufRead, schema: &Schema, ceiling: u64) -> Result<Pars
     document.end().map_err(|e| not_an_array(&e))?;
 
     Ok(parsed)
-}
-
-/// Whether the reader holds an array of objects, without holding it.
-///
-/// The probe answers a yes-or-no question, so it keeps one element at a time and
-/// never builds the rows at all.
-fn validate_json(reader: impl BufRead) -> Result<(), TableError> {
-    let mut document = serde_json::Deserializer::from_reader(reader);
-    let mut stopped = None;
-
-    let counted = document.deserialize_seq(Objects {
-        stopped: &mut stopped,
-    });
-
-    if let Some(e) = stopped {
-        return Err(e);
-    }
-
-    let seen = counted.map_err(|e| not_an_array(&e))?;
-    document.end().map_err(|e| not_an_array(&e))?;
-
-    if seen == 0 {
-        return Err(TableError::Empty);
-    }
-    Ok(())
 }
 
 /// A `serde_json` refusal as the refusal it caused.
@@ -405,38 +314,6 @@ impl<'de> de::Visitor<'de> for Elements<'_> {
         }
 
         Ok(Parsed { columns, rows })
-    }
-}
-
-/// The elements of a JSON array, counted and dropped.
-struct Objects<'a> {
-    /// Why the walk stopped, where it stopped before the array ended.
-    stopped: &'a mut Option<TableError>,
-}
-
-impl<'de> de::Visitor<'de> for Objects<'_> {
-    type Value = usize;
-
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("an array of objects")
-    }
-
-    fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        let mut seen = 0usize;
-
-        while let Some(value) = seq.next_element::<Value>()? {
-            if !value.is_object() {
-                return Err(stop(
-                    self.stopped,
-                    TableError::NotAnArrayOfObjects {
-                        detail: format!("element {seen} is not an object"),
-                    },
-                ));
-            }
-            seen += 1;
-        }
-
-        Ok(seen)
     }
 }
 
@@ -1043,6 +920,17 @@ mod tests {
         assert!(matches!(err, TableError::Empty), "{err:?}");
     }
 
+    /// Probe `file` as a headed CSV keyed by `asn`, under `ceiling`.
+    fn probe_csv(file: &Path, schema: &Schema, ceiling: u64) -> Result<(), TableError> {
+        probe(
+            file,
+            TableFormat::Csv { header: true },
+            schema,
+            &Index::Column("asn".to_string()),
+            ceiling,
+        )
+    }
+
     #[test]
     fn a_probe_reads_a_csv_to_the_end() {
         use std::fmt::Write as _;
@@ -1053,72 +941,56 @@ mod tests {
         for row in 0..5_000 {
             let _ = writeln!(body, "{row},operator");
         }
+        probe_csv(file_with(&file, &body), &Schema::Auto, u64::MAX).unwrap();
+
         // Deep enough that a bounded check would admit the file, replace a good
         // database with it, and only then fail at load.
         body.push_str("1,too,many,fields\n");
-        fs::write(&file, &body).unwrap();
-
-        let err = probe(&file, TableFormat::Csv { header: true }, None).unwrap_err();
+        let err = probe_csv(file_with(&file, &body), &Schema::Auto, u64::MAX).unwrap_err();
         assert!(
             matches!(err, TableError::Malformed { line: 5002, .. }),
             "{err:?}"
         );
     }
 
-    #[test]
-    fn a_probe_admits_a_long_well_formed_csv() {
-        use std::fmt::Write as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("rows.csv");
-        let mut body = String::from("asn,name\n");
-        for row in 0..5_000 {
-            let _ = writeln!(body, "{row},operator");
-        }
-        fs::write(&file, &body).unwrap();
-
-        probe(&file, TableFormat::Csv { header: true }, None).unwrap();
+    /// Write `body` to `file` and hand the path back.
+    fn file_with<'a>(file: &'a Path, body: &str) -> &'a Path {
+        fs::write(file, body).unwrap();
+        file
     }
 
     #[test]
-    fn a_probe_refuses_a_file_that_is_not_the_stated_format() {
+    fn a_probe_refuses_a_file_the_load_would_refuse() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("rows.csv");
+        let named = Schema::Named(vec!["asn".to_string(), "name".to_string()]);
 
-        fs::write(&file, b"asn,name\n").unwrap();
-        assert!(matches!(
-            probe(&file, TableFormat::Csv { header: true }, None).unwrap_err(),
-            TableError::Empty
-        ));
-
-        fs::write(&file, b"asn,name\n1,two,three\n").unwrap();
-        assert!(matches!(
-            probe(&file, TableFormat::Csv { header: true }, None).unwrap_err(),
-            TableError::Malformed { .. }
-        ));
+        for (body, schema, ceiling) in [
+            ("asn,name\n", &Schema::Auto, u64::MAX),
+            ("asn,name\n1,two,three\n", &Schema::Auto, u64::MAX),
+            // Consistent at three columns, and the schema names two.
+            ("asn,name,extra\n1,one,x\n", &named, u64::MAX),
+            // The index column is not one the file has.
+            ("number,name\n1,one\n", &Schema::Auto, u64::MAX),
+            // The rows cost more than the ceiling allows.
+            ("asn,name\n1,one\n2,two\n", &Schema::Auto, 64),
+        ] {
+            let result = probe_csv(file_with(&file, body), schema, ceiling);
+            assert!(result.is_err(), "{body:?} was admitted");
+        }
 
         fs::write(&file, b"{\"relays\": []}").unwrap();
         assert!(matches!(
-            probe(&file, TableFormat::Json, None).unwrap_err(),
+            probe(
+                &file,
+                TableFormat::Json,
+                &Schema::Auto,
+                &Index::Column("asn".to_string()),
+                u64::MAX
+            )
+            .unwrap_err(),
             TableError::NotAnArrayOfObjects { .. }
         ));
-    }
-
-    #[test]
-    fn a_probe_holds_the_file_to_the_width_the_schema_names() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("rows.csv");
-        // Internally consistent at three columns, so checking against the first
-        // record admits it. The load wants the two the schema names.
-        fs::write(&file, b"asn,name,extra\n1,one,x\n2,two,y\n").unwrap();
-
-        probe(&file, TableFormat::Csv { header: true }, None).unwrap();
-
-        let err = probe(&file, TableFormat::Csv { header: true }, Some(2)).unwrap_err();
-        assert!(
-            matches!(err, TableError::Malformed { line: 1, .. }),
-            "{err:?}"
-        );
     }
 
     #[test]

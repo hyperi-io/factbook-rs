@@ -32,10 +32,10 @@ Setting a path bypasses the provider for that half only. The other half still pr
 | `maxmind_license_key` | secret | unset | Required by `max_mind` on either tier |
 | `ipinfo_token` | secret | unset | Required by `ip_info` |
 | `max_age_days` | u32 | `30` | Ceiling on how stale a copy may be. The two halves read it differently, below |
-| `connect_timeout_secs` | u64 | `30` | A dead host should fail fast |
-| `read_timeout_secs` | u64 | `60` | Idle bound, not a whole-request budget, so a slow transfer is not cut off for being slow |
+| `connect_timeout_secs` | u64 | `30` | A dead host should fail fast. Zero is refused by `validate`, and a download with it fails with the key named. Not read when a client is injected |
+| `read_timeout_secs` | u64 | `60` | Idle bound, not a whole-request budget, so a slow transfer is not cut off for being slow. Zero is refused like `connect_timeout_secs` |
 | `verify_content` | bool | `true` | Check that a download is the kind of thing it claims to be |
-| `min_size_percent` | u8 | `50` | Refuse a replacement below this fraction of the copy on disk. Zero disables the floor |
+| `min_size_percent` | u8 | `50` | Refuse a replacement below this fraction of the copy on disk. Zero disables the floor, and a value above 100 is refused by `validate` |
 | `age_from_source` | bool | `true` | Report database age from the publisher's build stamp rather than the local write time. Metric only; freshness still counts from the write |
 | `resident_max_bytes` | u64 | `134217728` | Read a database this size or smaller onto the heap when it is opened; map a larger one. Zero maps everything. A table source that outgrows it is refused, below |
 
@@ -130,6 +130,8 @@ The column is found the same way `ip` finds one -- a conventional name (`prefix`
 A geo database is already in the format the reader reads, so `resident_max_bytes` only decides how it is opened. A table source is a CSV or a JSON document, and holding one costs several times the file it came from -- so the same key decides something bigger for a table: whether it can be held at all.
 
 If it loads into memory it is used. If it does not, `Table::ensure` returns `OverResidentCeiling` and the table does not load. Raise the ceiling, or point the source at less data.
+
+A download is held to the same ceiling before it replaces anything. One that would not load is refused and the copy on disk keeps serving. With no copy on disk the refusal reaches the caller as `Fetch(Unparseable)`, carrying the same message.
 
 Whether a source fits is not knowable before it is read. An encoding, a quoting style and a column count all move the answer, and the file size on disk does not. So the ceiling is **hit rather than predicted**: the read fills memory, stops the moment it crosses `resident_max_bytes`, and releases everything it had taken as it fails. A CSV stops on a record and a JSON array on an element, so neither reader's peak is set by the file -- the refusal is early and cheap rather than an allocation failure at the end of one.
 

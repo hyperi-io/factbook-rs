@@ -109,7 +109,7 @@ use crate::geoip::AutoDownloadConfig;
 use crate::geoip::DatabaseFormat;
 use crate::geoip::download::fetch::{self, Archive, Credential, Transfer};
 use crate::geoip::download::verify::Guard;
-use crate::geoip::download::{GeoIpDownloadError, SECS_PER_DAY, is_fresh};
+use crate::geoip::download::{self, GeoIpDownloadError, SECS_PER_DAY, is_fresh};
 use parse::Parsed;
 
 pub use config::{Index, Schema, SourceArchive, TableFormat, TableSource};
@@ -146,7 +146,7 @@ pub enum TableError {
     /// The source names somewhere the transfer cannot go.
     #[error("{url} is not a URL that can be fetched: {detail}")]
     BadUrl {
-        /// URL as the operator wrote it.
+        /// URL as the operator wrote it, minus its userinfo and query values.
         url: String,
         /// What the URL parser refused it for.
         detail: String,
@@ -347,6 +347,7 @@ impl Table {
         } else if is_fresh(&dest, u64::from(auto.max_age_days) * SECS_PER_DAY) {
             debug!(file = %dest.display(), "table is fresh");
         } else {
+            download::check_settings(auto, source.http_client.is_some())?;
             let client = fetch::client(
                 source.http_client.as_ref(),
                 Duration::from_secs(auto.connect_timeout_secs),
@@ -354,7 +355,7 @@ impl Table {
             )?;
 
             let transfer = transfer(source, dest.clone());
-            let guard = Guard::for_table(source.format, &source.schema, auto);
+            let guard = Guard::for_table(source.format, &source.schema, &source.index, auto);
 
             if let Err(e) = transfer.run_guarded(&client, guard).await {
                 if !dest.exists() {
@@ -650,7 +651,7 @@ impl TableSource {
     /// field to fix.
     pub fn validate(&self) -> Result<(), TableError> {
         reqwest::Url::parse(&self.url).map_err(|e| TableError::BadUrl {
-            url: self.url.clone(),
+            url: fetch::loggable(&self.url),
             detail: e.to_string(),
         })?;
 

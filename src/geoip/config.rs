@@ -384,7 +384,7 @@ pub struct AutoDownloadConfig {
     pub max_age_days: u32,
 
     /// Seconds to wait for the connection to the provider. A dead host fails
-    /// here.
+    /// here. Zero is refused by [`validate`](super::validate).
     pub connect_timeout_secs: u64,
 
     /// Seconds a transfer may go without receiving any bytes.
@@ -392,7 +392,8 @@ pub struct AutoDownloadConfig {
     /// This is an idle timeout, not a budget for the whole download: a database
     /// runs to hundreds of megabytes, so a total-time limit would make a slow
     /// link impossible rather than slow. A connection that has stopped
-    /// delivering still fails inside this window.
+    /// delivering still fails inside this window. Zero is refused by
+    /// [`validate`](super::validate).
     pub read_timeout_secs: u64,
 
     /// Refuse a downloaded database that resolves nothing for a well-known
@@ -413,7 +414,7 @@ pub struct AutoDownloadConfig {
     ///
     /// This is what refuses a truncated but parseable file or a provider
     /// shipping a stub. A first download has nothing to compare against and is
-    /// always accepted.
+    /// always accepted. Above 100 is refused by [`validate`](super::validate).
     pub min_size_percent: u8,
 
     /// Report database age from the publisher's own build timestamp rather
