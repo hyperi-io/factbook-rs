@@ -44,6 +44,7 @@
 
 // Acquisition is not a geoip concern: `crate::table` fetches a user-supplied
 // source through the same transfer, guard and interpretation types.
+mod cooldown;
 pub(crate) mod fetch;
 pub(crate) mod source;
 pub(crate) mod verify;
@@ -56,7 +57,7 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use super::config::{GeoIpConfig, ProviderChoice, ProviderSelection};
+use super::config::{AutoDownloadConfig, GeoIpConfig, ProviderChoice, ProviderSelection};
 use fetch::Transfer;
 use source::SourceSpec;
 use verify::Guard;
@@ -244,6 +245,15 @@ pub enum GeoIpDownloadError {
         floor_percent: u8,
     },
 
+    /// A setting holds a value that cannot work.
+    #[error("{field} {problem}")]
+    InvalidSetting {
+        /// Config key the operator has to correct.
+        field: &'static str,
+        /// What is wrong with the value it holds.
+        problem: &'static str,
+    },
+
     /// The body ended before the length the provider promised.
     #[error("{url} delivered {actual} of {expected} bytes")]
     Truncated {
@@ -271,6 +281,7 @@ impl GeoIpDownloadError {
             | Self::MissingCredential { .. }
             | Self::NoDatabases { .. }
             | Self::NotEntitled { .. }
+            | Self::InvalidSetting { .. }
             | Self::UnsupportedTier { .. } => true,
             // 408 is the server inviting a retry; the rest of the 4xx range is
             // about this request and will answer the same way again.
@@ -506,33 +517,45 @@ async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
         return Some(database);
     }
 
-    match download(kind, config).await {
-        Ok(files) => {
-            telemetry::attempt(kind.label(), "ok");
-            age(&files);
-            Some(Database {
-                format: database.format,
-                files,
-            })
-        }
-        Err(e) => {
-            telemetry::attempt(kind.label(), e.outcome());
-            warn!(
-                kind = kind.label(),
-                error = %e,
-                provider = ?choice,
-                "GeoIP database download failed"
-            );
-            // A stale database still answers most lookups correctly, so it
-            // beats disabling enrichment outright.
-            if database.files.iter().all(|file| file.exists()) {
-                warn!(kind = kind.label(), files = ?database.files, "using stale GeoIP database");
-                age(&database.files);
-                Some(database)
-            } else {
-                None
+    // A database the provider has just refused is not asked for again until its
+    // cool-down passes, and the stale copy serves meanwhile.
+    let stamped = database.files.first();
+    if stamped.is_none_or(|file| cooldown::wait_for(file, kind.label()).is_none()) {
+        match download(kind, config).await {
+            Ok(files) => {
+                if let Some(file) = stamped {
+                    cooldown::clear(file);
+                }
+                telemetry::attempt(kind.label(), "ok");
+                age(&files);
+                return Some(Database {
+                    format: database.format,
+                    files,
+                });
+            }
+            Err(e) => {
+                telemetry::attempt(kind.label(), e.outcome());
+                warn!(
+                    kind = kind.label(),
+                    error = %e,
+                    provider = ?choice,
+                    "GeoIP database download failed"
+                );
+                if let Some(file) = stamped {
+                    cooldown::begin(file, &e);
+                }
             }
         }
+    }
+
+    // A stale database still answers most lookups correctly, so it beats
+    // disabling enrichment outright.
+    if database.files.iter().all(|file| file.exists()) {
+        warn!(kind = kind.label(), files = ?database.files, "using stale GeoIP database");
+        age(&database.files);
+        Some(database)
+    } else {
+        None
     }
 }
 
@@ -553,6 +576,32 @@ fn provider_files(
     Ok((Kind::City.spec(choice)?, Kind::Asn.spec(choice)?))
 }
 
+/// Refuse download settings that can only fail.
+///
+/// The timeouts are skipped when the caller injected a client, because that
+/// client's own timeouts govern.
+///
+/// # Errors
+///
+/// [`GeoIpDownloadError::InvalidSetting`] naming the key.
+pub(crate) fn check_settings(
+    auto: &AutoDownloadConfig,
+    injected_client: bool,
+) -> Result<(), GeoIpDownloadError> {
+    let invalid = |field, problem| Err(GeoIpDownloadError::InvalidSetting { field, problem });
+
+    if !injected_client && auto.connect_timeout_secs == 0 {
+        return invalid("auto_download.connect_timeout_secs", "must be above zero");
+    }
+    if !injected_client && auto.read_timeout_secs == 0 {
+        return invalid("auto_download.read_timeout_secs", "must be above zero");
+    }
+    if auto.min_size_percent > 100 {
+        return invalid("auto_download.min_size_percent", "must be 100 or below");
+    }
+    Ok(())
+}
+
 /// Check the configuration can be acted on, before anything is downloaded.
 ///
 /// This is the config-load check: a paid tier with no modelled endpoint, or a
@@ -569,6 +618,7 @@ pub fn validate(config: &GeoIpConfig) -> Result<(), GeoIpDownloadError> {
     if !config.enabled || !config.auto_download.enabled {
         return Ok(());
     }
+    check_settings(&config.auto_download, config.http_client.is_some())?;
 
     for kind in [Kind::City, Kind::Asn] {
         // An explicit path is the operator's own file and needs no provider.
@@ -606,6 +656,7 @@ pub(crate) fn is_fresh(path: &Path, max_age_secs: u64) -> bool {
 /// a database, and the next freshness check re-drives all of them.
 async fn download(kind: Kind, config: &GeoIpConfig) -> Result<Vec<PathBuf>, GeoIpDownloadError> {
     // Planned before the client is built, so a config fault costs no setup.
+    check_settings(&config.auto_download, config.http_client.is_some())?;
     let transfers = plan(kind, config)?;
     let client = fetch::client(
         config.http_client.as_ref(),
@@ -619,7 +670,7 @@ async fn download(kind: Kind, config: &GeoIpConfig) -> Result<Vec<PathBuf>, GeoI
 
     let mut files = Vec::with_capacity(transfers.len());
     for transfer in transfers {
-        files.push(transfer.run_guarded(&client, guard).await?);
+        files.push(transfer.run_guarded(&client, guard.clone()).await?);
     }
     Ok(files)
 }

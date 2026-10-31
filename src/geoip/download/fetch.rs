@@ -77,19 +77,32 @@ const CHECKSUM_BODY_LIMIT: usize = 4 * 1024;
 /// What replaces a query value in a URL that is about to be logged.
 const REDACTED: &str = "<redacted>";
 
-/// A URL safe to log or put in an error, with every query value removed.
+/// A URL safe to log or put in an error, with the userinfo and every query value
+/// removed.
 ///
 /// This crate never formats its own credentials into a URL, but a table source
-/// is a string an operator wrote, and an authenticated one has nowhere to carry
-/// its token except the query. Parameter names are kept because they say which
+/// is a string an operator wrote, and an authenticated one carries its secret in
+/// the userinfo or the query. Parameter names are kept because they say which
 /// endpoint shape was used and carry nothing secret.
-fn loggable(url: &str) -> String {
-    let Some((base, query)) = url.split_once('?') else {
-        return url.to_string();
+pub(crate) fn loggable(url: &str) -> String {
+    // Parsed the way the client will read it, so a spelling the parser
+    // normalises into an authenticated URL (`https:user:pw@host`) is cleaned
+    // with the canonical one.
+    let (mut safe, query) = match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            let query = parsed.query().map(str::to_owned);
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            (parsed.to_string(), query)
+        }
+        Err(_) => unparsed(url),
+    };
+    let Some(query) = query else {
+        return safe;
     };
 
-    let mut safe = String::with_capacity(url.len());
-    safe.push_str(base);
     for (position, pair) in query.split('&').enumerate() {
         safe.push(if position == 0 { '?' } else { '&' });
         safe.push_str(pair.split_once('=').map_or(pair, |(name, _)| name));
@@ -98,6 +111,34 @@ fn loggable(url: &str) -> String {
     }
 
     safe
+}
+
+/// The base and query of a string the URL parser refused, with any userinfo
+/// dropped.
+///
+/// Whatever precedes the last `@` of the authority is removed, and where there
+/// is no `://` to find an authority by, whatever precedes the last `@` at all.
+fn unparsed(url: &str) -> (String, Option<String>) {
+    let (base, query) = match url.split_once('?') {
+        Some((base, query)) => (base, Some(query.to_string())),
+        None => (url, None),
+    };
+
+    let safe = match base.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+            let host = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host);
+            format!("{scheme}://{host}{path}")
+        }
+        None => base
+            .rsplit_once('@')
+            .map_or(base, |(_, tail)| tail)
+            .to_string(),
+    };
+
+    (safe, query)
 }
 
 /// Read size while digesting a file, which runs to tens of megabytes.
@@ -328,7 +369,7 @@ impl Transfer {
                 // The bytes are known bad, so they are not kept for a resume.
                 let _ = fs::remove_file(&part);
                 return Err(self.rejected(GeoIpDownloadError::ChecksumMismatch {
-                    url: checksum_url,
+                    url: loggable(&checksum_url),
                     expected,
                     actual,
                 }));
@@ -340,7 +381,7 @@ impl Transfer {
         let format = self.format;
         let staged = with_extension(&dest, STAGE_EXT);
         let final_size = tokio::task::spawn_blocking(move || {
-            let result = materialise_guarded(&part, &staged, &dest, archive, format, guard);
+            let result = materialise_guarded(&part, &staged, &dest, archive, format, &guard);
             let _ = fs::remove_file(&part);
             if result.is_err() {
                 let _ = fs::remove_file(&staged);
@@ -396,7 +437,7 @@ impl Transfer {
 
         warn!(
             url = %loggable(&self.url),
-            fallback = %fallback,
+            fallback = %loggable(fallback),
             "GeoIP database not published at that URL, trying the previous one"
         );
         // The fallback is a different file, so anything already transferred
@@ -421,6 +462,27 @@ impl Transfer {
         } else {
             0
         };
+
+        match self.stream_from(client, url, part, resume_from).await {
+            // A part file already as long as the body makes the range start at
+            // its end, which a server answers with 416.
+            Err(GeoIpDownloadError::UnexpectedStatus { status: 416, .. }) if resume_from > 0 => {
+                let _ = fs::remove_file(part);
+                self.stream_from(client, url, part, 0).await
+            }
+            other => other,
+        }
+    }
+
+    /// Stream `url` to `part`, continuing from byte `resume_from` when it is
+    /// above zero.
+    async fn stream_from(
+        &self,
+        client: &Client,
+        url: &str,
+        part: &Path,
+        resume_from: u64,
+    ) -> Result<u64, GeoIpDownloadError> {
         let mut request = self.credential.apply(client.get(url));
         if resume_from > 0 {
             request = request.header(reqwest::header::RANGE, format!("bytes={resume_from}-"));
@@ -729,7 +791,7 @@ fn materialise(
     archive: Archive,
     format: DatabaseFormat,
 ) -> Result<u64, GeoIpDownloadError> {
-    materialise_guarded(part, staged, dest, archive, format, Guard::OFF)
+    materialise_guarded(part, staged, dest, archive, format, &Guard::OFF)
 }
 
 /// Turn the transferred bytes into the destination file. Blocking: gzip and tar
@@ -740,7 +802,7 @@ fn materialise_guarded(
     dest: &Path,
     archive: Archive,
     format: DatabaseFormat,
-    guard: Guard,
+    guard: &Guard,
 ) -> Result<u64, GeoIpDownloadError> {
     let source = fs::File::open(part)?;
 
@@ -959,6 +1021,47 @@ mod tests {
             loggable("https://example.invalid/db.mmdb"),
             "https://example.invalid/db.mmdb"
         );
+    }
+
+    #[test]
+    fn a_logged_url_drops_the_userinfo_basic_auth_is_sent_from() {
+        for (url, shown) in [
+            (
+                "https://user:pw@internal.example/feed.csv",
+                "https://internal.example/feed.csv",
+            ),
+            (
+                "https://token@internal.example:8443/feed.csv?key=abc",
+                "https://internal.example:8443/feed.csv?key=<redacted>",
+            ),
+            // An `@` after the authority belongs to the path.
+            (
+                "https://example.invalid/feed@2.csv",
+                "https://example.invalid/feed@2.csv",
+            ),
+            // Spellings the parser normalises into the same authenticated URL.
+            (
+                "https:user:sekrit@example.net/feed.csv",
+                "https://example.net/feed.csv",
+            ),
+            (
+                "https:///user:sekrit@example.net/feed.csv",
+                "https://example.net/feed.csv",
+            ),
+            (
+                "https:\\\\user:sekrit@example.net\\feed.csv#sekrit",
+                "https://example.net/feed.csv",
+            ),
+            // Refused by the parser, so only the fallback can clean them.
+            (
+                "https://user:sekrit@exa mple.net/x.csv",
+                "https://exa mple.net/x.csv",
+            ),
+            ("https:user:sekrit@exa mple.net/x.csv", "exa mple.net/x.csv"),
+            ("not a url", "not a url"),
+        ] {
+            assert_eq!(loggable(url), shown, "{url}");
+        }
     }
 
     #[test]

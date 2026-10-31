@@ -25,10 +25,11 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use super::{DatabaseFormat, GeoIpDownloadError, Kind};
 use crate::geoip::config::AutoDownloadConfig;
-use crate::table::{Schema, TableFormat};
+use crate::table::{Index, Schema, TableFormat};
 
 #[cfg(feature = "geoip-lookup")]
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -42,24 +43,34 @@ const PERCENT: u64 = 100;
 /// What a staged file has to satisfy before it is renamed over the copy on
 /// disk.
 ///
-/// Carried by value: it is two settings the operator chose, resolved once per
-/// download rather than re-read per check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Resolved once per download from the operator's settings rather than re-read
+/// per check.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Guard {
     /// Kind whose field a probe requires, absent when content is not checked.
     probe: Option<Kind>,
 
-    /// Format a staged table must parse as, absent when content is not checked
+    /// What a staged table has to load as, absent when content is not checked
     /// or the payload is not a table.
-    parses: Option<TableFormat>,
-
-    /// Column count the source names, which is the width the load will require.
-    /// Absent when the schema takes its names from the file.
-    declared: Option<usize>,
+    table: Option<Arc<TableCheck>>,
 
     /// Smallest percentage of the copy on disk a replacement may be, zero for
     /// no floor.
     min_size_percent: u8,
+}
+
+/// Everything the load of a table asks of its file, so a staged one is admitted
+/// only if the load will accept it.
+#[derive(Debug, PartialEq, Eq)]
+struct TableCheck {
+    /// Encoding the rows are read as.
+    format: TableFormat,
+    /// Where the column names come from.
+    schema: Schema,
+    /// Key the rows are filed under.
+    index: Index,
+    /// Bytes the rows may cost, which the load abandons the read past.
+    ceiling: u64,
 }
 
 impl Guard {
@@ -68,8 +79,7 @@ impl Guard {
     #[cfg(test)]
     pub(super) const OFF: Self = Self {
         probe: None,
-        parses: None,
-        declared: None,
+        table: None,
         min_size_percent: 0,
     };
 
@@ -81,8 +91,7 @@ impl Guard {
             } else {
                 None
             },
-            parses: None,
-            declared: None,
+            table: None,
             min_size_percent: auto.min_size_percent,
         }
     }
@@ -90,24 +99,24 @@ impl Guard {
     /// The guard the operator's settings ask for on a table.
     ///
     /// A table has no address to probe, so the content question it answers is
-    /// whether the bytes hold rows of the format the source states, at the width
-    /// its schema names.
+    /// whether the file loads: rows of the stated format, at the width the schema
+    /// names, within the resident ceiling, keyed by a column it has.
     pub(crate) fn for_table(
         format: TableFormat,
         schema: &Schema,
+        index: &Index,
         auto: &AutoDownloadConfig,
     ) -> Self {
         Self {
             probe: None,
-            parses: if auto.verify_content {
-                Some(format)
-            } else {
-                None
-            },
-            declared: match schema {
-                Schema::Named(names) => Some(names.len()),
-                Schema::Auto => None,
-            },
+            table: auto.verify_content.then(|| {
+                Arc::new(TableCheck {
+                    format,
+                    schema: schema.clone(),
+                    index: index.clone(),
+                    ceiling: auto.resident_max_bytes,
+                })
+            }),
             min_size_percent: auto.min_size_percent,
         }
     }
@@ -125,7 +134,7 @@ impl Guard {
     /// [`GeoIpDownloadError::Unparseable`] when a table holds no rows of the
     /// format it states.
     pub(super) fn admit(
-        self,
+        &self,
         staged: &Path,
         dest: &Path,
         format: DatabaseFormat,
@@ -136,8 +145,8 @@ impl Guard {
             probe(staged, dest, kind, format)?;
         }
 
-        if let Some(table) = self.parses {
-            parses(staged, dest, table, self.declared)?;
+        if let Some(table) = &self.table {
+            parses(staged, dest, table)?;
         }
 
         Ok(())
@@ -148,7 +157,7 @@ impl Guard {
     ///
     /// A first download has nothing to compare against and passes, as does one
     /// over a destination whose size cannot be read.
-    fn check_size(self, staged: &Path, dest: &Path) -> Result<(), GeoIpDownloadError> {
+    fn check_size(&self, staged: &Path, dest: &Path) -> Result<(), GeoIpDownloadError> {
         if self.min_size_percent == 0 {
             return Ok(());
         }
@@ -286,18 +295,20 @@ fn probe(
     Ok(())
 }
 
-/// Read the head of the staged file and require rows of the stated format.
+/// Load the staged file as the table it states, and drop the result.
 ///
-/// Bounded rather than exhaustive: this runs before the rename, where the
-/// question is whether the bytes are a table at all, and a fault deeper in the
-/// file is reported by the load that follows.
-fn parses(
-    staged: &Path,
-    dest: &Path,
-    format: TableFormat,
-    declared: Option<usize>,
-) -> Result<(), GeoIpDownloadError> {
-    crate::table::probe(staged, format, declared).map_err(|e| GeoIpDownloadError::Unparseable {
+/// The load runs before the rename so that a file it would refuse never replaces
+/// a copy that loads. The table is built and released here, so the later load
+/// is the only one resident when the read succeeds.
+fn parses(staged: &Path, dest: &Path, table: &TableCheck) -> Result<(), GeoIpDownloadError> {
+    crate::table::probe(
+        staged,
+        table.format,
+        &table.schema,
+        &table.index,
+        table.ceiling,
+    )
+    .map_err(|e| GeoIpDownloadError::Unparseable {
         path: dest.display().to_string(),
         detail: e.to_string(),
     })

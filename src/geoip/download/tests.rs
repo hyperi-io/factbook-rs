@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::testkit::{gzip, mmdb_body, sha256_hex, tar_gz};
@@ -521,6 +521,195 @@ fn a_config_that_can_be_acted_on_validates() {
     explicit.city_db_path = Some("/data/city.mmdb".into());
     explicit.asn_db_path = Some("/data/asn.mmdb".into());
     validate(&explicit).unwrap();
+}
+
+#[test]
+fn a_setting_that_can_only_fail_is_refused_by_name() {
+    let dir = PathBuf::from("/var/lib/geoip");
+
+    for (edit, key) in [
+        (
+            (|a: &mut AutoDownloadConfig| a.read_timeout_secs = 0) as fn(&mut AutoDownloadConfig),
+            Some("auto_download.read_timeout_secs"),
+        ),
+        (
+            |a| a.connect_timeout_secs = 0,
+            Some("auto_download.connect_timeout_secs"),
+        ),
+        (
+            |a| a.min_size_percent = 101,
+            Some("auto_download.min_size_percent"),
+        ),
+        (
+            |a| a.min_size_percent = 255,
+            Some("auto_download.min_size_percent"),
+        ),
+        // The edges that work.
+        (|a| a.min_size_percent = 100, None),
+        (|a| a.min_size_percent = 0, None),
+        (|a| a.read_timeout_secs = 1, None),
+    ] {
+        let mut config = config_in(&dir, GeoIpProvider::DbIp);
+        edit(&mut config.auto_download);
+
+        match (validate(&config), key) {
+            (Ok(()), None) => {}
+            (Err(e @ GeoIpDownloadError::InvalidSetting { .. }), Some(key)) => {
+                assert!(e.to_string().contains(key), "{e}");
+                assert!(e.is_permanent());
+            }
+            (other, key) => panic!("{key:?} gave {other:?}"),
+        }
+    }
+
+    // Nothing is fetched, so a value that only matters to a fetch is not read.
+    let mut off = config_in(&dir, GeoIpProvider::DbIp);
+    off.auto_download.read_timeout_secs = 0;
+    off.auto_download.enabled = false;
+    validate(&off).unwrap();
+
+    // An injected client's own timeouts govern, so the two here are not read.
+    let mut injected = config_in(&dir, GeoIpProvider::DbIp).with_http_client(default_client());
+    injected.auto_download.read_timeout_secs = 0;
+    validate(&injected).unwrap();
+    injected.auto_download.min_size_percent = 101;
+    assert!(validate(&injected).is_err());
+}
+
+#[tokio::test]
+async fn a_download_with_a_setting_that_can_only_fail_makes_no_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config_in(dir.path(), GeoIpProvider::DbIp);
+    config.auto_download.read_timeout_secs = 0;
+
+    let err = download(Kind::City, &config).await.unwrap_err();
+    assert!(
+        matches!(err, GeoIpDownloadError::InvalidSetting { .. }),
+        "{err:?}"
+    );
+}
+
+/// An error of each kind a provider can answer with.
+fn rate_limited(retry_after_secs: Option<u64>) -> GeoIpDownloadError {
+    GeoIpDownloadError::RateLimited {
+        url: "https://example.invalid/db".into(),
+        retry_after_secs,
+    }
+}
+
+#[test]
+fn a_refusal_or_a_rate_limit_starts_a_cool_down() {
+    use cooldown::{CEILING_SECS, FLOOR_SECS};
+
+    let undersized = || GeoIpDownloadError::Undersized {
+        path: "db".into(),
+        actual: 1,
+        existing: 100,
+        floor_percent: 50,
+    };
+    let mismatch = || GeoIpDownloadError::ChecksumMismatch {
+        url: "u".into(),
+        expected: "a".into(),
+        actual: "b".into(),
+    };
+
+    for (error, expected) in [
+        (rate_limited(Some(600)), Some(600)),
+        (rate_limited(None), Some(FLOOR_SECS)),
+        // A provider cannot lock a deployment out for longer than a day.
+        (rate_limited(Some(10 * CEILING_SECS)), Some(CEILING_SECS)),
+        (undersized(), Some(FLOOR_SECS)),
+        (mismatch(), Some(FLOOR_SECS)),
+        // Not a refusal: the network, another process, a local fault.
+        (GeoIpDownloadError::Busy { path: "db".into() }, None),
+        (GeoIpDownloadError::Io(io::Error::other("disk")), None),
+        (
+            GeoIpDownloadError::UnexpectedStatus {
+                url: "u".into(),
+                status: 500,
+            },
+            None,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("db.mmdb");
+
+        cooldown::begin(&dest, &error);
+        let waiting = cooldown::wait_for(&dest, "city").map(|wait| wait.as_secs());
+
+        match (waiting, expected) {
+            (None, None) => {}
+            (Some(waiting), Some(expected)) => {
+                assert!(
+                    (expected.saturating_sub(5)..=expected).contains(&waiting),
+                    "{error:?} waits {waiting}s, wanted {expected}s"
+                );
+            }
+            (waiting, expected) => panic!("{error:?}: {waiting:?} against {expected:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_cool_down_ends_when_it_passes_or_a_download_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("db.mmdb");
+    let stamp = cooldown::stamp_path(&dest);
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // A stamp already in the past, and one that is not a stamp at all.
+    fs::write(&stamp, (now - 10).to_string()).unwrap();
+    assert!(cooldown::wait_for(&dest, "city").is_none());
+    fs::write(&stamp, "soon").unwrap();
+    assert!(cooldown::wait_for(&dest, "city").is_none());
+
+    fs::write(&stamp, (now + 600).to_string()).unwrap();
+    assert!(cooldown::wait_for(&dest, "city").is_some());
+    cooldown::clear(&dest);
+    assert!(cooldown::wait_for(&dest, "city").is_none());
+    assert!(!stamp.exists());
+}
+
+#[tokio::test]
+async fn a_database_that_is_cooling_down_costs_no_request() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let city = dir.path().join("dbip-city-lite.mmdb");
+    let asn = dir.path().join("dbip-asn-lite.mmdb");
+    fs::write(&city, b"stale city").unwrap();
+    fs::write(&asn, b"stale asn").unwrap();
+
+    let proxied = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(server.uri()).unwrap())
+        .build()
+        .unwrap();
+    let mut config = config_in(dir.path(), GeoIpProvider::DbIp).with_http_client(proxied);
+    config.auto_download.max_age_days = 0;
+
+    for file in [&city, &asn] {
+        fs::write(cooldown::stamp_path(file), (now + 600).to_string()).unwrap();
+    }
+    let databases = ensure_databases(&config).await.unwrap();
+
+    // Both stale copies are served and the provider is not asked.
+    assert_eq!(databases.city.unwrap().files, std::slice::from_ref(&city));
+    assert_eq!(databases.asn.unwrap().files, std::slice::from_ref(&asn));
+    assert_eq!(requested_targets(&server).await.len(), 0);
+
+    // Once the stamps pass, the same call reaches for the network again.
+    for file in [&city, &asn] {
+        fs::write(cooldown::stamp_path(file), (now - 1).to_string()).unwrap();
+    }
+    ensure_databases(&config).await.unwrap();
+    assert_eq!(requested_targets(&server).await.len(), 2);
 }
 
 #[tokio::test]
@@ -1402,6 +1591,50 @@ async fn a_download_that_misses_its_digest_is_rejected() {
 }
 
 #[tokio::test]
+async fn an_error_never_carries_a_credential_written_into_a_url() {
+    // A table source is a URL the operator wrote, and its credential can ride
+    // in the userinfo or the query of either the file or its digest.
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let with_secret = |name: &str| {
+        server
+            .uri()
+            .replacen("http://", "http://user:sekrit-pw@", 1)
+            + &format!("/{name}?token=sekrit-token")
+    };
+
+    let body = mmdb_body(b"a database");
+    Mock::given(method("GET"))
+        .and(path("/db.mmdb"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/db.mmdb.sha256"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sha256_hex(b"other")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gone.mmdb"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let mismatch = resumable_transfer(
+        with_secret("db.mmdb"),
+        dir.path().join("db.mmdb"),
+        with_secret("db.mmdb.sha256"),
+    );
+    let refused = raw_transfer(with_secret("gone.mmdb"), dir.path().join("gone.mmdb"));
+
+    for transfer in [mismatch, refused] {
+        let err = transfer.run(&default_client()).await.unwrap_err();
+        let shown = format!("{err} {err:?}");
+        assert!(!shown.contains("sekrit"), "{shown}");
+    }
+}
+
+#[tokio::test]
 async fn a_rejected_download_leaves_the_previous_database_in_place() {
     // The service keeps serving the last known-good copy. A bad body that
     // reached the destination would also look fresh, so nothing would ever
@@ -2046,6 +2279,50 @@ async fn a_server_that_ignores_the_range_restarts_the_file() {
     assert_eq!(fs::read(&written).unwrap(), body);
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests[0].headers.get("range").unwrap(), "bytes=8-");
+}
+
+#[tokio::test]
+async fn a_part_file_holding_the_whole_body_is_started_again() {
+    // A range starting at the end of a complete part file is answered with 416.
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("db.mmdb");
+    let part = dir.path().join("db.mmdb.part");
+
+    let body = mmdb_body(b"the whole database body");
+    fs::write(&part, &body).unwrap();
+
+    Mock::given(method("GET"))
+        .and(path("/db.mmdb"))
+        .and(header("range", format!("bytes={}-", body.len()).as_str()))
+        .respond_with(
+            ResponseTemplate::new(416)
+                .insert_header("content-range", format!("bytes */{}", body.len()).as_str()),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/db.mmdb"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/db.mmdb.sha256"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sha256_hex(&body)))
+        .mount(&server)
+        .await;
+
+    let written = resumable_transfer(
+        format!("{}/db.mmdb", server.uri()),
+        dest,
+        format!("{}/db.mmdb.sha256", server.uri()),
+    )
+    .run(&default_client())
+    .await
+    .unwrap();
+
+    assert_eq!(fs::read(&written).unwrap(), body);
 }
 
 #[tokio::test]
