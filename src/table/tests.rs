@@ -394,6 +394,12 @@ fn a_source_that_cannot_be_fetched_is_reported_before_anything_is() {
         TableError::BadUrl { .. }
     ));
 
+    // The refusal names the URL without the credential written into it.
+    source.url = "https://user:sekrit@exa mple.net/networks.csv?token=sekrit".to_string();
+    let err = source.validate().unwrap_err();
+    assert!(matches!(err, TableError::BadUrl { .. }), "{err:?}");
+    assert!(!err.to_string().contains("sekrit"), "{err}");
+
     source.url = "https://example.net/networks.csv".to_string();
     source.validate().unwrap();
 }
@@ -631,6 +637,42 @@ async fn a_replacement_that_holds_no_rows_leaves_the_previous_file_in_place() {
 }
 
 #[tokio::test]
+async fn a_replacement_the_load_would_refuse_leaves_the_previous_file_in_place() {
+    // Each replacement is a well-formed CSV that the load then rejects, so a
+    // guard that only checks the format would swap the good copy out for it.
+    let renamed_key = "number,name\n1,one\n2,two\n";
+    let too_big = operators(200);
+
+    for (replacement, resident_max_bytes) in [
+        (
+            renamed_key,
+            AutoDownloadConfig::default().resident_max_bytes,
+        ),
+        (too_big.as_str(), 1024),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("networks.csv");
+        fs::write(&file, NETWORKS).unwrap();
+
+        let server = MockServer::start().await;
+        serve(&server, "networks.csv", replacement.as_bytes()).await;
+
+        let settings = AutoDownloadConfig {
+            resident_max_bytes,
+            // Under the default floor, so only the load decides.
+            min_size_percent: 0,
+            ..auto(dir.path())
+        };
+        let table = Table::ensure(&source_at(&server, "networks.csv"), &settings)
+            .await
+            .unwrap();
+
+        assert_eq!(table.len(), 2, "{replacement:?}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), NETWORKS);
+    }
+}
+
+#[tokio::test]
 async fn a_replacement_under_the_size_floor_leaves_the_previous_file_in_place() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("networks.csv");
@@ -820,7 +862,7 @@ async fn a_schema_that_names_its_columns_refuses_a_file_of_another_width() {
         matches!(
             &err,
             TableError::Fetch(GeoIpDownloadError::Unparseable { detail, .. })
-                if detail.contains("3 fields against the expected 2")
+                if detail.contains("3 fields against 2 columns")
         ),
         "{err:?}"
     );

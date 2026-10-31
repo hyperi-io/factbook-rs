@@ -619,7 +619,7 @@ async fn download(kind: Kind, config: &GeoIpConfig) -> Result<Vec<PathBuf>, GeoI
 
     let mut files = Vec::with_capacity(transfers.len());
     for transfer in transfers {
-        files.push(transfer.run_guarded(&client, guard).await?);
+        files.push(transfer.run_guarded(&client, guard.clone()).await?);
     }
     Ok(files)
 }

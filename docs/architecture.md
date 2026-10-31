@@ -72,7 +72,7 @@ flowchart LR
 
 A short body is the one refusal that keeps its bytes: they are a valid prefix of the file, so the next run continues from them with a `Range` request rather than re-fetching tens of megabytes.
 
-The digest runs only where a publisher publishes one, and it is the expensive check: a full read and hash of the archive. The last three belong to the guard, which runs the volume floor first because two `stat` calls cost less than mapping a database. The last two of those never both apply -- a provider database is probed for an address and a table has its rows parsed, and the guard is built carrying only the one its payload takes.
+The digest runs only where a publisher publishes one, and it is the expensive check: a full read and hash of the archive. The last three belong to the guard, which runs the volume floor first because two `stat` calls cost less than mapping a database. The last two of those never both apply -- a provider database is probed for an address and a table is loaded as the source states it (rows, width, key column and resident ceiling), and the guard is built carrying only the one its payload takes.
 
 ## The cache is keyed on the address, not its text
 

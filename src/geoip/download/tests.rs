@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::testkit::{gzip, mmdb_body, sha256_hex, tar_gz};
@@ -1402,6 +1402,50 @@ async fn a_download_that_misses_its_digest_is_rejected() {
 }
 
 #[tokio::test]
+async fn an_error_never_carries_a_credential_written_into_a_url() {
+    // A table source is a URL the operator wrote, and its credential can ride
+    // in the userinfo or the query of either the file or its digest.
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let with_secret = |name: &str| {
+        server
+            .uri()
+            .replacen("http://", "http://user:sekrit-pw@", 1)
+            + &format!("/{name}?token=sekrit-token")
+    };
+
+    let body = mmdb_body(b"a database");
+    Mock::given(method("GET"))
+        .and(path("/db.mmdb"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/db.mmdb.sha256"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sha256_hex(b"other")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gone.mmdb"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let mismatch = resumable_transfer(
+        with_secret("db.mmdb"),
+        dir.path().join("db.mmdb"),
+        with_secret("db.mmdb.sha256"),
+    );
+    let refused = raw_transfer(with_secret("gone.mmdb"), dir.path().join("gone.mmdb"));
+
+    for transfer in [mismatch, refused] {
+        let err = transfer.run(&default_client()).await.unwrap_err();
+        let shown = format!("{err} {err:?}");
+        assert!(!shown.contains("sekrit"), "{shown}");
+    }
+}
+
+#[tokio::test]
 async fn a_rejected_download_leaves_the_previous_database_in_place() {
     // The service keeps serving the last known-good copy. A bad body that
     // reached the destination would also look fresh, so nothing would ever
@@ -2046,6 +2090,50 @@ async fn a_server_that_ignores_the_range_restarts_the_file() {
     assert_eq!(fs::read(&written).unwrap(), body);
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests[0].headers.get("range").unwrap(), "bytes=8-");
+}
+
+#[tokio::test]
+async fn a_part_file_holding_the_whole_body_is_started_again() {
+    // A range starting at the end of a complete part file is answered with 416.
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("db.mmdb");
+    let part = dir.path().join("db.mmdb.part");
+
+    let body = mmdb_body(b"the whole database body");
+    fs::write(&part, &body).unwrap();
+
+    Mock::given(method("GET"))
+        .and(path("/db.mmdb"))
+        .and(header("range", format!("bytes={}-", body.len()).as_str()))
+        .respond_with(
+            ResponseTemplate::new(416)
+                .insert_header("content-range", format!("bytes */{}", body.len()).as_str()),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/db.mmdb"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/db.mmdb.sha256"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sha256_hex(&body)))
+        .mount(&server)
+        .await;
+
+    let written = resumable_transfer(
+        format!("{}/db.mmdb", server.uri()),
+        dest,
+        format!("{}/db.mmdb.sha256", server.uri()),
+    )
+    .run(&default_client())
+    .await
+    .unwrap();
+
+    assert_eq!(fs::read(&written).unwrap(), body);
 }
 
 #[tokio::test]

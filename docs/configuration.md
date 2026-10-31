@@ -131,6 +131,8 @@ A geo database is already in the format the reader reads, so `resident_max_bytes
 
 If it loads into memory it is used. If it does not, `Table::ensure` returns `OverResidentCeiling` and the table does not load. Raise the ceiling, or point the source at less data.
 
+A download is held to the same ceiling before it replaces anything. One that would not load is refused and the copy on disk keeps serving. With no copy on disk the refusal reaches the caller as `Fetch(Unparseable)`, carrying the same message.
+
 Whether a source fits is not knowable before it is read. An encoding, a quoting style and a column count all move the answer, and the file size on disk does not. So the ceiling is **hit rather than predicted**: the read fills memory, stops the moment it crosses `resident_max_bytes`, and releases everything it had taken as it fails. A CSV stops on a record and a JSON array on an element, so neither reader's peak is set by the file -- the refusal is early and cheap rather than an allocation failure at the end of one.
 
 Writing an oversized source out as a MaxMind DB and serving it from there is future work, tracked as issue #2. Until it lands there is no fallback, and nothing here pretends otherwise.

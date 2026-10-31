@@ -146,7 +146,7 @@ pub enum TableError {
     /// The source names somewhere the transfer cannot go.
     #[error("{url} is not a URL that can be fetched: {detail}")]
     BadUrl {
-        /// URL as the operator wrote it.
+        /// URL as the operator wrote it, minus its userinfo and query values.
         url: String,
         /// What the URL parser refused it for.
         detail: String,
@@ -354,7 +354,7 @@ impl Table {
             )?;
 
             let transfer = transfer(source, dest.clone());
-            let guard = Guard::for_table(source.format, &source.schema, auto);
+            let guard = Guard::for_table(source.format, &source.schema, &source.index, auto);
 
             if let Err(e) = transfer.run_guarded(&client, guard).await {
                 if !dest.exists() {
@@ -650,7 +650,7 @@ impl TableSource {
     /// field to fix.
     pub fn validate(&self) -> Result<(), TableError> {
         reqwest::Url::parse(&self.url).map_err(|e| TableError::BadUrl {
-            url: self.url.clone(),
+            url: fetch::loggable(&self.url),
             detail: e.to_string(),
         })?;
 
