@@ -91,11 +91,7 @@ let databases = ensure_databases(&config).await?;
 # }
 ```
 
-Credentials are `Secret`: redacted in `Debug` and `Display`, and never formatted
-into a URL or a process argument. Supply them from your secrets layer rather
-than as literals. `factbook::geoip::validate` checks a selection when config
-loads, so a missing credential is reported by name rather than as a rejected
-request on the first fetch.
+Credentials are `Secret`: redacted in `Debug` and `Display`, never a process argument. The IPinfo token goes on as a query parameter added by the request builder, never into a URL string the crate logs. Supply credentials from your secrets layer. Call `factbook::geoip::validate` when your config loads, and a missing credential is reported by name, not as a rejected first fetch. Nothing calls it for you.
 
 Provisioning and lookup stay separate calls rather than one convenience
 constructor, so a host that pre-seeds its databases or mounts them read-only
@@ -199,9 +195,9 @@ behind a cache -- reading the database onto the heap when it fits under the
 configured ceiling, mapping it when it does not.
 
 A refused download never replaces a good database -- the file already on disk
-keeps being served. A hit costs tens of nanoseconds against microseconds for
-the database read behind it, and private or reserved addresses never reach the
-cache at all.
+keeps being served. A cache hit took about 300 ns against about 6 us for the
+database read behind it (`benches/geoip_lookup.rs`, 2026-11-01, x86_64), and
+private or reserved addresses never reach the cache at all.
 
 Why that ordering makes the memory map safe, and what the six checks are:
 [docs/architecture.md](https://github.com/hyperi-io/factbook-rs/blob/main/docs/architecture.md).
@@ -218,7 +214,7 @@ Why that ordering makes the memory map safe, and what the six checks are:
 
 ## Issues
 
-Open bugs: [this repo](https://github.com/hyperi-io/factbook-rs/issues?q=is%3Aopen+is%3Aissue+type%3ABug+-label%3Abacklog+-label%3Anext-minor) | [whole DFE suite](https://github.com/search?type=issues&q=is%3Aopen+is%3Aissue+type%3ABug+-label%3Abacklog+-label%3Anext-minor+repo%3Ahyperi-io%2Fdfe-infra+repo%3Ahyperi-io%2Fdfe-docker+repo%3Ahyperi-io%2Fdfe-deploy+repo%3Ahyperi-io%2Fdfe-engine+repo%3Ahyperi-io%2Fdfe-loader+repo%3Ahyperi-io%2Fdfe-receiver+repo%3Ahyperi-io%2Fdfe-fetcher+repo%3Ahyperi-io%2Fdfe-archiver+repo%3Ahyperi-io%2Fdfe-transform-vrl+repo%3Ahyperi-io%2Fdfe-transform-vector+repo%3Ahyperi-io%2Fdfe-transform-elastic+repo%3Ahyperi-io%2Fdfe-ui+repo%3Ahyperi-io%2Fdfe-hyperdx+repo%3Ahyperi-io%2Fscalo-rs+repo%3Ahyperi-io%2Fscalo-py+repo%3Ahyperi-io%2Flogreducer+repo%3Ahyperi-io%2Fdfe-schemas+repo%3Ahyperi-io%2Fvector-vrl+repo%3Ahyperi-io%2Fculvert+repo%3Ahyperi-io%2Fclickhouse-dfe+repo%3Ahyperi-io%2Ffactbook-rs)
+Open bugs: [this repo](https://github.com/hyperi-io/factbook-rs/issues?q=is%3Aopen+is%3Aissue+type%3ABug+-label%3Abacklog+-label%3Anext-minor) | [whole DFE suite](https://github.com/search?type=issues&q=is%3Aopen+is%3Aissue+type%3ABug+-label%3Abacklog+-label%3Anext-minor+repo%3Ahyperi-io%2Fdfe-infra+repo%3Ahyperi-io%2Fdfe-docker+repo%3Ahyperi-io%2Fdfe-deploy+repo%3Ahyperi-io%2Fdfe-engine+repo%3Ahyperi-io%2Fdfe-loader+repo%3Ahyperi-io%2Fdfe-receiver+repo%3Ahyperi-io%2Fdfe-fetcher+repo%3Ahyperi-io%2Fdfe-archiver+repo%3Ahyperi-io%2Fdfe-transform-vrl+repo%3Ahyperi-io%2Fdfe-transform-vector+repo%3Ahyperi-io%2Fdfe-transform-elastic+repo%3Ahyperi-io%2Fdfe-ui+repo%3Ahyperi-io%2Fdfe-hyperdx+repo%3Ahyperi-io%2Fscalo-rs+repo%3Ahyperi-io%2Fscalo-py+repo%3Ahyperi-io%2Flogreducer+repo%3Ahyperi-io%2Fdfe-schemas+repo%3Ahyperi-io%2Fvector-vrl+repo%3Ahyperi-io%2Fculvert+repo%3Ahyperi-io%2Fdfe-clickhouse-rs+repo%3Ahyperi-io%2Ffactbook-rs)
 
 ## Licence
 
@@ -229,5 +225,4 @@ you configure, and each source sets its own terms for its own data.
 [SOURCES.md](https://github.com/hyperi-io/factbook-rs/blob/main/SOURCES.md)
 points at where each publisher states them.
 
-Credentials are held in a `Secret` newtype that never reaches a log line, a
-process argument or a formatted URL.
+Credentials are held in a `Secret` newtype that never reaches a log line or a process argument. IPinfo's token goes on as a query parameter added by the request builder, never into a URL string the crate logs.
