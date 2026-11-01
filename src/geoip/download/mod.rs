@@ -22,7 +22,7 @@
 //!
 //! # Credentials
 //!
-//! MaxMind and IPinfo credentials are [`Secret`] and never reach a log line.
+//! MaxMind and IPinfo credentials are [`Secret`](crate::Secret) and never reach a log line.
 //! The IPinfo token is attached as a query parameter by the request builder
 //! rather than being formatted into the URL string, and a transport error is
 //! stripped of its URL before it is reported, so neither the logged URL nor the

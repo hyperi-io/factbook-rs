@@ -252,7 +252,7 @@ impl TableBacking {
 /// The address and prefix kinds carry the rows their index could not file --
 /// a key cell that is there and does not parse. Those rows are unreachable by
 /// address and still reachable by the text they hold, so a
-/// [`Query`](query::Query) narrowed by the index walks them as well.
+/// [`Query`] narrowed by the index walks them as well.
 #[derive(Debug)]
 enum Keys {
     /// Filed under the text of a column.

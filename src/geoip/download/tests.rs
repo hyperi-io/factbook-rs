@@ -711,7 +711,7 @@ async fn an_oversized_body_is_not_asked_for_again_inside_its_cool_down() {
     let (url, dest, client) = (&url, &dest, &client);
     let fetch = move || async move {
         let file = raw_transfer(url.clone(), dest.clone())
-            .run_within(&client, 64)
+            .run_within(client, 64)
             .await?;
         Ok(vec![file])
     };
