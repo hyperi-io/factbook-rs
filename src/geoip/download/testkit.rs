@@ -19,32 +19,13 @@ use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread::{self, ThreadId};
 
-/// Destinations whose next materialise step waits for the test holding it.
+/// Files whose next blocking step waits for the test holding it.
 static HELD: Mutex<Vec<(PathBuf, Hold)>> = Mutex::new(Vec::new());
 
-/// The thread each piece of blocking file work ran on, by the file it touched.
+/// The thread each blocking step ran on, by the file it touched.
 static RAN_ON: Mutex<Vec<(PathBuf, ThreadId)>> = Mutex::new(Vec::new());
 
-/// Record the calling thread against `path`.
-pub(crate) fn ran_here(path: &Path) {
-    RAN_ON
-        .lock()
-        .unwrap()
-        .push((path.to_path_buf(), thread::current().id()));
-}
-
-/// Every thread blocking work on `path` has run on.
-pub(crate) fn threads_for(path: &Path) -> Vec<ThreadId> {
-    RAN_ON
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|(ran, _)| ran == path)
-        .map(|&(_, thread)| thread)
-        .collect()
-}
-
-/// The two ends of one held materialise step.
+/// The two ends of one held step.
 struct Hold {
     /// Fires once the step has started.
     entered: mpsc::Sender<()>,
@@ -52,16 +33,15 @@ struct Hold {
     release: mpsc::Receiver<()>,
 }
 
-/// Hold the next materialise into `dest` on the blocking pool until the test
-/// lets it go.
+/// Hold the next blocking step on `path` until the test lets it go.
 ///
 /// Returns a receiver that fires once the step has started, and the sender that
 /// releases it.
-pub(crate) fn hold_materialise(dest: &Path) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+pub(crate) fn hold(path: &Path) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
     let (entered, has_entered) = mpsc::channel();
     let (release, released) = mpsc::channel();
     HELD.lock().unwrap().push((
-        dest.to_path_buf(),
+        path.to_path_buf(),
         Hold {
             entered,
             release: released,
@@ -70,19 +50,36 @@ pub(crate) fn hold_materialise(dest: &Path) -> (mpsc::Receiver<()>, mpsc::Sender
     (has_entered, release)
 }
 
-/// Wait here while a test holds `dest`. Blocking, and a no-op for any
-/// destination no test is holding.
-pub(crate) fn materialise_point(dest: &Path) {
+/// Record the calling thread against `path`, then wait while a test holds it.
+///
+/// Blocking, and returns at once for a file no test is holding.
+pub(crate) fn checkpoint(path: &Path) {
+    RAN_ON
+        .lock()
+        .unwrap()
+        .push((path.to_path_buf(), thread::current().id()));
+
     let hold = {
         let mut held = HELD.lock().unwrap();
         held.iter()
-            .position(|(path, _)| path == dest)
+            .position(|(held, _)| held == path)
             .map(|at| held.remove(at).1)
     };
     if let Some(hold) = hold {
         let _ = hold.entered.send(());
         let _ = hold.release.recv();
     }
+}
+
+/// Every thread a blocking step on `path` has run on.
+pub(crate) fn threads_for(path: &Path) -> Vec<ThreadId> {
+    RAN_ON
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(ran, _)| ran == path)
+        .map(|&(_, thread)| thread)
+        .collect()
 }
 
 /// Marker that opens the metadata section of a MaxMind DB file.

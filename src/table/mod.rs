@@ -416,7 +416,7 @@ impl Table {
         ceiling: u64,
     ) -> Result<Self, TableError> {
         #[cfg(test)]
-        crate::geoip::download::testkit::ran_here(path);
+        crate::geoip::download::testkit::checkpoint(path);
 
         let parsed = parse::read(
             BufReader::new(fs::File::open(path)?),
