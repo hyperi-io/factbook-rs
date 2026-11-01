@@ -44,8 +44,7 @@
 
 use std::cell;
 use std::fmt;
-use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead};
 use std::path::Path;
 
 use serde::de;
@@ -134,8 +133,7 @@ pub(crate) fn probe(
     index: &Index,
     ceiling: u64,
 ) -> Result<(), TableError> {
-    let reader = BufReader::new(fs::File::open(path)?);
-    Table::build(read(reader, format, schema, ceiling)?, index, ceiling).map(drop)
+    Table::read_file(path, format, schema, index, ceiling).map(drop)
 }
 
 /// Read a CSV into columns and rows.
@@ -766,6 +764,8 @@ impl Csv {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     /// Every field of a parsed table, as text, for comparing against a literal.

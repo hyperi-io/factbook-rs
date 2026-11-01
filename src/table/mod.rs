@@ -338,6 +338,9 @@ impl Table {
     /// nowhere else for a table to be served from, so a ceiling it crosses is
     /// the end of the load rather than a switch to something slower.
     ///
+    /// The read and the index build run on the blocking pool, so a large
+    /// source holds no runtime worker while it loads.
+    ///
     /// # Errors
     ///
     /// [`TableError::Fetch`] when the download fails and there is no local copy
@@ -378,17 +381,37 @@ impl Table {
             }
         }
 
-        let reader = BufReader::new(fs::File::open(&dest)?);
-        let parsed = parse::read(
-            reader,
-            source.format,
-            &source.schema,
-            auto.resident_max_bytes,
-        )?;
-        let table = Self::build(parsed, &source.index, auto.resident_max_bytes)?;
+        let (format, schema, index) = (source.format, source.schema.clone(), source.index.clone());
+        let ceiling = auto.resident_max_bytes;
+        let table = tokio::task::spawn_blocking(move || {
+            Self::read_file(&dest, format, &schema, &index, ceiling)
+        })
+        .await
+        .map_err(io::Error::from)??;
 
         telemetry::backing(&source.file, table.backing());
         Ok(table)
+    }
+
+    /// Read and index the file at `path`, refusing past `ceiling` bytes.
+    /// Blocking: it reads, parses and indexes the whole file.
+    pub(crate) fn read_file(
+        path: &Path,
+        format: TableFormat,
+        schema: &Schema,
+        index: &Index,
+        ceiling: u64,
+    ) -> Result<Self, TableError> {
+        #[cfg(test)]
+        crate::geoip::download::testkit::ran_here(path);
+
+        let parsed = parse::read(
+            BufReader::new(fs::File::open(path)?),
+            format,
+            schema,
+            ceiling,
+        )?;
+        Self::build(parsed, index, ceiling)
     }
 
     /// Read a table off disk.
@@ -408,7 +431,7 @@ impl Table {
         schema: &Schema,
         index: &Index,
     ) -> Result<Self, TableError> {
-        Self::from_reader(BufReader::new(fs::File::open(path)?), format, schema, index)
+        Self::read_file(path, format, schema, index, u64::MAX)
     }
 
     /// Read a table from bytes already in hand.

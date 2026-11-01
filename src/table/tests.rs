@@ -15,7 +15,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
-use crate::geoip::download::testkit::{gzip, sha256_hex};
+use crate::geoip::download::testkit::{self, gzip, sha256_hex};
 
 /// A CSV of two networks, keyed by autonomous system number.
 const NETWORKS: &str = "asn,name,country\n13335,CLOUDFLARENET,US\n15169,GOOGLE,US\n";
@@ -971,6 +971,24 @@ async fn a_table_that_fits_is_held_in_memory() {
         table.get("13335").unwrap().get("name"),
         Some("CLOUDFLARENET")
     );
+}
+
+#[tokio::test]
+async fn a_table_is_read_and_indexed_off_the_runtime_thread() {
+    // A current-thread runtime runs every task on this thread, so a load done
+    // here would hold up every other task for the length of the file.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("networks.csv");
+    fs::write(&file, operators(200)).unwrap();
+
+    let table = Table::ensure(&local("networks.csv"), &offline(dir.path()))
+        .await
+        .unwrap();
+
+    assert_eq!(table.len(), 200);
+    let threads = testkit::threads_for(&file);
+    assert_eq!(threads.len(), 1, "{threads:?}");
+    assert_ne!(threads[0], std::thread::current().id());
 }
 
 #[tokio::test]

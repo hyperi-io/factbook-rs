@@ -17,9 +17,32 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc;
+use std::thread::{self, ThreadId};
 
 /// Destinations whose next materialise step waits for the test holding it.
 static HELD: Mutex<Vec<(PathBuf, Hold)>> = Mutex::new(Vec::new());
+
+/// The thread each piece of blocking file work ran on, by the file it touched.
+static RAN_ON: Mutex<Vec<(PathBuf, ThreadId)>> = Mutex::new(Vec::new());
+
+/// Record the calling thread against `path`.
+pub(crate) fn ran_here(path: &Path) {
+    RAN_ON
+        .lock()
+        .unwrap()
+        .push((path.to_path_buf(), thread::current().id()));
+}
+
+/// Every thread blocking work on `path` has run on.
+pub(crate) fn threads_for(path: &Path) -> Vec<ThreadId> {
+    RAN_ON
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(ran, _)| ran == path)
+        .map(|&(_, thread)| thread)
+        .collect()
+}
 
 /// The two ends of one held materialise step.
 struct Hold {
