@@ -21,7 +21,9 @@
 //!
 //! Both are advisory. An operator running a database whose schema this crate
 //! models badly turns either off without giving up the format, digest and
-//! length checks in front of them.
+//! length checks in front of them. A table is different: it is loaded before
+//! the rename whatever the settings say, because a file the load refuses
+//! leaves nothing to serve.
 
 use std::fs;
 use std::path::Path;
@@ -50,8 +52,8 @@ pub(crate) struct Guard {
     /// Kind whose field a probe requires, absent when content is not checked.
     probe: Option<Kind>,
 
-    /// What a staged table has to load as, absent when content is not checked
-    /// or the payload is not a table.
+    /// What a staged table has to load as, absent when the payload is not a
+    /// table.
     table: Option<Arc<TableCheck>>,
 
     /// Smallest percentage of the copy on disk a replacement may be, zero for
@@ -98,9 +100,10 @@ impl Guard {
 
     /// The guard the operator's settings ask for on a table.
     ///
-    /// A table has no address to probe, so the content question it answers is
-    /// whether the file loads: rows of the stated format, at the width the schema
-    /// names, within the resident ceiling, keyed by a column it has.
+    /// The staged file has to load: rows of the stated format, at the width the
+    /// schema names, within the resident ceiling, keyed by a column it has. That
+    /// holds with `verify_content` off, because a file the load refuses replaces
+    /// a table that loads with nothing at all.
     pub(crate) fn for_table(
         format: TableFormat,
         schema: &Schema,
@@ -109,14 +112,12 @@ impl Guard {
     ) -> Self {
         Self {
             probe: None,
-            table: auto.verify_content.then(|| {
-                Arc::new(TableCheck {
-                    format,
-                    schema: schema.clone(),
-                    index: index.clone(),
-                    ceiling: auto.resident_max_bytes,
-                })
-            }),
+            table: Some(Arc::new(TableCheck {
+                format,
+                schema: schema.clone(),
+                index: index.clone(),
+                ceiling: auto.resident_max_bytes,
+            })),
             min_size_percent: auto.min_size_percent,
         }
     }

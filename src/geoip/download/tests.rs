@@ -187,11 +187,12 @@ fn gzip_transfer(url: String, dest: PathBuf) -> Transfer {
 /// test drives itself. Returns the URL to fetch.
 fn drip_server(chunks: Vec<Vec<u8>>, gap: Duration) -> String {
     let length = chunks.iter().map(Vec::len).sum();
-    drip_server_promising(chunks, length, gap)
+    drip_server_promising(chunks, Some(length), gap)
 }
 
-/// The same, declaring a `Content-Length` the chunks do not add up to.
-fn drip_server_promising(chunks: Vec<Vec<u8>>, length: usize, gap: Duration) -> String {
+/// The same, declaring a `Content-Length` the chunks need not add up to, or
+/// none at all, which leaves the body running until the server hangs up.
+fn drip_server_promising(chunks: Vec<Vec<u8>>, length: Option<usize>, gap: Duration) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
@@ -207,7 +208,10 @@ fn drip_server_promising(chunks: Vec<Vec<u8>>, length: usize, gap: Duration) -> 
         let mut buffer = [0u8; 2048];
         let _ = socket.read(&mut buffer).await;
 
-        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n");
+        let head = match length {
+            Some(length) => format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n"),
+            None => "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_string(),
+        };
         // Writes are ignored on failure: the client hangs up first whenever the
         // test is about a transfer that does not finish.
         let _ = socket.write_all(head.as_bytes()).await;
@@ -620,6 +624,33 @@ fn a_refusal_or_a_rate_limit_starts_a_cool_down() {
         (rate_limited(Some(10 * CEILING_SECS)), Some(CEILING_SECS)),
         (undersized(), Some(FLOOR_SECS)),
         (mismatch(), Some(FLOOR_SECS)),
+        (
+            GeoIpDownloadError::TooLarge {
+                url: "u".into(),
+                limit: 64,
+            },
+            Some(FLOOR_SECS),
+        ),
+        // Answered the same way every time, so held back for the ceiling.
+        (
+            GeoIpDownloadError::CredentialRejected {
+                url: "u".into(),
+                status: 401,
+                fields: "auto_download.maxmind_license_key",
+            },
+            Some(CEILING_SECS),
+        ),
+        (
+            GeoIpDownloadError::NotEntitled { url: "u".into() },
+            Some(CEILING_SECS),
+        ),
+        (
+            GeoIpDownloadError::UnexpectedStatus {
+                url: "u".into(),
+                status: 404,
+            },
+            Some(CEILING_SECS),
+        ),
         // Not a refusal: the network, another process, a local fault.
         (GeoIpDownloadError::Busy { path: "db".into() }, None),
         (GeoIpDownloadError::Io(io::Error::other("disk")), None),
@@ -634,8 +665,8 @@ fn a_refusal_or_a_rate_limit_starts_a_cool_down() {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("db.mmdb");
 
-        cooldown::begin(&dest, &error);
-        let waiting = cooldown::wait_for(&dest, "city").map(|wait| wait.as_secs());
+        cooldown::begin(&dest, &error, 1);
+        let waiting = cooldown::wait_for(&dest, "city", 1).map(|wait| wait.as_secs());
 
         match (waiting, expected) {
             (None, None) => {}
@@ -646,6 +677,12 @@ fn a_refusal_or_a_rate_limit_starts_a_cool_down() {
                 );
             }
             (waiting, expected) => panic!("{error:?}: {waiting:?} against {expected:?}"),
+        }
+
+        // A permanent failure holds back the configuration it failed under and
+        // no other.
+        if error.is_permanent() {
+            assert!(cooldown::wait_for(&dest, "city", 2).is_none(), "{error:?}");
         }
     }
 }
@@ -662,15 +699,66 @@ fn a_cool_down_ends_when_it_passes_or_a_download_does() {
 
     // A stamp already in the past, and one that is not a stamp at all.
     fs::write(&stamp, (now - 10).to_string()).unwrap();
-    assert!(cooldown::wait_for(&dest, "city").is_none());
+    assert!(cooldown::wait_for(&dest, "city", 0).is_none());
     fs::write(&stamp, "soon").unwrap();
-    assert!(cooldown::wait_for(&dest, "city").is_none());
+    assert!(cooldown::wait_for(&dest, "city", 0).is_none());
 
     fs::write(&stamp, (now + 600).to_string()).unwrap();
-    assert!(cooldown::wait_for(&dest, "city").is_some());
+    assert!(cooldown::wait_for(&dest, "city", 0).is_some());
     cooldown::clear(&dest);
-    assert!(cooldown::wait_for(&dest, "city").is_none());
+    assert!(cooldown::wait_for(&dest, "city", 0).is_none());
     assert!(!stamp.exists());
+}
+
+#[tokio::test]
+async fn an_oversized_body_is_not_asked_for_again_inside_its_cool_down() {
+    // Every refresh of a stale database would otherwise transfer up to the
+    // body ceiling again before refusing it.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/db.mmdb", listener.local_addr().unwrap());
+    let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    tokio::spawn({
+        let requests = requests.clone();
+        async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buffer = [0u8; 2048];
+                let _ = socket.read(&mut buffer).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n")
+                    .await;
+            }
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("db.mmdb");
+    let client = default_client();
+    let (url, dest, client) = (&url, &dest, &client);
+    let fetch = move || async move {
+        let file = raw_transfer(url.clone(), dest.clone())
+            .run_within(client, 64)
+            .await?;
+        Ok(vec![file])
+    };
+
+    let first = attempt("city", Some(dest), 0, fetch).await;
+    assert!(
+        matches!(
+            first,
+            Attempt::Ran(Err(GeoIpDownloadError::TooLarge { .. }))
+        ),
+        "{first:?}"
+    );
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let second = attempt("city", Some(dest), 0, fetch).await;
+    assert!(matches!(second, Attempt::Waiting(_)), "{second:?}");
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the cool-down let a second request through"
+    );
 }
 
 #[tokio::test]
@@ -1279,6 +1367,87 @@ async fn a_transfer_in_flight_turns_a_second_transfer_of_the_same_database_away(
 }
 
 #[tokio::test]
+async fn a_cancelled_transfer_holds_its_lock_until_its_blocking_steps_end() {
+    // Dropping the future does not stop a step it handed to the blocking pool:
+    // a write of the part file, or the materialise that verifies and renames
+    // it. A second writer let in at that point writes under the first.
+    for (step, held_file, left) in [
+        ("write", "db.mmdb.part", "db.mmdb.part"),
+        ("materialise", "db.mmdb", "db.mmdb"),
+    ] {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("db.mmdb");
+        let body = mmdb_body(b"the database the cancelled transfer is placing");
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let (entered, release) = testkit::hold(&dir.path().join(held_file));
+        let transfer = tokio::spawn({
+            let (url, dest) = (format!("{}/db.mmdb", server.uri()), dest.clone());
+            async move { raw_transfer(url, dest).run(&default_client()).await }
+        });
+
+        tokio::task::spawn_blocking(move || entered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        transfer.abort();
+        assert!(transfer.await.unwrap_err().is_cancelled(), "{step}");
+
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join("db.mmdb.lock"))
+            .unwrap();
+        let held = matches!(lock.try_lock(), Err(fs::TryLockError::WouldBlock));
+        release.send(()).unwrap();
+        assert!(
+            held,
+            "the lock was released while the {step} step still ran"
+        );
+
+        // The step runs to the end and releases the lock as it finishes.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lock.try_lock().is_err() {
+            assert!(Instant::now() < deadline, "the {step} step never finished");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(fs::read(dir.path().join(left)).unwrap(), body, "{step}");
+        assert_eq!(entries(dir.path()), [left], "{step}");
+    }
+}
+
+#[tokio::test]
+async fn a_body_is_written_off_the_runtime_thread() {
+    // A current-thread runtime runs every task on this thread, so a write done
+    // here holds up every other task for as long as the disk takes.
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("db.mmdb");
+    let body = mmdb_body(&vec![b'x'; 3 << 20]);
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .mount(&server)
+        .await;
+
+    raw_transfer(format!("{}/db.mmdb", server.uri()), dest.clone())
+        .run(&default_client())
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read(&dest).unwrap(), body);
+    let threads = testkit::threads_for(&dir.path().join("db.mmdb.part"));
+    let here = std::thread::current().id();
+    assert!(
+        !threads.is_empty() && threads.iter().all(|&thread| thread != here),
+        "the part file was written on {threads:?}, the runtime is on {here:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_destination_that_cannot_be_renamed_over_leaves_no_staged_file() {
     // A directory where the database belongs fails the final rename, and the
     // staged file has to go with it rather than sit there as a second copy.
@@ -1349,6 +1518,48 @@ async fn the_ipinfo_token_rides_as_a_query_parameter() {
     let url = &requests[0].url;
     assert_eq!(url.path(), "/data/ipinfo_lite.mmdb");
     assert_eq!(url.query(), Some("token=token-wxyz"));
+}
+
+#[tokio::test]
+async fn a_rejected_credential_is_not_sent_again_until_it_changes() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = default_client();
+
+    // The fingerprint of what each transfer sends, and the transfer itself.
+    let plan_at = |config: &GeoIpConfig| {
+        let transfer = planned(Kind::City, config, &server).remove(0);
+        (fingerprint(std::slice::from_ref(&transfer)), transfer)
+    };
+
+    let mut config = credentialled(dir.path(), GeoIpProvider::MaxMind);
+    let (asked, first) = plan_at(&config);
+    let dest = first.dest.clone();
+    let attempted = attempt("city", Some(&dest), asked, || first.run(&client)).await;
+    assert!(
+        matches!(
+            attempted,
+            Attempt::Ran(Err(GeoIpDownloadError::CredentialRejected { .. }))
+        ),
+        "{attempted:?}"
+    );
+
+    // The same credential would be refused the same way, so it costs nothing.
+    let (asked, again) = plan_at(&config);
+    let attempted = attempt("city", Some(&dest), asked, || again.run(&client)).await;
+    assert!(matches!(attempted, Attempt::Waiting(_)), "{attempted:?}");
+    assert_eq!(requested_paths(&server).await.len(), 1);
+
+    // A different credential is a different question, and is asked at once.
+    config.auto_download.maxmind_license_key = Some("licence-rotated".into());
+    let (asked, rotated) = plan_at(&config);
+    let attempted = attempt("city", Some(&dest), asked, || rotated.run(&client)).await;
+    assert!(matches!(attempted, Attempt::Ran(Err(_))), "{attempted:?}");
+    assert_eq!(requested_paths(&server).await.len(), 2);
 }
 
 #[tokio::test]
@@ -2137,7 +2348,7 @@ async fn a_body_shorter_than_its_content_length_is_rejected() {
     let mut chunks: Vec<Vec<u8>> = body.chunks(16).map(<[u8]>::to_vec).collect();
     let missing = chunks.pop().unwrap();
     let delivered = body.len() - missing.len();
-    let url = drip_server_promising(chunks, body.len(), Duration::from_millis(10));
+    let url = drip_server_promising(chunks, Some(body.len()), Duration::from_millis(10));
 
     let err = raw_transfer(url, dest.clone())
         .run(&default_client())
@@ -2156,6 +2367,48 @@ async fn a_body_shorter_than_its_content_length_is_rejected() {
     // prefix the next run resumes from.
     assert_eq!(fs::read(&dest).unwrap(), good);
     assert_eq!(fs::read(&part).unwrap().len(), delivered);
+}
+
+#[tokio::test]
+async fn a_body_past_the_size_ceiling_is_refused_and_removed() {
+    // A body that keeps arriving would otherwise write until the data
+    // filesystem fills, so the ceiling has to hold whether or not the server
+    // declares a length. A body exactly on it is admitted.
+    let fits = mmdb_body(b"a body exactly on the ceiling");
+    let over = mmdb_body(b"a body one byte past the ceiling!");
+    let limit = u64::try_from(fits.len()).unwrap();
+    assert!(over.len() > fits.len());
+
+    for (declared, body) in [(true, &fits), (false, &fits), (true, &over), (false, &over)] {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("db.mmdb");
+        let chunks: Vec<Vec<u8>> = body.chunks(16).map(<[u8]>::to_vec).collect();
+        let url = drip_server_promising(chunks, declared.then_some(body.len()), Duration::ZERO);
+
+        let result = raw_transfer(url, dest.clone())
+            .run_within(&default_client(), limit)
+            .await;
+
+        if body.len() == fits.len() {
+            assert_eq!(
+                fs::read(result.unwrap()).unwrap(),
+                *body,
+                "declared={declared}"
+            );
+        } else {
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, GeoIpDownloadError::TooLarge { limit: l, .. } if l == limit),
+                "declared={declared}: {err:?}"
+            );
+            assert!(!err.is_permanent(), "{err:?}");
+            assert!(
+                entries(dir.path()).is_empty(),
+                "declared={declared}: {:?} left behind",
+                entries(dir.path())
+            );
+        }
+    }
 }
 
 #[tokio::test]

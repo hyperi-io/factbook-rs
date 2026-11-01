@@ -407,6 +407,8 @@ pub struct AutoDownloadConfig {
     ///
     /// Reading the file needs the lookup engine, so a build without
     /// `geoip-lookup` accepts the setting and has nothing to ask the file with.
+    ///
+    /// A table source is loaded before it replaces the copy on disk either way.
     pub verify_content: bool,
 
     /// Smallest percentage of the copy it replaces a downloaded database may

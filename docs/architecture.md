@@ -40,7 +40,7 @@ A resident reader has no mapping to invalidate, so it is not exposed to that. Th
 
 Nothing dangles if a process dies mid-update:
 
-- The transfer holds an advisory lock on a `.lock` file beside the destination, so two processes sharing a data directory cannot interleave into it. That file exists for the lock alone: the part file is unlinked and recreated mid-transfer, and a lock follows the inode rather than the name. The kernel releases the lock when the process holding it goes away.
+- The transfer holds an advisory lock on a `.lock` file beside the destination, so two processes sharing a data directory cannot interleave into it. That file exists for the lock alone: the part file is unlinked and recreated mid-transfer, and a lock follows the inode rather than the name. The kernel releases the lock when the process holding it goes away. Cancelling the download does not release it early: the step renaming the staged file holds it until that file is placed or removed.
 - A second process finding the lock held is turned away before it makes a request, so it spends none of the provider's quota and reads what is on disk.
 - A panic while the readers are being swapped poisons a lock guarding a path and a timestamp. It is recovered rather than failing every refresh from then on.
 
@@ -48,11 +48,12 @@ Nothing dangles if a process dies mid-update:
 
 The transfer checks what arrives, and the guard checks the staged file before the rename. Nothing is ever checked at the destination, because a bad file there would carry a fresh modification time the freshness check would then refuse to replace.
 
-Six checks, in the order they run:
+Seven checks, in the order they run:
 
 ```mermaid
 flowchart LR
-    S[bytes arriving] --> L{promised length}
+    S[bytes arriving] --> C{4 GiB body ceiling}
+    C --> L{promised length}
     L --> G{published digest}
     G --> M{format marker}
     M --> Z{volume against the copy on disk}
@@ -61,6 +62,7 @@ flowchart LR
     T -->|all pass| R[atomic rename]
 
     L -.->|short body| Q[keep what arrived, to resume from]
+    C -.-> X
     G -.->|any fails| X[discard what arrived]
     M -.-> X
     Z -.-> X
@@ -72,7 +74,9 @@ flowchart LR
 
 A short body is the one refusal that keeps its bytes: they are a valid prefix of the file, so the next run continues from them with a `Range` request rather than re-fetching tens of megabytes.
 
-A refused or rate-limited download also writes a `.retry` stamp beside the lock: the time before which the database is not asked for again. A 429 waits as long as `Retry-After` says and any other refusal waits an hour, both capped at a day. The stale copy serves meanwhile, and a download that passes removes the stamp. Failures of the network itself start no wait.
+The body ceiling stops a response that never ends from filling the data filesystem. A declared length past it is refused before a byte lands, and either refusal starts the wait below.
+
+A refused or rate-limited download also writes a `.retry` stamp beside the lock: the time before which the database or table is not asked for again. A 429 waits as long as `Retry-After` says and any other refusal waits an hour, both capped at a day. The stale copy serves meanwhile, and a download that passes removes the stamp. Failures of the network itself start no wait. A rejected credential, a missing entitlement or another 4xx about the request is held back in memory instead, until the configuration behind the request changes or a day passes, so a restart with a corrected credential asks at once.
 
 The digest runs only where a publisher publishes one, and it is the expensive check: a full read and hash of the archive. The last three belong to the guard, which runs the volume floor first because two `stat` calls cost less than mapping a database. The last two of those never both apply -- a provider database is probed for an address and a table is loaded as the source states it (rows, width, key column and resident ceiling), and the guard is built carrying only the one its payload takes.
 
@@ -107,7 +111,7 @@ flowchart LR
     D --> X[refuse at load]
 ```
 
-The ceiling is hit, never predicted. Size on disk does not say whether a source fits -- encoding, quoting and column count all move the answer -- so the read fills memory and stops when it crosses the line. A CSV stops on a record and a JSON array on an element, so neither reader's peak is set by the file, and what the read had taken is released as the refusal unwinds. The refusal is early and cheap rather than an allocation failure at the end of the file.
+The ceiling is hit, never predicted. Size on disk does not say whether a source fits -- encoding, quoting and column count all move the answer -- so the read fills memory and stops when it crosses the line. A CSV stops partway through a field and a JSON array partway through an element, so neither reader's peak is set by the file, and what the read had taken is released as the refusal unwinds. The refusal is early and cheap rather than an allocation failure at the end of the file.
 
 Nothing sits behind that refusal today. Writing an oversized source out as a MaxMind DB and serving it mapped is future work, tracked as issue #2. `Table::backing()` and the `enrichment_table_backing` gauge already report where a table's rows are, so the answer keeps the shape it will have when there is a second place for them to be.
 

@@ -15,7 +15,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
-use crate::geoip::download::testkit::{gzip, sha256_hex};
+use crate::geoip::download::testkit::{self, gzip, sha256_hex};
 
 /// A CSV of two networks, keyed by autonomous system number.
 const NETWORKS: &str = "asn,name,country\n13335,CLOUDFLARENET,US\n15169,GOOGLE,US\n";
@@ -643,32 +643,81 @@ async fn a_replacement_the_load_would_refuse_leaves_the_previous_file_in_place()
     let renamed_key = "number,name\n1,one\n2,two\n";
     let too_big = operators(200);
 
-    for (replacement, resident_max_bytes) in [
+    // Content verification off still refuses a file the load would refuse.
+    for verify_content in [true, false] {
+        for (replacement, resident_max_bytes) in [
+            (
+                renamed_key,
+                AutoDownloadConfig::default().resident_max_bytes,
+            ),
+            (too_big.as_str(), 1024),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("networks.csv");
+            fs::write(&file, NETWORKS).unwrap();
+
+            let server = MockServer::start().await;
+            serve(&server, "networks.csv", replacement.as_bytes()).await;
+
+            let settings = AutoDownloadConfig {
+                resident_max_bytes,
+                verify_content,
+                // Under the default floor, so only the load decides.
+                min_size_percent: 0,
+                ..auto(dir.path())
+            };
+            let table = Table::ensure(&source_at(&server, "networks.csv"), &settings)
+                .await
+                .unwrap();
+
+            assert_eq!(table.len(), 2, "{replacement:?} verify={verify_content}");
+            assert_eq!(fs::read_to_string(&file).unwrap(), NETWORKS);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_refused_table_is_not_asked_for_again_inside_its_cool_down() {
+    for (refusal, response) in [
         (
-            renamed_key,
-            AutoDownloadConfig::default().resident_max_bytes,
+            "a rate limit",
+            ResponseTemplate::new(429).insert_header("retry-after", "600"),
         ),
-        (too_big.as_str(), 1024),
+        (
+            "a login page",
+            ResponseTemplate::new(200).set_body_bytes(b"<!DOCTYPE html><html></html>".to_vec()),
+        ),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("networks.csv");
         fs::write(&file, NETWORKS).unwrap();
-
         let server = MockServer::start().await;
-        serve(&server, "networks.csv", replacement.as_bytes()).await;
+        Mock::given(method("GET"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        let source = source_at(&server, "networks.csv");
 
-        let settings = AutoDownloadConfig {
-            resident_max_bytes,
-            // Under the default floor, so only the load decides.
-            min_size_percent: 0,
-            ..auto(dir.path())
-        };
-        let table = Table::ensure(&source_at(&server, "networks.csv"), &settings)
-            .await
-            .unwrap();
+        for _ in 0..2 {
+            let table = Table::ensure(&source, &auto(dir.path())).await.unwrap();
+            assert_eq!(table.len(), 2, "{refusal}");
+        }
+        let requests = server.received_requests().await.unwrap().len();
+        assert_eq!(requests, 1, "{refusal} let a second request through");
 
-        assert_eq!(table.len(), 2, "{replacement:?}");
-        assert_eq!(fs::read_to_string(&file).unwrap(), NETWORKS);
+        // With no copy to serve, the wait is reported rather than spent on a
+        // request.
+        fs::remove_file(&file).unwrap();
+        let err = Table::ensure(&source, &auto(dir.path())).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TableError::Fetch(GeoIpDownloadError::CoolingDown { wait_secs, .. })
+                    if wait_secs > 0
+            ),
+            "{refusal}: {err:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }
 
@@ -908,9 +957,11 @@ async fn a_schema_that_names_its_columns_refuses_a_file_of_another_width() {
     assert!(!dir.path().join("networks.csv").exists());
 
     // The same body under a schema taken from the file is admitted, so it is
-    // the declared width doing the refusing.
+    // the declared width doing the refusing. A fresh directory, because the
+    // refusal above holds this one back for its cool-down.
     source.schema = Schema::Auto;
-    let table = Table::ensure(&source, &auto(dir.path())).await.unwrap();
+    let fresh = tempfile::tempdir().unwrap();
+    let table = Table::ensure(&source, &auto(fresh.path())).await.unwrap();
     assert_eq!(table.len(), 2);
 }
 
@@ -970,6 +1021,24 @@ async fn a_table_that_fits_is_held_in_memory() {
 }
 
 #[tokio::test]
+async fn a_table_is_read_and_indexed_off_the_runtime_thread() {
+    // A current-thread runtime runs every task on this thread, so a load done
+    // here would hold up every other task for the length of the file.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("networks.csv");
+    fs::write(&file, operators(200)).unwrap();
+
+    let table = Table::ensure(&local("networks.csv"), &offline(dir.path()))
+        .await
+        .unwrap();
+
+    assert_eq!(table.len(), 200);
+    let threads = testkit::threads_for(&file);
+    assert_eq!(threads.len(), 1, "{threads:?}");
+    assert_ne!(threads[0], std::thread::current().id());
+}
+
+#[tokio::test]
 async fn a_table_that_will_not_fit_is_refused_at_load() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("networks.csv"), operators(200)).unwrap();
@@ -995,4 +1064,63 @@ async fn a_table_that_will_not_fit_is_refused_at_load() {
         .await
         .unwrap();
     assert_eq!(table.len(), 200);
+}
+
+#[tokio::test]
+async fn the_index_is_held_to_the_ceiling_with_the_rows() {
+    use std::fmt::Write as _;
+
+    let ranges = (0..200u32).fold(String::from("network,name\n"), |mut body, at| {
+        let _ = writeln!(body, "10.{}.{}.0/24,range-{at}", at / 256, at % 256);
+        body
+    });
+
+    for (body, index) in [
+        (operators(200), Index::Column("asn".to_string())),
+        (ranges, Index::Prefix),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("networks.csv"), &body).unwrap();
+        let source = TableSource {
+            index: index.clone(),
+            ..local("networks.csv")
+        };
+
+        // The smallest ceiling the rows alone fit under.
+        let fits = |ceiling| {
+            parse::read(
+                body.as_bytes(),
+                TableFormat::Csv { header: true },
+                &Schema::Auto,
+                ceiling,
+            )
+            .is_ok()
+        };
+        let (mut low, mut high) = (0u64, 1 << 20);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if fits(mid) { high = mid } else { low = mid + 1 }
+        }
+
+        // Every key is distinct, so the index costs at least as much as the rows.
+        for (ceiling, admitted) in [(low, false), (low * 4, true)] {
+            let settings = AutoDownloadConfig {
+                resident_max_bytes: ceiling,
+                ..offline(dir.path())
+            };
+            let loaded = Table::ensure(&source, &settings).await;
+            assert_eq!(
+                loaded.is_ok(),
+                admitted,
+                "{index:?} under {ceiling}: {:?}",
+                loaded.as_ref().err()
+            );
+            if let Err(err) = loaded {
+                assert!(
+                    matches!(err, TableError::OverResidentCeiling { .. }),
+                    "{err:?}"
+                );
+            }
+        }
+    }
 }

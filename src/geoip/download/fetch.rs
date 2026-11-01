@@ -23,12 +23,15 @@
 //! timeout rather than a total one.
 
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use flate2::read::MultiGzDecoder;
 use reqwest::{Client, RequestBuilder, StatusCode};
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use super::verify::Guard;
@@ -73,6 +76,12 @@ const SHA256_HEX_LEN: usize = 64;
 /// Ceiling on a digest body. `sha256sum` output is one short line, so anything
 /// past this is not a digest and is refused rather than buffered.
 const CHECKSUM_BODY_LIMIT: usize = 4 * 1024;
+
+/// Bytes gathered before a write is handed to the blocking pool.
+///
+/// Large enough that a transfer costs a few hundred hops to the pool rather than
+/// one per chunk, small enough that the two batches a writer holds stay cheap.
+const WRITE_BATCH_BYTES: usize = 1024 * 1024;
 
 /// What replaces a query value in a URL that is about to be logged.
 const REDACTED: &str = "<redacted>";
@@ -153,6 +162,14 @@ const DIGEST_BUFFER_BYTES: usize = 64 * 1024;
 /// 200 MB.
 const MAX_EXPANDED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
+/// Ceiling on the bytes one response body may write to its part file.
+///
+/// A body that keeps arriving would otherwise fill the data filesystem before
+/// the expansion ceiling is ever reached, and a raw body never meets that one at
+/// all. A compressed body is no larger than what it expands to, so the one
+/// figure bounds both.
+const MAX_BODY_BYTES: u64 = MAX_EXPANDED_BYTES;
+
 /// Openers of a markup document, lowercase, for a payload that should be text.
 const MARKUP_OPENERS: [&[u8]; 3] = [b"<!doctype", b"<html", b"<?xml"];
 
@@ -220,6 +237,25 @@ impl Credential {
         }
     }
 
+    /// Feed what this credential sends into `state`.
+    fn identify(&self, state: &mut impl Hasher) {
+        match self {
+            Self::None => state.write_u8(0),
+            Self::Basic {
+                username, password, ..
+            } => {
+                state.write_u8(1);
+                username.expose().hash(state);
+                password.expose().hash(state);
+            }
+            Self::QueryToken { name, value, .. } => {
+                state.write_u8(2);
+                name.hash(state);
+                value.expose().hash(state);
+            }
+        }
+    }
+
     /// Config fields this credential was read from, when there is one.
     const fn fields(&self) -> Option<&'static str> {
         match self {
@@ -278,6 +314,15 @@ pub(crate) struct Transfer {
 }
 
 impl Transfer {
+    /// Feed everything this transfer sends, and where it writes, into `state`.
+    pub(crate) fn identify(&self, state: &mut impl Hasher) {
+        self.url.hash(state);
+        self.fallback_url.hash(state);
+        self.checksum_url.hash(state);
+        self.dest.hash(state);
+        self.credential.identify(state);
+    }
+
     /// The same transfer with nothing checked beyond the format and the digest.
     ///
     /// This is the shape the transport, archive and status cases are asserted
@@ -285,6 +330,17 @@ impl Transfer {
     #[cfg(test)]
     pub(crate) async fn run(self, client: &Client) -> Result<PathBuf, GeoIpDownloadError> {
         self.run_guarded(client, Guard::OFF).await
+    }
+
+    /// The same, refusing a body past `limit` bytes, so a test reaches the
+    /// refusal without transferring four gigabytes.
+    #[cfg(test)]
+    pub(crate) async fn run_within(
+        self,
+        client: &Client,
+        limit: u64,
+    ) -> Result<PathBuf, GeoIpDownloadError> {
+        self.fetch(client, Guard::OFF, limit).await
     }
 
     /// Fetch, materialise and atomically move the database into place, refusing
@@ -295,6 +351,16 @@ impl Transfer {
         self,
         client: &Client,
         guard: Guard,
+    ) -> Result<PathBuf, GeoIpDownloadError> {
+        self.fetch(client, guard, MAX_BODY_BYTES).await
+    }
+
+    /// [`Self::run_guarded`], refusing a body past `limit` bytes.
+    async fn fetch(
+        self,
+        client: &Client,
+        guard: Guard,
+        limit: u64,
     ) -> Result<PathBuf, GeoIpDownloadError> {
         if let Some(parent) = self.dest.parent() {
             fs::create_dir_all(parent)?;
@@ -345,11 +411,15 @@ impl Transfer {
             "downloading GeoIP database"
         );
 
+        // Shared with every write handed to the blocking pool, so a cancelled
+        // transfer keeps the lock until its last write has landed.
+        let lock = Arc::new(lock);
+
         // A failure keeps the part file: what it holds is a valid prefix of the
         // body, and the next run resumes from it rather than re-fetching tens of
         // megabytes. Only materialise writes the destination, so a part file is
         // never mistaken for a database.
-        let bytes = match self.stream_with_fallback(client, &part).await {
+        let bytes = match self.stream_with_fallback(client, &part, &lock, limit).await {
             Ok(bytes) => bytes,
             Err(e) => {
                 // A transfer that wrote nothing leaves no part file behind, so
@@ -380,12 +450,18 @@ impl Transfer {
         let archive = self.archive;
         let format = self.format;
         let staged = with_extension(&dest, STAGE_EXT);
+        // The lock moves into the blocking step, because a cancelled caller
+        // drops this future and not that step: it is released only once the
+        // part and staged files are renamed or removed.
         let final_size = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            super::testkit::checkpoint(&dest);
             let result = materialise_guarded(&part, &staged, &dest, archive, format, &guard);
             let _ = fs::remove_file(&part);
             if result.is_err() {
                 let _ = fs::remove_file(&staged);
             }
+            drop(lock);
             result
         })
         .await?
@@ -422,8 +498,10 @@ impl Transfer {
         &self,
         client: &Client,
         part: &Path,
+        lock: &Arc<fs::File>,
+        limit: u64,
     ) -> Result<u64, GeoIpDownloadError> {
-        let primary = self.stream_to(client, &self.url, part).await;
+        let primary = self.stream_to(client, &self.url, part, lock, limit).await;
 
         let Some(fallback) = self.fallback_url.as_deref() else {
             return primary;
@@ -443,7 +521,7 @@ impl Transfer {
         // The fallback is a different file, so anything already transferred
         // belongs to the other URL and cannot be resumed into this one.
         let _ = fs::remove_file(part);
-        self.stream_to(client, fallback, part).await
+        self.stream_to(client, fallback, part, lock, limit).await
     }
 
     /// Stream the response body of `url` to `part`, returning the total bytes
@@ -453,6 +531,8 @@ impl Transfer {
         client: &Client,
         url: &str,
         part: &Path,
+        lock: &Arc<fs::File>,
+        limit: u64,
     ) -> Result<u64, GeoIpDownloadError> {
         // Called either way: it also drops a part file past the resume window,
         // which has to happen whether or not the offset is usable.
@@ -463,25 +543,31 @@ impl Transfer {
             0
         };
 
-        match self.stream_from(client, url, part, resume_from).await {
+        match self
+            .stream_from(client, url, part, lock, resume_from, limit)
+            .await
+        {
             // A part file already as long as the body makes the range start at
             // its end, which a server answers with 416.
             Err(GeoIpDownloadError::UnexpectedStatus { status: 416, .. }) if resume_from > 0 => {
                 let _ = fs::remove_file(part);
-                self.stream_from(client, url, part, 0).await
+                self.stream_from(client, url, part, lock, 0, limit).await
             }
             other => other,
         }
     }
 
     /// Stream `url` to `part`, continuing from byte `resume_from` when it is
-    /// above zero.
+    /// above zero, and refusing a body that would leave the part file past
+    /// `limit` bytes.
     async fn stream_from(
         &self,
         client: &Client,
         url: &str,
         part: &Path,
+        lock: &Arc<fs::File>,
         resume_from: u64,
+        limit: u64,
     ) -> Result<u64, GeoIpDownloadError> {
         let mut request = self.credential.apply(client.get(url));
         if resume_from > 0 {
@@ -508,17 +594,32 @@ impl Transfer {
         // the whole body, so the prefix is discarded rather than appended to --
         // appending it would silently build a corrupt file.
         let resuming = resume_from > 0 && status == StatusCode::PARTIAL_CONTENT;
-        let mut file = if resuming {
-            fs::OpenOptions::new().append(true).open(part)?
-        } else {
-            fs::File::create(part)?
-        };
         let mut written = if resuming { resume_from } else { 0 };
         // What the part file already held. A range the server ignored leaves
         // `resume_from` set while nothing was kept, so the rate has to measure
         // against this rather than against `resume_from`.
         let carried = written;
-        let expected = response.content_length().map(|length| length + written);
+        let expected = response
+            .content_length()
+            .map(|length| length.saturating_add(written));
+
+        // A declared length past the ceiling is refused before a byte lands,
+        // and any prefix kept for it goes too: it belongs to a body that can
+        // never be admitted.
+        if expected.is_some_and(|expected| expected > limit) {
+            let _ = fs::remove_file(part);
+            return Err(GeoIpDownloadError::TooLarge {
+                url: loggable(url),
+                limit,
+            });
+        }
+
+        let file = if resuming {
+            fs::OpenOptions::new().append(true).open(part)?
+        } else {
+            fs::File::create(part)?
+        };
+        let mut writer = PartWriter::new(file, part, lock);
 
         if resume_from > 0 {
             info!(
@@ -531,16 +632,36 @@ impl Transfer {
 
         let started = Instant::now();
         let mut reported = Instant::now();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(reqwest::Error::without_url)?
-        {
+        loop {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                // What arrived is a valid prefix, so it is landed for the next
+                // run to resume from.
+                Err(e) => {
+                    if writer.finish().await.is_err() {
+                        let _ = fs::remove_file(part);
+                    }
+                    return Err(e.without_url().into());
+                }
+            };
+
+            // An undeclared or understated length is caught here, before the
+            // chunk that would cross the ceiling is written.
+            if written.saturating_add(chunk.len() as u64) > limit {
+                drop(writer);
+                let _ = fs::remove_file(part);
+                return Err(GeoIpDownloadError::TooLarge {
+                    url: loggable(url),
+                    limit,
+                });
+            }
+
             // A write that fails leaves the part file in a state this process
             // cannot describe -- a full disk truncates it silently -- so it goes
             // rather than being resumed from.
-            if let Err(e) = io::Write::write_all(&mut file, &chunk) {
-                drop(file);
+            if let Err(e) = writer.write(&chunk).await {
+                drop(writer);
                 let _ = fs::remove_file(part);
                 return Err(e.into());
             }
@@ -558,8 +679,7 @@ impl Transfer {
             }
         }
 
-        if let Err(e) = io::Write::flush(&mut file) {
-            drop(file);
+        if let Err(e) = writer.finish().await {
             let _ = fs::remove_file(part);
             return Err(e.into());
         }
@@ -580,6 +700,107 @@ impl Transfer {
 
         Ok(written)
     }
+}
+
+/// A part file written on the blocking pool, one batch in flight at a time.
+///
+/// Holds at most two batches: the one gathering and the one being written.
+struct PartWriter {
+    /// The file, while no write holds it.
+    file: Option<fs::File>,
+
+    /// The write in flight, which hands back the file, its emptied buffer and
+    /// how the write went.
+    pending: Option<JoinHandle<(fs::File, Vec<u8>, io::Result<()>)>>,
+
+    /// Bytes gathered for the next write.
+    gathered: Vec<u8>,
+
+    /// A buffer a finished write handed back, reused for the next batch.
+    spare: Vec<u8>,
+
+    /// The transfer's lock, held by every write in flight.
+    lock: Arc<fs::File>,
+
+    /// The part file's path, for the test checkpoint.
+    #[cfg(test)]
+    path: PathBuf,
+}
+
+impl PartWriter {
+    /// A writer over `file`, the part file open at `path`.
+    fn new(file: fs::File, path: &Path, lock: &Arc<fs::File>) -> Self {
+        #[cfg(not(test))]
+        let _ = path;
+        Self {
+            file: Some(file),
+            pending: None,
+            gathered: Vec::with_capacity(WRITE_BATCH_BYTES),
+            spare: Vec::new(),
+            lock: Arc::clone(lock),
+            #[cfg(test)]
+            path: path.to_path_buf(),
+        }
+    }
+
+    /// Gather `chunk`, handing a full batch to the blocking pool.
+    ///
+    /// A failed write is reported by a later call, once it has landed.
+    async fn write(&mut self, chunk: &[u8]) -> io::Result<()> {
+        self.gathered.extend_from_slice(chunk);
+        if self.gathered.len() >= WRITE_BATCH_BYTES {
+            self.send().await?;
+        }
+        Ok(())
+    }
+
+    /// Write whatever is gathered, wait for every write to land, and flush.
+    async fn finish(mut self) -> io::Result<()> {
+        if !self.gathered.is_empty() {
+            self.send().await?;
+        }
+        self.settle().await?;
+        match self.file.take() {
+            Some(mut file) => io::Write::flush(&mut file),
+            None => Err(lost()),
+        }
+    }
+
+    /// Hand the gathered bytes to the blocking pool once the last write lands.
+    async fn send(&mut self) -> io::Result<()> {
+        self.settle().await?;
+        let mut file = self.file.take().ok_or_else(lost)?;
+        let mut batch = std::mem::replace(&mut self.gathered, std::mem::take(&mut self.spare));
+        let lock = Arc::clone(&self.lock);
+        #[cfg(test)]
+        let path = self.path.clone();
+
+        self.pending = Some(tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            super::testkit::checkpoint(&path);
+            let written = io::Write::write_all(&mut file, &batch);
+            drop(lock);
+            batch.clear();
+            (file, batch, written)
+        }));
+        Ok(())
+    }
+
+    /// Wait for the write in flight, taking the file back.
+    async fn settle(&mut self) -> io::Result<()> {
+        let Some(write) = self.pending.take() else {
+            return Ok(());
+        };
+        let (file, spare, written) = write.await.map_err(io::Error::from)?;
+        self.file = Some(file);
+        self.spare = spare;
+        written
+    }
+}
+
+/// The error for a writer whose file went with a write that never returned.
+fn lost() -> io::Error {
+    io::Error::other("the part file was lost to a write that did not complete")
 }
 
 /// Turn a refusing response into the error that describes it.

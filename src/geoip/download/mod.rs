@@ -22,7 +22,7 @@
 //!
 //! # Credentials
 //!
-//! MaxMind and IPinfo credentials are [`Secret`] and never reach a log line.
+//! MaxMind and IPinfo credentials are [`Secret`](crate::Secret) and never reach a log line.
 //! The IPinfo token is attached as a query parameter by the request builder
 //! rather than being formatted into the URL string, and a transport error is
 //! stripped of its URL before it is reported, so neither the logged URL nor the
@@ -50,6 +50,7 @@ pub(crate) mod source;
 pub(crate) mod verify;
 
 use std::fs;
+use std::hash::{DefaultHasher, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -120,11 +121,12 @@ pub enum GeoIpDownloadError {
         member: &'static str,
     },
 
-    /// The body expanded past the ceiling decompression is allowed.
+    /// The body, or what it expanded to, ran past the size ceiling.
     ///
-    /// A compressed body states nothing reliable about its expanded size, so a
-    /// hostile or corrupt one would otherwise write until the filesystem fills.
-    #[error("{url} expanded past the {limit} byte ceiling")]
+    /// Neither a response that keeps arriving nor a compressed body states its
+    /// final size reliably, so a hostile or corrupt one would otherwise write
+    /// until the filesystem fills.
+    #[error("{url} ran past the {limit} byte ceiling")]
     TooLarge {
         /// URL that was requested, without any credential.
         url: String,
@@ -264,6 +266,16 @@ pub enum GeoIpDownloadError {
         /// Length that arrived.
         actual: u64,
     },
+
+    /// A recent refusal holds the next request back, and there is no copy on
+    /// disk to serve meanwhile.
+    #[error("{path} is not fetched again for another {wait_secs} seconds after its last refusal")]
+    CoolingDown {
+        /// File the refusal was for.
+        path: String,
+        /// Seconds before the next request is made.
+        wait_secs: u64,
+    },
 }
 
 impl GeoIpDownloadError {
@@ -309,6 +321,7 @@ impl GeoIpDownloadError {
             | Self::Unpopulated { .. }
             | Self::Undersized { .. }
             | Self::Truncated { .. }
+            | Self::TooLarge { .. }
             | Self::ArchiveMemberMissing { .. } => "refused",
             _ => "failed",
         }
@@ -517,35 +530,29 @@ async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
         return Some(database);
     }
 
-    // A database the provider has just refused is not asked for again until its
-    // cool-down passes, and the stale copy serves meanwhile.
-    let stamped = database.files.first();
-    if stamped.is_none_or(|file| cooldown::wait_for(file, kind.label()).is_none()) {
-        match download(kind, config).await {
-            Ok(files) => {
-                if let Some(file) = stamped {
-                    cooldown::clear(file);
-                }
-                telemetry::attempt(kind.label(), "ok");
-                age(&files);
-                return Some(Database {
-                    format: database.format,
-                    files,
-                });
-            }
-            Err(e) => {
-                telemetry::attempt(kind.label(), e.outcome());
-                warn!(
-                    kind = kind.label(),
-                    error = %e,
-                    provider = ?choice,
-                    "GeoIP database download failed"
-                );
-                if let Some(file) = stamped {
-                    cooldown::begin(file, &e);
-                }
-            }
+    let stamp = database.files.first().map(PathBuf::as_path);
+    // A configuration that cannot be planned costs no request, so any one
+    // fingerprint serves it.
+    let asked = plan(kind, config).map_or(0, |transfers| fingerprint(&transfers));
+    match attempt(kind.label(), stamp, asked, || download(kind, config)).await {
+        Attempt::Ran(Ok(files)) => {
+            telemetry::attempt(kind.label(), "ok");
+            age(&files);
+            return Some(Database {
+                format: database.format,
+                files,
+            });
         }
+        Attempt::Ran(Err(e)) => {
+            telemetry::attempt(kind.label(), e.outcome());
+            warn!(
+                kind = kind.label(),
+                error = %e,
+                provider = ?choice,
+                "GeoIP database download failed"
+            );
+        }
+        Attempt::Waiting(_) => {}
     }
 
     // A stale database still answers most lookups correctly, so it beats
@@ -673,6 +680,56 @@ async fn download(kind: Kind, config: &GeoIpConfig) -> Result<Vec<PathBuf>, GeoI
         files.push(transfer.run_guarded(&client, guard.clone()).await?);
     }
     Ok(files)
+}
+
+/// How one attempt at a download came out.
+#[derive(Debug)]
+pub(crate) enum Attempt<T> {
+    /// The file is cooling down for this long yet, so nothing was asked.
+    Waiting(Duration),
+
+    /// The fetch ran, and ended so.
+    Ran(Result<T, GeoIpDownloadError>),
+}
+
+/// Run `fetch` unless the file stamped at `stamp` is cooling down.
+///
+/// A file the provider has just refused is not asked for again until its
+/// cool-down passes, and the stale copy serves meanwhile. `fingerprint` names
+/// the configuration the request is made under, so a permanent failure holds
+/// back that configuration and no other.
+pub(crate) async fn attempt<T, F>(
+    kind: &'static str,
+    stamp: Option<&Path>,
+    fingerprint: u64,
+    fetch: impl FnOnce() -> F,
+) -> Attempt<T>
+where
+    F: Future<Output = Result<T, GeoIpDownloadError>>,
+{
+    if let Some(wait) = stamp.and_then(|file| cooldown::wait_for(file, kind, fingerprint)) {
+        return Attempt::Waiting(wait);
+    }
+
+    let result = fetch().await;
+    if let Some(file) = stamp {
+        match &result {
+            Ok(_) => cooldown::clear(file),
+            Err(e) => cooldown::begin(file, e, fingerprint),
+        }
+    }
+    Attempt::Ran(result)
+}
+
+/// A digest of everything a set of transfers sends, credential included.
+///
+/// Held in memory only, and never logged.
+pub(crate) fn fingerprint(transfers: &[Transfer]) -> u64 {
+    let mut state = DefaultHasher::new();
+    for transfer in transfers {
+        transfer.identify(&mut state);
+    }
+    state.finish()
 }
 
 /// The transfers that fetch one database.

@@ -72,6 +72,7 @@ impl GeoIp {
         let mut next = Readers {
             city: current.city.clone(),
             asn: current.asn.clone(),
+            generation: current.generation,
         };
         let mut changed = false;
         let mut failure = None;
@@ -454,6 +455,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_expired_answer_read_before_a_refresh_is_not_served_after_it() {
+        // The re-read of an expired answer inserts without a placeholder, so a
+        // refresh landing between its read and its insert cannot clear it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.mmdb");
+        replace(&path, ASN_DB, at(0));
+        let max_age = Duration::from_millis(300);
+        let geoip = GeoIp::open(
+            DatabasePaths::asn_only(&path),
+            CacheConfig {
+                max_age: Some(max_age),
+                ..CacheConfig::default()
+            },
+        )
+        .unwrap();
+        let probe = IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1));
+        assert!(geoip.lookup(probe).is_some());
+        thread::sleep(max_age + Duration::from_millis(50));
+
+        let (has_read, release) = crate::geoip::enricher::pause::hold();
+        let reread = {
+            let geoip = geoip.clone();
+            thread::spawn(move || geoip.lookup(probe))
+        };
+        has_read.recv().unwrap();
+        replace(&path, CITY_DB, at(60));
+        assert!(geoip.refresh_if_changed().unwrap());
+        release.send(()).unwrap();
+        assert!(reread.join().unwrap().is_some(), "read from the old file");
+
+        // Well inside the age limit, so only the swap can make it stale. The
+        // city database holds no record for the probe.
+        assert!(geoip.lookup(probe).is_none(), "served from the old file");
     }
 
     #[test]
