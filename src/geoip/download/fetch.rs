@@ -380,12 +380,18 @@ impl Transfer {
         let archive = self.archive;
         let format = self.format;
         let staged = with_extension(&dest, STAGE_EXT);
+        // The lock moves into the blocking step, because a cancelled caller
+        // drops this future and not that step: it is released only once the
+        // part and staged files are renamed or removed.
         let final_size = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            super::testkit::materialise_point(&dest);
             let result = materialise_guarded(&part, &staged, &dest, archive, format, &guard);
             let _ = fs::remove_file(&part);
             if result.is_err() {
                 let _ = fs::remove_file(&staged);
             }
+            drop(lock);
             result
         })
         .await?

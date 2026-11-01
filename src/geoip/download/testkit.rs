@@ -14,6 +14,53 @@
 //! sha256 of any of them -- so they are built here rather than three times.
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::mpsc;
+
+/// Destinations whose next materialise step waits for the test holding it.
+static HELD: Mutex<Vec<(PathBuf, Hold)>> = Mutex::new(Vec::new());
+
+/// The two ends of one held materialise step.
+struct Hold {
+    /// Fires once the step has started.
+    entered: mpsc::Sender<()>,
+    /// Lets the step go on.
+    release: mpsc::Receiver<()>,
+}
+
+/// Hold the next materialise into `dest` on the blocking pool until the test
+/// lets it go.
+///
+/// Returns a receiver that fires once the step has started, and the sender that
+/// releases it.
+pub(crate) fn hold_materialise(dest: &Path) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+    let (entered, has_entered) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    HELD.lock().unwrap().push((
+        dest.to_path_buf(),
+        Hold {
+            entered,
+            release: released,
+        },
+    ));
+    (has_entered, release)
+}
+
+/// Wait here while a test holds `dest`. Blocking, and a no-op for any
+/// destination no test is holding.
+pub(crate) fn materialise_point(dest: &Path) {
+    let hold = {
+        let mut held = HELD.lock().unwrap();
+        held.iter()
+            .position(|(path, _)| path == dest)
+            .map(|at| held.remove(at).1)
+    };
+    if let Some(hold) = hold {
+        let _ = hold.entered.send(());
+        let _ = hold.release.recv();
+    }
+}
 
 /// Marker that opens the metadata section of a MaxMind DB file.
 const MMDB_MARKER: &[u8] = b"\xab\xcd\xefMaxMind.com";

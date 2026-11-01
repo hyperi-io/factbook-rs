@@ -1279,6 +1279,55 @@ async fn a_transfer_in_flight_turns_a_second_transfer_of_the_same_database_away(
 }
 
 #[tokio::test]
+async fn a_cancelled_transfer_holds_its_lock_until_the_file_is_in_place() {
+    // Dropping the future does not stop the blocking step it handed the part
+    // file to. A second writer let in at that point recreates the part and
+    // staged files the first is still verifying and renaming.
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("db.mmdb");
+    let body = mmdb_body(b"the database the cancelled transfer is placing");
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .mount(&server)
+        .await;
+
+    let (entered, release) = testkit::hold_materialise(&dest);
+    let transfer = tokio::spawn({
+        let (url, dest) = (format!("{}/db.mmdb", server.uri()), dest.clone());
+        async move { raw_transfer(url, dest).run(&default_client()).await }
+    });
+
+    tokio::task::spawn_blocking(move || entered.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    transfer.abort();
+    assert!(transfer.await.unwrap_err().is_cancelled());
+
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.path().join("db.mmdb.lock"))
+        .unwrap();
+    let held = matches!(lock.try_lock(), Err(fs::TryLockError::WouldBlock));
+    release.send(()).unwrap();
+    assert!(
+        held,
+        "the lock was released while the blocking step still owned the part file"
+    );
+
+    // The step runs to the end and releases the lock as it finishes.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while lock.try_lock().is_err() {
+        assert!(Instant::now() < deadline, "the blocking step never finished");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(fs::read(&dest).unwrap(), body);
+    assert_eq!(entries(dir.path()), ["db.mmdb"]);
+}
+
+#[tokio::test]
 async fn a_destination_that_cannot_be_renamed_over_leaves_no_staged_file() {
     // A directory where the database belongs fails the final rename, and the
     // staged file has to go with it rather than sit there as a second copy.
