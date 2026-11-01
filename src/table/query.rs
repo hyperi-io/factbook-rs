@@ -241,7 +241,7 @@ impl Table {
             Some(plan) => {
                 let walk = self.narrow(&query, &plan).map_or_else(
                     || Walk::All(0..self.rows.len()),
-                    |lists| Walk::Listed { lists, next: 0 },
+                    |lists| Walk::Listed { lists },
                 );
                 (plan, walk)
             }
@@ -394,38 +394,41 @@ enum Walk<'a> {
     /// Every row, in file order.
     All(Range<usize>),
 
-    /// The lists the index narrowed to, walked in order.
+    /// The lists the index narrowed to, merged back into file order.
+    ///
+    /// Each list is ascending, because rows are filed as they are read.
     Listed {
         /// Positions still to walk, per list.
         lists: [&'a [usize]; LISTS],
-
-        /// List the walk is on.
-        next: usize,
     },
 }
 
 impl Walk<'_> {
     /// A walk over no rows at all.
     const fn nothing() -> Self {
-        Self::Listed {
-            lists: NOTHING,
-            next: 0,
-        }
+        Self::Listed { lists: NOTHING }
     }
 
     /// The next position to test.
+    ///
+    /// The lowest head among the lists, so a wildcard row filed before an exact
+    /// one is still tested first. A position at the head of more than one list
+    /// is taken from all of them and handed back once.
     fn pop(&mut self) -> Option<usize> {
         match self {
             Self::All(all) => all.next(),
-            Self::Listed { lists, next } => {
-                while *next < LISTS {
-                    if let Some((first, rest)) = lists[*next].split_first() {
-                        lists[*next] = rest;
-                        return Some(*first);
+            Self::Listed { lists } => {
+                let lowest = lists
+                    .iter()
+                    .filter_map(|list| list.first())
+                    .min()
+                    .copied()?;
+                for list in lists.iter_mut() {
+                    if list.first() == Some(&lowest) {
+                        *list = &list[1..];
                     }
-                    *next += 1;
                 }
-                None
+                Some(lowest)
             }
         }
     }
@@ -434,7 +437,7 @@ impl Walk<'_> {
     fn remaining(&self) -> usize {
         match self {
             Self::All(all) => all.len(),
-            Self::Listed { lists, next } => lists[*next..].iter().map(|list| list.len()).sum(),
+            Self::Listed { lists } => lists.iter().map(|list| list.len()).sum(),
         }
     }
 }
@@ -886,6 +889,103 @@ mod tests {
 
         let query = Query::new(&conditions).wildcard("*");
         assert_eq!(found(&table, query, "rate"), ["0.20"]);
+    }
+
+    #[test]
+    fn indexed_rows_come_back_in_file_order_whichever_list_holds_them() {
+        // Detection samples the head of the file, so the row the address index
+        // cannot file (`unfiled`) and the repeat of a key both sit past 70 rows.
+        let mut address_rows = String::from("ip,operator\n");
+        for at in 0..70 {
+            let _ = std::fmt::Write::write_fmt(
+                &mut address_rows,
+                format_args!("10.0.0.{at},OPERATOR-{at}\n"),
+            );
+        }
+        address_rows.push_str("unfiled,UNFILED\n10.0.0.7,AGAIN\n");
+
+        // (table body, index, key, wildcard, operator column, expected order)
+        let cases: [(&str, Index, &str, Option<&str>, &str, &[&str]); 6] = [
+            (
+                "country,rate\n*,w1\nAU,e1\n*,w2\nAU,e2\n",
+                Index::Column("country".to_string()),
+                "AU",
+                Some("*"),
+                "rate",
+                &["w1", "e1", "w2", "e2"],
+            ),
+            (
+                "country,rate\n*,w1\nNZ,x\n*,w2\n",
+                Index::Column("country".to_string()),
+                "AU",
+                Some("*"),
+                "rate",
+                &["w1", "w2"],
+            ),
+            (
+                "country,rate\nAU,e1\nAU,e2\n",
+                Index::Column("country".to_string()),
+                "AU",
+                Some("*"),
+                "rate",
+                &["e1", "e2"],
+            ),
+            (
+                "country,rate\nNZ,x\n",
+                Index::Column("country".to_string()),
+                "AU",
+                Some("*"),
+                "rate",
+                &[],
+            ),
+            (
+                "country,rate\n*,w\n",
+                Index::Column("country".to_string()),
+                "*",
+                Some("*"),
+                "rate",
+                &["w"],
+            ),
+            (
+                &address_rows,
+                Index::Ip,
+                "10.0.0.7",
+                Some("unfiled"),
+                "operator",
+                &["OPERATOR-7", "UNFILED", "AGAIN"],
+            ),
+        ];
+
+        for (body, index, key, wildcard, column, expected) in cases {
+            let table = table(body, &index);
+            let conditions = [eq(
+                match index {
+                    Index::Ip => "ip",
+                    _ => "country",
+                },
+                key,
+            )];
+            let mut query = Query::new(&conditions);
+            if let Some(w) = wildcard {
+                query = query.wildcard(w);
+            }
+
+            assert_eq!(found(&table, query, column), expected, "key {key}");
+        }
+    }
+
+    #[test]
+    fn a_position_in_two_lists_is_walked_once_and_the_lists_merge_by_row() {
+        let mut walk = Walk::Listed {
+            lists: [&[1, 4, 9], &[2, 4, 8], &[4, 5]],
+        };
+
+        let mut order = Vec::new();
+        while let Some(at) = walk.pop() {
+            order.push(at);
+        }
+
+        assert_eq!(order, [1, 2, 4, 5, 8, 9]);
     }
 
     #[test]
