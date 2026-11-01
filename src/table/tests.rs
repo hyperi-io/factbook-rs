@@ -643,32 +643,36 @@ async fn a_replacement_the_load_would_refuse_leaves_the_previous_file_in_place()
     let renamed_key = "number,name\n1,one\n2,two\n";
     let too_big = operators(200);
 
-    for (replacement, resident_max_bytes) in [
-        (
-            renamed_key,
-            AutoDownloadConfig::default().resident_max_bytes,
-        ),
-        (too_big.as_str(), 1024),
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("networks.csv");
-        fs::write(&file, NETWORKS).unwrap();
+    // Content verification off still refuses a file the load would refuse.
+    for verify_content in [true, false] {
+        for (replacement, resident_max_bytes) in [
+            (
+                renamed_key,
+                AutoDownloadConfig::default().resident_max_bytes,
+            ),
+            (too_big.as_str(), 1024),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("networks.csv");
+            fs::write(&file, NETWORKS).unwrap();
 
-        let server = MockServer::start().await;
-        serve(&server, "networks.csv", replacement.as_bytes()).await;
+            let server = MockServer::start().await;
+            serve(&server, "networks.csv", replacement.as_bytes()).await;
 
-        let settings = AutoDownloadConfig {
-            resident_max_bytes,
-            // Under the default floor, so only the load decides.
-            min_size_percent: 0,
-            ..auto(dir.path())
-        };
-        let table = Table::ensure(&source_at(&server, "networks.csv"), &settings)
-            .await
-            .unwrap();
+            let settings = AutoDownloadConfig {
+                resident_max_bytes,
+                verify_content,
+                // Under the default floor, so only the load decides.
+                min_size_percent: 0,
+                ..auto(dir.path())
+            };
+            let table = Table::ensure(&source_at(&server, "networks.csv"), &settings)
+                .await
+                .unwrap();
 
-        assert_eq!(table.len(), 2, "{replacement:?}");
-        assert_eq!(fs::read_to_string(&file).unwrap(), NETWORKS);
+            assert_eq!(table.len(), 2, "{replacement:?} verify={verify_content}");
+            assert_eq!(fs::read_to_string(&file).unwrap(), NETWORKS);
+        }
     }
 }
 

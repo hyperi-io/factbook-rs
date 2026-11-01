@@ -34,7 +34,7 @@ Setting a path bypasses the provider for that half only. The other half still pr
 | `max_age_days` | u32 | `30` | Ceiling on how stale a copy may be. The two halves read it differently, below |
 | `connect_timeout_secs` | u64 | `30` | A dead host should fail fast. Zero is refused by `validate`, and a download with it fails with the key named. Not read when a client is injected |
 | `read_timeout_secs` | u64 | `60` | Idle bound, not a whole-request budget, so a slow transfer is not cut off for being slow. Zero is refused like `connect_timeout_secs` |
-| `verify_content` | bool | `true` | Check that a download is the kind of thing it claims to be |
+| `verify_content` | bool | `true` | Check that a downloaded database answers a known address. A table source is loaded before it replaces the copy on disk whatever this says |
 | `min_size_percent` | u8 | `50` | Refuse a replacement below this fraction of the copy on disk. Zero disables the floor, and a value above 100 is refused by `validate` |
 | `age_from_source` | bool | `true` | Report database age from the publisher's build stamp rather than the local write time. Metric only; freshness still counts from the write |
 | `resident_max_bytes` | u64 | `134217728` | Read a database this size or smaller onto the heap when it is opened; map a larger one. Zero maps everything. A table source that outgrows it is refused, below |
