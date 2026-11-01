@@ -120,11 +120,12 @@ pub enum GeoIpDownloadError {
         member: &'static str,
     },
 
-    /// The body expanded past the ceiling decompression is allowed.
+    /// The body, or what it expanded to, ran past the size ceiling.
     ///
-    /// A compressed body states nothing reliable about its expanded size, so a
-    /// hostile or corrupt one would otherwise write until the filesystem fills.
-    #[error("{url} expanded past the {limit} byte ceiling")]
+    /// Neither a response that keeps arriving nor a compressed body states its
+    /// final size reliably, so a hostile or corrupt one would otherwise write
+    /// until the filesystem fills.
+    #[error("{url} ran past the {limit} byte ceiling")]
     TooLarge {
         /// URL that was requested, without any credential.
         url: String,

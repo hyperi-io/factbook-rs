@@ -187,11 +187,12 @@ fn gzip_transfer(url: String, dest: PathBuf) -> Transfer {
 /// test drives itself. Returns the URL to fetch.
 fn drip_server(chunks: Vec<Vec<u8>>, gap: Duration) -> String {
     let length = chunks.iter().map(Vec::len).sum();
-    drip_server_promising(chunks, length, gap)
+    drip_server_promising(chunks, Some(length), gap)
 }
 
-/// The same, declaring a `Content-Length` the chunks do not add up to.
-fn drip_server_promising(chunks: Vec<Vec<u8>>, length: usize, gap: Duration) -> String {
+/// The same, declaring a `Content-Length` the chunks need not add up to, or
+/// none at all, which leaves the body running until the server hangs up.
+fn drip_server_promising(chunks: Vec<Vec<u8>>, length: Option<usize>, gap: Duration) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
@@ -207,7 +208,10 @@ fn drip_server_promising(chunks: Vec<Vec<u8>>, length: usize, gap: Duration) -> 
         let mut buffer = [0u8; 2048];
         let _ = socket.read(&mut buffer).await;
 
-        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n");
+        let head = match length {
+            Some(length) => format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n"),
+            None => "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_string(),
+        };
         // Writes are ignored on failure: the client hangs up first whenever the
         // test is about a transfer that does not finish.
         let _ = socket.write_all(head.as_bytes()).await;
@@ -2186,7 +2190,7 @@ async fn a_body_shorter_than_its_content_length_is_rejected() {
     let mut chunks: Vec<Vec<u8>> = body.chunks(16).map(<[u8]>::to_vec).collect();
     let missing = chunks.pop().unwrap();
     let delivered = body.len() - missing.len();
-    let url = drip_server_promising(chunks, body.len(), Duration::from_millis(10));
+    let url = drip_server_promising(chunks, Some(body.len()), Duration::from_millis(10));
 
     let err = raw_transfer(url, dest.clone())
         .run(&default_client())
@@ -2205,6 +2209,44 @@ async fn a_body_shorter_than_its_content_length_is_rejected() {
     // prefix the next run resumes from.
     assert_eq!(fs::read(&dest).unwrap(), good);
     assert_eq!(fs::read(&part).unwrap().len(), delivered);
+}
+
+#[tokio::test]
+async fn a_body_past_the_size_ceiling_is_refused_and_removed() {
+    // A body that keeps arriving would otherwise write until the data
+    // filesystem fills, so the ceiling has to hold whether or not the server
+    // declares a length. A body exactly on it is admitted.
+    let fits = mmdb_body(b"a body exactly on the ceiling");
+    let over = mmdb_body(b"a body one byte past the ceiling!");
+    let limit = u64::try_from(fits.len()).unwrap();
+    assert!(over.len() > fits.len());
+
+    for (declared, body) in [(true, &fits), (false, &fits), (true, &over), (false, &over)] {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("db.mmdb");
+        let chunks: Vec<Vec<u8>> = body.chunks(16).map(<[u8]>::to_vec).collect();
+        let url = drip_server_promising(chunks, declared.then_some(body.len()), Duration::ZERO);
+
+        let result = raw_transfer(url, dest.clone())
+            .run_within(&default_client(), limit)
+            .await;
+
+        if body.len() == fits.len() {
+            assert_eq!(fs::read(result.unwrap()).unwrap(), *body, "declared={declared}");
+        } else {
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, GeoIpDownloadError::TooLarge { limit: l, .. } if l == limit),
+                "declared={declared}: {err:?}"
+            );
+            assert!(!err.is_permanent(), "{err:?}");
+            assert!(
+                entries(dir.path()).is_empty(),
+                "declared={declared}: {:?} left behind",
+                entries(dir.path())
+            );
+        }
+    }
 }
 
 #[tokio::test]

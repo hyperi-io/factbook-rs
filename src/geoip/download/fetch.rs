@@ -153,6 +153,14 @@ const DIGEST_BUFFER_BYTES: usize = 64 * 1024;
 /// 200 MB.
 const MAX_EXPANDED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
+/// Ceiling on the bytes one response body may write to its part file.
+///
+/// A body that keeps arriving would otherwise fill the data filesystem before
+/// the expansion ceiling is ever reached, and a raw body never meets that one at
+/// all. A compressed body is no larger than what it expands to, so the one
+/// figure bounds both.
+const MAX_BODY_BYTES: u64 = MAX_EXPANDED_BYTES;
+
 /// Openers of a markup document, lowercase, for a payload that should be text.
 const MARKUP_OPENERS: [&[u8]; 3] = [b"<!doctype", b"<html", b"<?xml"];
 
@@ -287,6 +295,17 @@ impl Transfer {
         self.run_guarded(client, Guard::OFF).await
     }
 
+    /// The same, refusing a body past `limit` bytes, so a test reaches the
+    /// refusal without transferring four gigabytes.
+    #[cfg(test)]
+    pub(crate) async fn run_within(
+        self,
+        client: &Client,
+        limit: u64,
+    ) -> Result<PathBuf, GeoIpDownloadError> {
+        self.fetch(client, Guard::OFF, limit).await
+    }
+
     /// Fetch, materialise and atomically move the database into place, refusing
     /// a staged file the guard will not admit.
     ///
@@ -295,6 +314,16 @@ impl Transfer {
         self,
         client: &Client,
         guard: Guard,
+    ) -> Result<PathBuf, GeoIpDownloadError> {
+        self.fetch(client, guard, MAX_BODY_BYTES).await
+    }
+
+    /// [`Self::run_guarded`], refusing a body past `limit` bytes.
+    async fn fetch(
+        self,
+        client: &Client,
+        guard: Guard,
+        limit: u64,
     ) -> Result<PathBuf, GeoIpDownloadError> {
         if let Some(parent) = self.dest.parent() {
             fs::create_dir_all(parent)?;
@@ -349,7 +378,7 @@ impl Transfer {
         // body, and the next run resumes from it rather than re-fetching tens of
         // megabytes. Only materialise writes the destination, so a part file is
         // never mistaken for a database.
-        let bytes = match self.stream_with_fallback(client, &part).await {
+        let bytes = match self.stream_with_fallback(client, &part, limit).await {
             Ok(bytes) => bytes,
             Err(e) => {
                 // A transfer that wrote nothing leaves no part file behind, so
@@ -428,8 +457,9 @@ impl Transfer {
         &self,
         client: &Client,
         part: &Path,
+        limit: u64,
     ) -> Result<u64, GeoIpDownloadError> {
-        let primary = self.stream_to(client, &self.url, part).await;
+        let primary = self.stream_to(client, &self.url, part, limit).await;
 
         let Some(fallback) = self.fallback_url.as_deref() else {
             return primary;
@@ -449,7 +479,7 @@ impl Transfer {
         // The fallback is a different file, so anything already transferred
         // belongs to the other URL and cannot be resumed into this one.
         let _ = fs::remove_file(part);
-        self.stream_to(client, fallback, part).await
+        self.stream_to(client, fallback, part, limit).await
     }
 
     /// Stream the response body of `url` to `part`, returning the total bytes
@@ -459,6 +489,7 @@ impl Transfer {
         client: &Client,
         url: &str,
         part: &Path,
+        limit: u64,
     ) -> Result<u64, GeoIpDownloadError> {
         // Called either way: it also drops a part file past the resume window,
         // which has to happen whether or not the offset is usable.
@@ -469,25 +500,27 @@ impl Transfer {
             0
         };
 
-        match self.stream_from(client, url, part, resume_from).await {
+        match self.stream_from(client, url, part, resume_from, limit).await {
             // A part file already as long as the body makes the range start at
             // its end, which a server answers with 416.
             Err(GeoIpDownloadError::UnexpectedStatus { status: 416, .. }) if resume_from > 0 => {
                 let _ = fs::remove_file(part);
-                self.stream_from(client, url, part, 0).await
+                self.stream_from(client, url, part, 0, limit).await
             }
             other => other,
         }
     }
 
     /// Stream `url` to `part`, continuing from byte `resume_from` when it is
-    /// above zero.
+    /// above zero, and refusing a body that would leave the part file past
+    /// `limit` bytes.
     async fn stream_from(
         &self,
         client: &Client,
         url: &str,
         part: &Path,
         resume_from: u64,
+        limit: u64,
     ) -> Result<u64, GeoIpDownloadError> {
         let mut request = self.credential.apply(client.get(url));
         if resume_from > 0 {
@@ -514,17 +547,31 @@ impl Transfer {
         // the whole body, so the prefix is discarded rather than appended to --
         // appending it would silently build a corrupt file.
         let resuming = resume_from > 0 && status == StatusCode::PARTIAL_CONTENT;
-        let mut file = if resuming {
-            fs::OpenOptions::new().append(true).open(part)?
-        } else {
-            fs::File::create(part)?
-        };
         let mut written = if resuming { resume_from } else { 0 };
         // What the part file already held. A range the server ignored leaves
         // `resume_from` set while nothing was kept, so the rate has to measure
         // against this rather than against `resume_from`.
         let carried = written;
-        let expected = response.content_length().map(|length| length + written);
+        let expected = response
+            .content_length()
+            .map(|length| length.saturating_add(written));
+
+        // A declared length past the ceiling is refused before a byte lands,
+        // and any prefix kept for it goes too: it belongs to a body that can
+        // never be admitted.
+        if expected.is_some_and(|expected| expected > limit) {
+            let _ = fs::remove_file(part);
+            return Err(GeoIpDownloadError::TooLarge {
+                url: loggable(url),
+                limit,
+            });
+        }
+
+        let mut file = if resuming {
+            fs::OpenOptions::new().append(true).open(part)?
+        } else {
+            fs::File::create(part)?
+        };
 
         if resume_from > 0 {
             info!(
@@ -542,6 +589,17 @@ impl Transfer {
             .await
             .map_err(reqwest::Error::without_url)?
         {
+            // An undeclared or understated length is caught here, before the
+            // chunk that would cross the ceiling is written.
+            if written.saturating_add(chunk.len() as u64) > limit {
+                drop(file);
+                let _ = fs::remove_file(part);
+                return Err(GeoIpDownloadError::TooLarge {
+                    url: loggable(url),
+                    limit,
+                });
+            }
+
             // A write that fails leaves the part file in a state this process
             // cannot describe -- a full disk truncates it silently -- so it goes
             // rather than being resumed from.
