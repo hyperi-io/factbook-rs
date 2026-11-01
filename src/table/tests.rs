@@ -1000,3 +1000,62 @@ async fn a_table_that_will_not_fit_is_refused_at_load() {
         .unwrap();
     assert_eq!(table.len(), 200);
 }
+
+#[tokio::test]
+async fn the_index_is_held_to_the_ceiling_with_the_rows() {
+    use std::fmt::Write as _;
+
+    let ranges = (0..200u32).fold(String::from("network,name\n"), |mut body, at| {
+        let _ = writeln!(body, "10.{}.{}.0/24,range-{at}", at / 256, at % 256);
+        body
+    });
+
+    for (body, index) in [
+        (operators(200), Index::Column("asn".to_string())),
+        (ranges, Index::Prefix),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("networks.csv"), &body).unwrap();
+        let source = TableSource {
+            index: index.clone(),
+            ..local("networks.csv")
+        };
+
+        // The smallest ceiling the rows alone fit under.
+        let fits = |ceiling| {
+            parse::read(
+                body.as_bytes(),
+                TableFormat::Csv { header: true },
+                &Schema::Auto,
+                ceiling,
+            )
+            .is_ok()
+        };
+        let (mut low, mut high) = (0u64, 1 << 20);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if fits(mid) { high = mid } else { low = mid + 1 }
+        }
+
+        // Every key is distinct, so the index costs at least as much as the rows.
+        for (ceiling, admitted) in [(low, false), (low * 4, true)] {
+            let settings = AutoDownloadConfig {
+                resident_max_bytes: ceiling,
+                ..offline(dir.path())
+            };
+            let loaded = Table::ensure(&source, &settings).await;
+            assert_eq!(
+                loaded.is_ok(),
+                admitted,
+                "{index:?} under {ceiling}: {:?}",
+                loaded.as_ref().err()
+            );
+            if let Err(err) = loaded {
+                assert!(
+                    matches!(err, TableError::OverResidentCeiling { .. }),
+                    "{err:?}"
+                );
+            }
+        }
+    }
+}

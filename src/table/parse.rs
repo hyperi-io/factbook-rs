@@ -25,8 +25,9 @@
 //! encoding, a quoting style and a column count all move the answer. So the
 //! readers fill memory and stop at the ceiling the caller names, reporting
 //! [`TableError::OverResidentCeiling`] with everything they had accumulated
-//! released as the error unwinds. What is counted is the rows, not the index
-//! [`Table::build`](super::Table::build) later derives from them.
+//! released as the error unwinds. The bytes the rows were charged travel with
+//! them, and [`Table::build`](super::Table::build) charges the index it derives
+//! against what is left.
 //!
 //! Both encodings stop mid-record. A JSON array is walked element by element
 //! rather than parsed whole -- a document is not valid until its last byte, but
@@ -86,6 +87,10 @@ pub(super) struct Parsed {
 
     /// One entry per row, each as wide as `columns`.
     pub(super) rows: Vec<Vec<Cell>>,
+
+    /// Bytes the rows were charged against the ceiling, which the index then
+    /// adds to.
+    pub(super) held: u64,
 }
 
 /// Read a source file into columns and rows, stopping at `ceiling` bytes.
@@ -130,7 +135,7 @@ pub(crate) fn probe(
     ceiling: u64,
 ) -> Result<(), TableError> {
     let reader = BufReader::new(fs::File::open(path)?);
-    Table::build(read(reader, format, schema, ceiling)?, index).map(drop)
+    Table::build(read(reader, format, schema, ceiling)?, index, ceiling).map(drop)
 }
 
 /// Read a CSV into columns and rows.
@@ -140,7 +145,8 @@ fn read_csv(
     schema: &Schema,
     ceiling: u64,
 ) -> Result<Parsed, TableError> {
-    let mut records = records(reader, ceiling)?.into_iter();
+    let (records, held) = records(reader, ceiling)?;
+    let mut records = records.into_iter();
 
     // The header row is consumed whether or not its names are used, so naming
     // the columns explicitly overrides a header rather than shifting the rows.
@@ -171,7 +177,11 @@ fn read_csv(
         return Err(TableError::Empty);
     }
 
-    Ok(Parsed { columns, rows })
+    Ok(Parsed {
+        columns,
+        rows,
+        held,
+    })
 }
 
 /// Read a JSON array of objects into columns and rows.
@@ -401,7 +411,11 @@ impl<'de> de::Visitor<'de> for Elements<'_> {
             return Err(stop(self.stopped, TableError::NoNames));
         }
 
-        Ok(Parsed { columns, rows })
+        Ok(Parsed {
+            columns,
+            rows,
+            held,
+        })
     }
 }
 
@@ -442,11 +456,11 @@ fn cell_of_value(value: Option<&Value>) -> Cell {
     }
 }
 
-/// Read every CSV record in the reader.
+/// Read every CSV record in the reader, and the bytes they were charged.
 ///
 /// One exit, through `finish`, because that is where an unterminated quoted
 /// field is caught: a second exit that skipped it would accept a malformed file.
-fn records(mut reader: impl BufRead, ceiling: u64) -> Result<Vec<Record>, TableError> {
+fn records(mut reader: impl BufRead, ceiling: u64) -> Result<(Vec<Record>, u64), TableError> {
     let mut csv = Csv::new(ceiling);
 
     loop {
@@ -461,7 +475,8 @@ fn records(mut reader: impl BufRead, ceiling: u64) -> Result<Vec<Record>, TableE
         reader.consume(consumed);
     }
 
-    Ok(strip_bom(csv.finish()?))
+    let (records, held) = csv.finish()?;
+    Ok((strip_bom(records), held))
 }
 
 /// Drop the byte-order mark from the first field, where a publisher wrote one.
@@ -715,7 +730,7 @@ impl Csv {
     }
 
     /// Close whatever record is open at the end of the file.
-    fn finish(mut self) -> Result<Vec<Record>, TableError> {
+    fn finish(mut self) -> Result<(Vec<Record>, u64), TableError> {
         if self.state == State::Quoted {
             return Err(TableError::Malformed {
                 line: self.record_line,
@@ -728,7 +743,7 @@ impl Csv {
             self.end_record()?;
         }
 
-        Ok(self.records)
+        Ok((self.records, self.held))
     }
 
     /// Move the fields read so far into a completed record.

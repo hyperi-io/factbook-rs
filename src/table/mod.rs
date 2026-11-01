@@ -32,8 +32,8 @@
 //! # A table is held in memory, or it is refused
 //!
 //! [`Table::ensure`] reads the source into memory and serves it from there. A
-//! source that outgrows `resident_max_bytes` while it is being read is abandoned
-//! -- what it had taken is released, and the call fails with
+//! source whose rows and index outgrow `resident_max_bytes` while they are built
+//! is abandoned -- what it had taken is released, and the call fails with
 //! [`TableError::OverResidentCeiling`] rather than holding a table the
 //! deployment said it did not want held.
 //!
@@ -92,8 +92,10 @@ mod parse;
 mod query;
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fmt;
 use std::fs;
+use std::hash::Hash;
 use std::io::{self, BufRead, BufReader};
 use std::net::IpAddr;
 use std::ops::Range;
@@ -127,6 +129,11 @@ const ADDRESS_SAMPLE: usize = 64;
 
 /// No row is filed under this key.
 const NO_ROWS: &[usize] = &[];
+
+/// Bytes one new range costs the prefix index: its trie node, and the branch
+/// node a binary trie adds at most once per leaf.
+const PREFIX_ENTRY_BYTES: usize =
+    2 * size_of::<(IpNet, Option<Vec<usize>>, Option<usize>, Option<usize>)>();
 
 /// One cell of a row. `None` is a value the source did not supply.
 type Cell = Option<Box<str>>;
@@ -210,7 +217,8 @@ pub enum TableError {
         columns: String,
     },
 
-    /// The rows outgrew the memory the source was given.
+    /// The rows, or the rows and their index, outgrew the memory the source
+    /// was given.
     ///
     /// The read stops here rather than finishing: a source too large for
     /// `resident_max_bytes` is refused, and there is nowhere else for it to go.
@@ -324,8 +332,9 @@ impl Table {
     /// that copy, because a stale table answers most lookups and no table
     /// answers none.
     ///
-    /// Reading is not. The rows are held to `auto.resident_max_bytes`, and a
-    /// source that outgrows it is abandoned mid-read and refused -- there is
+    /// Reading is not. The rows and their index are held to
+    /// `auto.resident_max_bytes`, and a source that outgrows it is abandoned
+    /// mid-read or mid-index and refused -- there is
     /// nowhere else for a table to be served from, so a ceiling it crosses is
     /// the end of the load rather than a switch to something slower.
     ///
@@ -376,7 +385,7 @@ impl Table {
             &source.schema,
             auto.resident_max_bytes,
         )?;
-        let table = Self::build(parsed, &source.index)?;
+        let table = Self::build(parsed, &source.index, auto.resident_max_bytes)?;
 
         telemetry::backing(&source.file, table.backing());
         Ok(table)
@@ -414,7 +423,11 @@ impl Table {
         schema: &Schema,
         index: &Index,
     ) -> Result<Self, TableError> {
-        Self::build(parse::read(reader, format, schema, u64::MAX)?, index)
+        Self::build(
+            parse::read(reader, format, schema, u64::MAX)?,
+            index,
+            u64::MAX,
+        )
     }
 
     /// Column names, in the order a row's cells are stored.
@@ -509,9 +522,22 @@ impl Table {
         }
     }
 
-    /// Index parsed rows by the key the source states.
-    fn build(parsed: Parsed, index: &Index) -> Result<Self, TableError> {
-        let Parsed { columns, rows } = parsed;
+    /// Index parsed rows by the key the source states, refusing once the rows,
+    /// the column names and the index together cost more than `ceiling` bytes.
+    fn build(parsed: Parsed, index: &Index, ceiling: u64) -> Result<Self, TableError> {
+        let Parsed {
+            columns,
+            mut rows,
+            held,
+        } = parsed;
+
+        // The parse charged one slot per row, not the capacity the vector
+        // doubled into.
+        rows.shrink_to_fit();
+        let mut budget = Budget { held, ceiling };
+        for column in &columns {
+            budget.charge(column.len() + size_of::<String>())?;
+        }
 
         let key_column = match index {
             Index::Column(name) => columns
@@ -541,7 +567,7 @@ impl Table {
                 let mut filed: HashMap<Box<str>, Vec<usize>> = HashMap::new();
                 for (at, row) in rows.iter().enumerate() {
                     if let Some(key) = cell(row, key_column) {
-                        filed.entry(Box::from(key)).or_default().push(at);
+                        budget.file(&mut filed, Box::from(key), key.len(), at)?;
                         reachable += 1;
                     }
                 }
@@ -555,10 +581,10 @@ impl Table {
                         continue;
                     };
                     if let Some(address) = as_address(text) {
-                        filed.entry(address).or_default().push(at);
+                        budget.file(&mut filed, address, 0, at)?;
                         reachable += 1;
                     } else {
-                        unindexed.push(at);
+                        budget.push(&mut unindexed, at)?;
                     }
                 }
                 Keys::Address { filed, unindexed }
@@ -573,10 +599,17 @@ impl Table {
                     if let Some(prefix) = as_prefix(text) {
                         // A repeated range keeps every row, the same as a
                         // repeated text key does.
-                        filed.entry(prefix).or_default().push(at);
+                        if let Some(list) = filed.get_mut(&prefix) {
+                            budget.push(list, at)?;
+                        } else {
+                            budget.charge(PREFIX_ENTRY_BYTES)?;
+                            let mut list = Vec::new();
+                            budget.push(&mut list, at)?;
+                            filed.insert(prefix, list);
+                        }
                         reachable += 1;
                     } else {
-                        unindexed.push(at);
+                        budget.push(&mut unindexed, at)?;
                     }
                 }
                 Keys::Prefix {
@@ -839,6 +872,64 @@ fn keyed_column(
     }
 
     (0..columns.len()).find(|&at| holds(at))
+}
+
+/// Bytes a table may hold while its index is built, and what it holds so far.
+///
+/// An estimate on the same footing as the parse's: what each structure asks
+/// the allocator for, with no account of how the allocator rounds it.
+struct Budget {
+    /// Bytes charged so far.
+    held: u64,
+
+    /// Bytes the table may cost before the build is abandoned.
+    ceiling: u64,
+}
+
+impl Budget {
+    /// Add `bytes`, refusing once the total passes the ceiling.
+    fn charge(&mut self, bytes: usize) -> Result<(), TableError> {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.held = self.held.saturating_add(bytes);
+        if self.held > self.ceiling {
+            return Err(TableError::OverResidentCeiling {
+                ceiling: self.ceiling,
+            });
+        }
+        Ok(())
+    }
+
+    /// Append a row position, charging whatever capacity the list grows by.
+    fn push(&mut self, list: &mut Vec<usize>, at: usize) -> Result<(), TableError> {
+        let before = list.capacity();
+        list.push(at);
+        self.charge((list.capacity() - before) * size_of::<usize>())
+    }
+
+    /// File a row position under `key`, charging the `key_bytes` it holds on
+    /// the heap, the list it lands in and the buckets the map grows by.
+    fn file<K: Hash + Eq>(
+        &mut self,
+        filed: &mut HashMap<K, Vec<usize>>,
+        key: K,
+        key_bytes: usize,
+        at: usize,
+    ) -> Result<(), TableError> {
+        let slots = filed.capacity();
+        let list = match filed.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                self.charge(key_bytes)?;
+                entry.insert(Vec::new())
+            }
+        };
+        self.push(list, at)?;
+
+        // A bucket holds one entry and one control byte, and the map keeps an
+        // eighth of its buckets empty.
+        let bucket = size_of::<(K, Vec<usize>)>() + 1;
+        self.charge((filed.capacity() - slots) * bucket * 8 / 7)
+    }
 }
 
 /// The backing each table got, through the facade.
