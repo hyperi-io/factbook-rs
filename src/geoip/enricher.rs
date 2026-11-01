@@ -54,6 +54,7 @@
 use std::fmt;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -238,6 +239,8 @@ pub(super) struct Readers {
     pub(super) city: Option<Arc<Backing>>,
     /// ASN database, when one was provisioned.
     pub(super) asn: Option<Arc<Backing>>,
+    /// Which swap installed this set, stamped by [`Inner::swap_readers`].
+    pub(super) generation: u64,
 }
 
 impl Readers {
@@ -274,6 +277,8 @@ pub(super) struct Sources {
 pub(super) struct Entry {
     /// When the databases were read for this answer.
     loaded: Instant,
+    /// Generation of the reader set the answer was read from.
+    generation: u64,
     /// The answer, absent when neither database held the address.
     record: Option<Arc<GeoIpRecord>>,
 }
@@ -282,6 +287,9 @@ pub(super) struct Entry {
 pub(super) struct Inner {
     /// Readers, replaced wholesale by a refresh.
     pub(super) readers: ArcSwap<Readers>,
+    /// Generation of the reader set installed last. An answer read from any
+    /// other is stale whenever it reaches the cache.
+    generation: AtomicU64,
     /// The answers, keyed by address.
     cache: Cache<IpAddr, Entry>,
     /// Files the readers came from, locked only by a refresh.
@@ -302,9 +310,15 @@ impl Inner {
     /// this is exact and leaves no window. The store precedes the clear, so a
     /// lookup that misses during the swap reads the new file rather than
     /// repopulating from the old one.
-    pub(super) fn swap_readers(&self, readers: Readers) {
+    ///
+    /// A read already under way when the swap lands can still insert its
+    /// answer after the clear. The generation is what stops a hit serving it.
+    pub(super) fn swap_readers(&self, mut readers: Readers) {
+        readers.generation = self.generation.load(Ordering::Acquire) + 1;
+        let generation = readers.generation;
         let backings = readers.backings();
         self.readers.store(Arc::new(readers));
+        self.generation.store(generation, Ordering::Release);
         self.cache.clear();
         telemetry::size(self.cache.len());
         backing_telemetry::backings(backings);
@@ -382,12 +396,14 @@ impl GeoIp {
         let readers = Readers {
             city: city_reader,
             asn: asn_reader,
+            generation: 0,
         };
         backing_telemetry::backings(readers.backings());
 
         Ok(Self {
             inner: Arc::new(Inner {
                 readers: ArcSwap::from_pointee(readers),
+                generation: AtomicU64::new(0),
                 cache: Cache::new(cache.capacity),
                 sources: Mutex::new(Sources {
                     city: city_source,
@@ -438,12 +454,13 @@ impl GeoIp {
         // A waiter that a coalesced load hands the value to arrives here as a
         // hit, so the miss count stays equal to the number of database reads.
         let entry = match self.inner.cache.get_value_or_guard(&ip, None) {
-            GuardResult::Value(entry) if !self.expired(&entry) => {
+            GuardResult::Value(entry) if self.current(&entry) => {
                 telemetry::hit();
                 entry
             }
-            // An entry past its age limit is re-read and replaced without
-            // coalescing, which is why the age limit is off by default.
+            // An entry past its age limit, or read from a reader set a refresh
+            // has replaced, is re-read and replaced without coalescing, which
+            // is why the age limit is off by default.
             GuardResult::Value(_) => {
                 let entry = self.miss(ip);
                 self.inner.cache.insert(ip, entry.clone());
@@ -479,7 +496,7 @@ impl GeoIp {
 
         let started = telemetry::started();
         let entry = match self.inner.cache.get_value_or_guard_async(&ip).await {
-            Ok(entry) if !self.expired(&entry) => {
+            Ok(entry) if self.current(&entry) => {
                 telemetry::hit();
                 entry
             }
@@ -545,19 +562,57 @@ impl GeoIp {
         telemetry::miss();
         let readers = self.inner.readers.load_full();
 
-        Entry {
+        let entry = Entry {
             // Stamped even when no age limit is set: an unconditional clock read
             // on the miss path is far below the cost of the read it accompanies.
             loaded: Instant::now(),
+            generation: readers.generation,
             record: read(&readers, ip, self.inner.collect_extra_fields).map(Arc::new),
-        }
+        };
+        #[cfg(test)]
+        pause::point();
+        entry
     }
 
-    /// Whether a cached answer has outlived the configured age limit.
-    fn expired(&self, entry: &Entry) -> bool {
-        self.inner
-            .max_age
-            .is_some_and(|max_age| entry.loaded.elapsed() > max_age)
+    /// Whether a cached answer was read from the readers now installed and is
+    /// inside the configured age limit.
+    fn current(&self, entry: &Entry) -> bool {
+        entry.generation == self.inner.generation.load(Ordering::Acquire)
+            && self
+                .inner
+                .max_age
+                .is_none_or(|max_age| entry.loaded.elapsed() <= max_age)
+    }
+}
+
+/// A hold on the next database read, so a test can land a refresh between the
+/// read and the cache insert that follows it.
+#[cfg(test)]
+pub(super) mod pause {
+    use std::sync::Mutex;
+    use std::sync::mpsc::{self, Receiver, Sender};
+
+    /// The two ends of the held read, when one is held.
+    static HELD: Mutex<Option<(Sender<()>, Receiver<()>)>> = Mutex::new(None);
+
+    /// Hold the next read until the test lets it go.
+    ///
+    /// Returns a receiver that fires once the read is done, and the sender that
+    /// releases it.
+    pub(in crate::geoip) fn hold() -> (Receiver<()>, Sender<()>) {
+        let (read, has_read) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        *HELD.lock().unwrap() = Some((read, released));
+        (has_read, release)
+    }
+
+    /// Wait here while a test holds the read. Returns at once otherwise.
+    pub(super) fn point() {
+        let held = HELD.lock().unwrap().take();
+        if let Some((read, release)) = held {
+            let _ = read.send(());
+            let _ = release.recv();
+        }
     }
 }
 
