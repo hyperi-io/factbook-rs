@@ -3,6 +3,13 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [0.1.3](https://github.com/hyperi-io/factbook-rs/compare/v0.1.2...v0.1.3) (2026-11-01)
+
+### Bug Fixes
+
+* limit downloads and table memory, reject stale cache answers ([#15](https://github.com/hyperi-io/factbook-rs/issues/15)) ([0cf49c8](https://github.com/hyperi-io/factbook-rs/commit/0cf49c88d7722a321adcf264b264e31006ae8a9e))
+* **query:** keep indexed query results in file order ([#16](https://github.com/hyperi-io/factbook-rs/issues/16)) ([a0be067](https://github.com/hyperi-io/factbook-rs/commit/a0be06738a72544944a863c34cc7d644af79a561))
+
 ## [0.1.2](https://github.com/hyperi-io/factbook-rs/compare/v0.1.1...v0.1.2) (2026-10-31)
 
 ### Bug Fixes
