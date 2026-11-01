@@ -111,7 +111,7 @@ flowchart LR
     D --> X[refuse at load]
 ```
 
-The ceiling is hit, never predicted. Size on disk does not say whether a source fits -- encoding, quoting and column count all move the answer -- so the read fills memory and stops when it crosses the line. A CSV stops on a record and a JSON array on an element, so neither reader's peak is set by the file, and what the read had taken is released as the refusal unwinds. The refusal is early and cheap rather than an allocation failure at the end of the file.
+The ceiling is hit, never predicted. Size on disk does not say whether a source fits -- encoding, quoting and column count all move the answer -- so the read fills memory and stops when it crosses the line. A CSV stops partway through a field and a JSON array partway through an element, so neither reader's peak is set by the file, and what the read had taken is released as the refusal unwinds. The refusal is early and cheap rather than an allocation failure at the end of the file.
 
 Nothing sits behind that refusal today. Writing an oversized source out as a MaxMind DB and serving it mapped is future work, tracked as issue #2. `Table::backing()` and the `enrichment_table_backing` gauge already report where a table's rows are, so the answer keeps the shape it will have when there is a second place for them to be.
 

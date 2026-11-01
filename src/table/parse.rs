@@ -28,24 +28,27 @@
 //! released as the error unwinds. What is counted is the rows, not the index
 //! [`Table::build`](super::Table::build) later derives from them.
 //!
-//! Both encodings stop mid-file. A CSV record is complete as soon as it closes,
-//! and a JSON array is walked element by element rather than parsed whole -- a
-//! document is not valid until its last byte, but one element of it is, and one
-//! element is the unit the ceiling measures. So neither reader's peak is set by
-//! the file: it is the rows accumulated so far, plus one record being read.
+//! Both encodings stop mid-record. A JSON array is walked element by element
+//! rather than parsed whole -- a document is not valid until its last byte, but
+//! one element of it is. The record being read is charged against what the rows
+//! have left as it grows: a CSV field byte by byte, a JSON element by the length
+//! of its text. So neither reader's peak is set by the file. An element's parsed
+//! value costs a multiple of its text, which bounds the JSON peak at that
+//! multiple of the ceiling.
 //!
 //! A JSON source that names no columns widens instead of collecting keys up
 //! front. A key first seen on the hundredth object is inserted into the
 //! ninety-nine rows already read, which reaches the same union of keys without
 //! a first pass that would have to hold the document to make one.
 
+use std::cell;
 use std::fmt;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 
-use serde::Deserializer as _;
 use serde::de;
+use serde::{Deserialize as _, Deserializer as _};
 use serde_json::Value;
 
 use super::config::{Index, Schema, TableFormat};
@@ -177,12 +180,17 @@ fn read_csv(
 /// the rows built out of it would put the ceiling behind the allocation it
 /// exists to stop, which is no ceiling at all.
 fn read_json(reader: impl BufRead, schema: &Schema, ceiling: u64) -> Result<Parsed, TableError> {
-    let mut document = serde_json::Deserializer::from_reader(reader);
+    let meter = Meter::default();
+    let mut document = serde_json::Deserializer::from_reader(Metered {
+        inner: reader,
+        meter: &meter,
+    });
     let mut stopped = None;
 
     let read = document.deserialize_seq(Elements {
         schema,
         ceiling,
+        meter: &meter,
         stopped: &mut stopped,
     });
 
@@ -204,6 +212,65 @@ fn read_json(reader: impl BufRead, schema: &Schema, ceiling: u64) -> Result<Pars
 fn not_an_array(e: &serde_json::Error) -> TableError {
     TableError::NotAnArrayOfObjects {
         detail: e.to_string(),
+    }
+}
+
+/// How many bytes of the document the element being read may still take.
+///
+/// One element is parsed whole before its row can be measured, so its text is
+/// what the ceiling bounds while it is read: a single string or array the size
+/// of the file would otherwise be held in full before the first check.
+#[derive(Default)]
+struct Meter {
+    /// Bytes left for the element being read, `None` between elements.
+    room: cell::Cell<Option<u64>>,
+
+    /// Whether an element ran out of room.
+    tripped: cell::Cell<bool>,
+}
+
+/// A document reader that refuses to read an element past its room.
+struct Metered<'m, R> {
+    inner: R,
+    meter: &'m Meter,
+}
+
+impl<R: io::Read> io::Read for Metered<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let Some(room) = self.meter.room.get() else {
+            return self.inner.read(buf);
+        };
+        if room == 0 {
+            self.meter.tripped.set(true);
+            return Err(io::Error::other("an element outgrew the resident ceiling"));
+        }
+
+        let take = buf.len().min(usize::try_from(room).unwrap_or(usize::MAX));
+        let read = self.inner.read(&mut buf[..take])?;
+        self.meter
+            .room
+            .set(Some(room - u64::try_from(read).unwrap_or(room)));
+        Ok(read)
+    }
+}
+
+/// One array element, read with `room` bytes of the document to take.
+///
+/// The separator and whitespace before it are read before the room is set, so
+/// a pretty-printed document is charged for its elements and not its layout.
+struct Element<'m> {
+    meter: &'m Meter,
+    room: u64,
+}
+
+impl<'de> de::DeserializeSeed<'de> for Element<'_> {
+    type Value = Value;
+
+    fn deserialize<D: de::Deserializer<'de>>(self, element: D) -> Result<Value, D::Error> {
+        self.meter.room.set(Some(self.room));
+        let value = Value::deserialize(element);
+        self.meter.room.set(None);
+        value
     }
 }
 
@@ -230,6 +297,9 @@ struct Elements<'a> {
     /// Bytes the rows may cost before the read is abandoned.
     ceiling: u64,
 
+    /// What the element being read may still take.
+    meter: &'a Meter,
+
     /// Why the walk stopped, where it stopped before the array ended.
     stopped: &'a mut Option<TableError>,
 }
@@ -251,7 +321,25 @@ impl<'de> de::Visitor<'de> for Elements<'_> {
         let mut held: u64 = 0;
         let mut seen = 0usize;
 
-        while let Some(value) = seq.next_element::<Value>()? {
+        loop {
+            let element = Element {
+                meter: self.meter,
+                room: self.ceiling.saturating_sub(held),
+            };
+            let value = match seq.next_element_seed(element) {
+                Ok(Some(value)) => value,
+                Ok(None) => break,
+                Err(_) if self.meter.tripped.get() => {
+                    return Err(stop(
+                        self.stopped,
+                        TableError::OverResidentCeiling {
+                            ceiling: self.ceiling,
+                        },
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
+
             let Some(object) = value.as_object() else {
                 return Err(stop(
                     self.stopped,
@@ -438,7 +526,11 @@ struct Csv {
     /// Bytes the completed records will cost once they are rows.
     held: u64,
 
-    /// Bytes the completed records may cost before the read is abandoned.
+    /// Bytes the closed fields of the current record will cost as cells.
+    record: u64,
+
+    /// Bytes the records may cost, the one being read included, before the
+    /// read is abandoned.
     ceiling: u64,
 }
 
@@ -468,8 +560,23 @@ impl Csv {
             started: false,
             after_cr: false,
             held: 0,
+            record: 0,
             ceiling,
         }
+    }
+
+    /// Refuse once the completed records and the record being read cost more
+    /// than the ceiling, `open` being what its unclosed field will cost.
+    fn charge(&self, open: usize) -> Result<(), TableError> {
+        let row = self
+            .record
+            .saturating_add(u64::try_from(ROW_OVERHEAD + open).unwrap_or(u64::MAX));
+        if self.held.saturating_add(row) > self.ceiling {
+            return Err(TableError::OverResidentCeiling {
+                ceiling: self.ceiling,
+            });
+        }
+        Ok(())
     }
 
     /// Hold one byte of the field being read.
@@ -480,6 +587,7 @@ impl Csv {
                 detail: format!("a field is longer than {MAX_FIELD} bytes"),
             });
         }
+        self.charge(self.field.len() + 1 + CELL_OVERHEAD)?;
         self.field.push(byte);
         Ok(())
     }
@@ -584,9 +692,13 @@ impl Csv {
             detail: "a field is not UTF-8".to_string(),
         })?;
 
+        let cost = u64::try_from(text.len() + CELL_OVERHEAD).unwrap_or(u64::MAX);
+        self.record = self.record.saturating_add(cost);
         self.fields.push(text);
         self.state = State::FieldStart;
-        Ok(())
+        // Empty fields cost a cell each and push no byte, so a record of them
+        // is charged here rather than in `push`.
+        self.charge(0)
     }
 
     /// Close the record at a line ending outside a quoted field.
@@ -621,21 +733,15 @@ impl Csv {
 
     /// Move the fields read so far into a completed record.
     ///
-    /// The ceiling is counted here rather than per byte: a record is what
-    /// becomes a row, and a partial one costs nothing that survives.
+    /// The ceiling was charged as the record grew, so the read stops partway
+    /// through one that will not fit rather than after holding it whole.
     fn end_record(&mut self) -> Result<(), TableError> {
         self.end_field()?;
         let fields = std::mem::take(&mut self.fields);
 
-        let row: usize = fields.iter().map(|text| text.len() + CELL_OVERHEAD).sum();
-        self.held = self
-            .held
-            .saturating_add(u64::try_from(row + ROW_OVERHEAD).unwrap_or(u64::MAX));
-        if self.held > self.ceiling {
-            return Err(TableError::OverResidentCeiling {
-                ceiling: self.ceiling,
-            });
-        }
+        let row = std::mem::take(&mut self.record)
+            .saturating_add(u64::try_from(ROW_OVERHEAD).unwrap_or(u64::MAX));
+        self.held = self.held.saturating_add(row);
 
         self.records.push((self.record_line, fields));
         self.started = false;
@@ -897,6 +1003,82 @@ mod tests {
             matches!(read_out, TableError::NotAnArrayOfObjects { .. }),
             "{read_out:?}"
         );
+    }
+
+    #[test]
+    fn one_element_is_held_to_the_ceiling_while_it_is_read() {
+        // Each document is malformed past the point a single element crosses
+        // the ceiling, so a read that reported the fault had buffered the whole
+        // element first -- the allocation the ceiling exists to stop.
+        let long_string = format!(r#"[{{"name": "{}"#, "x".repeat(1 << 20));
+        let wide_array = format!(r#"[{{"asn": 1}}, {{"seen": [{}"#, "1,".repeat(1 << 19));
+        let many_keys: String = std::iter::once("[{".to_string())
+            .chain((0..1 << 16).map(|key| format!(r#""k{key}": null,"#)))
+            .collect();
+
+        for (shape, body) in [
+            ("one long string", long_string),
+            ("one wide array", wide_array),
+            ("one wide object", many_keys),
+        ] {
+            let err = read(body.as_bytes(), TableFormat::Json, &Schema::Auto, 4096).unwrap_err();
+            assert!(
+                matches!(err, TableError::OverResidentCeiling { ceiling: 4096 }),
+                "{shape}: {err:?}"
+            );
+
+            // Unbounded, the same document is read far enough to meet the
+            // fault, so it is the ceiling doing the stopping.
+            let unbounded =
+                read(body.as_bytes(), TableFormat::Json, &Schema::Auto, u64::MAX).unwrap_err();
+            assert!(
+                matches!(unbounded, TableError::NotAnArrayOfObjects { .. }),
+                "{shape}: {unbounded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_element_that_fits_beside_the_rows_already_read_is_admitted() {
+        // The element is charged against what the ceiling has left, so a table
+        // that fits still loads rather than being refused for its last row.
+        let body = r#"[{"asn": 13335, "name": "CLOUDFLARENET"}, {"asn": 15169, "name": "GOOGLE"}]"#;
+        let whole = read(body.as_bytes(), TableFormat::Json, &Schema::Auto, u64::MAX).unwrap();
+        let cost: u64 = whole.rows.iter().map(|row| footprint(row)).sum();
+
+        let parsed = read(body.as_bytes(), TableFormat::Json, &Schema::Auto, cost).unwrap();
+        assert_eq!(cells(&parsed), cells(&whole));
+    }
+
+    #[test]
+    fn one_record_is_held_to_the_ceiling_while_it_is_read() {
+        // As for JSON: each record is malformed past the point it crosses the
+        // ceiling, so reporting that fault means the record was held whole.
+        let long_field = format!("asn,name\n1,\"{}", "x".repeat(1 << 20));
+        let many_fields = format!("asn,name\n{}", "a,".repeat(MAX_FIELDS + 1));
+
+        for (shape, body) in [
+            ("one long field", long_field),
+            ("one wide record", many_fields),
+        ] {
+            let err = read(
+                body.as_bytes(),
+                TableFormat::Csv { header: true },
+                &Schema::Auto,
+                1024,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, TableError::OverResidentCeiling { ceiling: 1024 }),
+                "{shape}: {err:?}"
+            );
+
+            let unbounded = csv(&body).unwrap_err();
+            assert!(
+                matches!(unbounded, TableError::Malformed { .. }),
+                "{shape}: {unbounded:?}"
+            );
+        }
     }
 
     #[test]
