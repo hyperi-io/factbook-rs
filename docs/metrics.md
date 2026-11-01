@@ -44,7 +44,7 @@ on the table one.
 | `busy` | Another process holds the lock on the file | expected where several processes share a data directory; sustained means one is stuck |
 | `unentitled` | The credential was accepted and the database refused | the account has no claim on the edition selected; check the tier against the account's products, not the key |
 
-Separate the two when you alert. `refused` is the provider's problem: it shipped a login page, a stub, or a database that answers nothing, and the old file is still in place. `failed` is yours.
+Separate the two when you alert. `refused` is the provider's problem: it shipped a login page, a stub, a body past the 4 GiB ceiling, or a database that answers nothing, and the old file is still in place. `failed` is yours.
 
 ## The two backing gauges say where the bytes are
 

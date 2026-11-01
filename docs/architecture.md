@@ -74,7 +74,7 @@ flowchart LR
 
 A short body is the one refusal that keeps its bytes: they are a valid prefix of the file, so the next run continues from them with a `Range` request rather than re-fetching tens of megabytes.
 
-The body ceiling stops a response that never ends from filling the data filesystem. A declared length past it is refused before a byte lands.
+The body ceiling stops a response that never ends from filling the data filesystem. A declared length past it is refused before a byte lands, and either refusal starts the wait below.
 
 A refused or rate-limited download also writes a `.retry` stamp beside the lock: the time before which the database is not asked for again. A 429 waits as long as `Retry-After` says and any other refusal waits an hour, both capped at a day. The stale copy serves meanwhile, and a download that passes removes the stamp. Failures of the network itself start no wait.
 

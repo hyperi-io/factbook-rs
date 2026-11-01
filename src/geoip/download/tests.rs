@@ -624,6 +624,13 @@ fn a_refusal_or_a_rate_limit_starts_a_cool_down() {
         (rate_limited(Some(10 * CEILING_SECS)), Some(CEILING_SECS)),
         (undersized(), Some(FLOOR_SECS)),
         (mismatch(), Some(FLOOR_SECS)),
+        (
+            GeoIpDownloadError::TooLarge {
+                url: "u".into(),
+                limit: 64,
+            },
+            Some(FLOOR_SECS),
+        ),
         // Not a refusal: the network, another process, a local fault.
         (GeoIpDownloadError::Busy { path: "db".into() }, None),
         (GeoIpDownloadError::Io(io::Error::other("disk")), None),
@@ -675,6 +682,54 @@ fn a_cool_down_ends_when_it_passes_or_a_download_does() {
     cooldown::clear(&dest);
     assert!(cooldown::wait_for(&dest, "city").is_none());
     assert!(!stamp.exists());
+}
+
+#[tokio::test]
+async fn an_oversized_body_is_not_asked_for_again_inside_its_cool_down() {
+    // Every refresh of a stale database would otherwise transfer up to the
+    // body ceiling again before refusing it.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/db.mmdb", listener.local_addr().unwrap());
+    let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    tokio::spawn({
+        let requests = requests.clone();
+        async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buffer = [0u8; 2048];
+                let _ = socket.read(&mut buffer).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n")
+                    .await;
+            }
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("db.mmdb");
+    let client = default_client();
+    let (url, dest, client) = (&url, &dest, &client);
+    let fetch = move || async move {
+        let file = raw_transfer(url.clone(), dest.clone())
+            .run_within(&client, 64)
+            .await?;
+        Ok(vec![file])
+    };
+
+    let first = attempt("city", Some(dest), fetch).await;
+    assert!(
+        matches!(first, Some(Err(GeoIpDownloadError::TooLarge { .. }))),
+        "{first:?}"
+    );
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let second = attempt("city", Some(dest), fetch).await;
+    assert!(second.is_none(), "{second:?}");
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the cool-down let a second request through"
+    );
 }
 
 #[tokio::test]

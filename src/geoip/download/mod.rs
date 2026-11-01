@@ -310,6 +310,7 @@ impl GeoIpDownloadError {
             | Self::Unpopulated { .. }
             | Self::Undersized { .. }
             | Self::Truncated { .. }
+            | Self::TooLarge { .. }
             | Self::ArchiveMemberMissing { .. } => "refused",
             _ => "failed",
         }
@@ -518,35 +519,29 @@ async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
         return Some(database);
     }
 
-    // A database the provider has just refused is not asked for again until its
-    // cool-down passes, and the stale copy serves meanwhile.
-    let stamped = database.files.first();
-    if stamped.is_none_or(|file| cooldown::wait_for(file, kind.label()).is_none()) {
-        match download(kind, config).await {
-            Ok(files) => {
-                if let Some(file) = stamped {
-                    cooldown::clear(file);
-                }
-                telemetry::attempt(kind.label(), "ok");
-                age(&files);
-                return Some(Database {
-                    format: database.format,
-                    files,
-                });
-            }
-            Err(e) => {
-                telemetry::attempt(kind.label(), e.outcome());
-                warn!(
-                    kind = kind.label(),
-                    error = %e,
-                    provider = ?choice,
-                    "GeoIP database download failed"
-                );
-                if let Some(file) = stamped {
-                    cooldown::begin(file, &e);
-                }
-            }
+    match attempt(kind.label(), database.files.first(), || {
+        download(kind, config)
+    })
+    .await
+    {
+        Some(Ok(files)) => {
+            telemetry::attempt(kind.label(), "ok");
+            age(&files);
+            return Some(Database {
+                format: database.format,
+                files,
+            });
         }
+        Some(Err(e)) => {
+            telemetry::attempt(kind.label(), e.outcome());
+            warn!(
+                kind = kind.label(),
+                error = %e,
+                provider = ?choice,
+                "GeoIP database download failed"
+            );
+        }
+        None => {}
     }
 
     // A stale database still answers most lookups correctly, so it beats
@@ -674,6 +669,33 @@ async fn download(kind: Kind, config: &GeoIpConfig) -> Result<Vec<PathBuf>, GeoI
         files.push(transfer.run_guarded(&client, guard.clone()).await?);
     }
     Ok(files)
+}
+
+/// Run `fetch` unless the database stamped at `stamp` is cooling down.
+///
+/// A database the provider has just refused is not asked for again until its
+/// cool-down passes, and the stale copy serves meanwhile. `None` means the
+/// attempt was skipped.
+async fn attempt<F>(
+    kind: &'static str,
+    stamp: Option<&PathBuf>,
+    fetch: impl FnOnce() -> F,
+) -> Option<Result<Vec<PathBuf>, GeoIpDownloadError>>
+where
+    F: Future<Output = Result<Vec<PathBuf>, GeoIpDownloadError>>,
+{
+    if stamp.is_some_and(|file| cooldown::wait_for(file, kind).is_some()) {
+        return None;
+    }
+
+    let result = fetch().await;
+    if let Some(file) = stamp {
+        match &result {
+            Ok(_) => cooldown::clear(file),
+            Err(e) => cooldown::begin(file, e),
+        }
+    }
+    Some(result)
 }
 
 /// The transfers that fetch one database.
