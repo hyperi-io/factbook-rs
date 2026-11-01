@@ -371,7 +371,8 @@ impl Table {
             let transfer = transfer(source, dest.clone());
             let guard = Guard::for_table(source.format, &source.schema, &source.index, auto);
 
-            let fetched = download::attempt("table", Some(&dest), || {
+            let asked = download::fingerprint(std::slice::from_ref(&transfer));
+            let fetched = download::attempt("table", Some(&dest), asked, || {
                 transfer.run_guarded(&client, guard)
             })
             .await;

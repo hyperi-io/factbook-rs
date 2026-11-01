@@ -631,6 +631,26 @@ fn a_refusal_or_a_rate_limit_starts_a_cool_down() {
             },
             Some(FLOOR_SECS),
         ),
+        // Answered the same way every time, so held back for the ceiling.
+        (
+            GeoIpDownloadError::CredentialRejected {
+                url: "u".into(),
+                status: 401,
+                fields: "auto_download.maxmind_license_key",
+            },
+            Some(CEILING_SECS),
+        ),
+        (
+            GeoIpDownloadError::NotEntitled { url: "u".into() },
+            Some(CEILING_SECS),
+        ),
+        (
+            GeoIpDownloadError::UnexpectedStatus {
+                url: "u".into(),
+                status: 404,
+            },
+            Some(CEILING_SECS),
+        ),
         // Not a refusal: the network, another process, a local fault.
         (GeoIpDownloadError::Busy { path: "db".into() }, None),
         (GeoIpDownloadError::Io(io::Error::other("disk")), None),
@@ -645,8 +665,8 @@ fn a_refusal_or_a_rate_limit_starts_a_cool_down() {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("db.mmdb");
 
-        cooldown::begin(&dest, &error);
-        let waiting = cooldown::wait_for(&dest, "city").map(|wait| wait.as_secs());
+        cooldown::begin(&dest, &error, 1);
+        let waiting = cooldown::wait_for(&dest, "city", 1).map(|wait| wait.as_secs());
 
         match (waiting, expected) {
             (None, None) => {}
@@ -657,6 +677,12 @@ fn a_refusal_or_a_rate_limit_starts_a_cool_down() {
                 );
             }
             (waiting, expected) => panic!("{error:?}: {waiting:?} against {expected:?}"),
+        }
+
+        // A permanent failure holds back the configuration it failed under and
+        // no other.
+        if error.is_permanent() {
+            assert!(cooldown::wait_for(&dest, "city", 2).is_none(), "{error:?}");
         }
     }
 }
@@ -673,14 +699,14 @@ fn a_cool_down_ends_when_it_passes_or_a_download_does() {
 
     // A stamp already in the past, and one that is not a stamp at all.
     fs::write(&stamp, (now - 10).to_string()).unwrap();
-    assert!(cooldown::wait_for(&dest, "city").is_none());
+    assert!(cooldown::wait_for(&dest, "city", 0).is_none());
     fs::write(&stamp, "soon").unwrap();
-    assert!(cooldown::wait_for(&dest, "city").is_none());
+    assert!(cooldown::wait_for(&dest, "city", 0).is_none());
 
     fs::write(&stamp, (now + 600).to_string()).unwrap();
-    assert!(cooldown::wait_for(&dest, "city").is_some());
+    assert!(cooldown::wait_for(&dest, "city", 0).is_some());
     cooldown::clear(&dest);
-    assert!(cooldown::wait_for(&dest, "city").is_none());
+    assert!(cooldown::wait_for(&dest, "city", 0).is_none());
     assert!(!stamp.exists());
 }
 
@@ -716,7 +742,7 @@ async fn an_oversized_body_is_not_asked_for_again_inside_its_cool_down() {
         Ok(vec![file])
     };
 
-    let first = attempt("city", Some(dest), fetch).await;
+    let first = attempt("city", Some(dest), 0, fetch).await;
     assert!(
         matches!(
             first,
@@ -726,7 +752,7 @@ async fn an_oversized_body_is_not_asked_for_again_inside_its_cool_down() {
     );
     assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-    let second = attempt("city", Some(dest), fetch).await;
+    let second = attempt("city", Some(dest), 0, fetch).await;
     assert!(matches!(second, Attempt::Waiting(_)), "{second:?}");
     assert_eq!(
         requests.load(std::sync::atomic::Ordering::SeqCst),
@@ -1463,6 +1489,48 @@ async fn the_ipinfo_token_rides_as_a_query_parameter() {
     let url = &requests[0].url;
     assert_eq!(url.path(), "/data/ipinfo_lite.mmdb");
     assert_eq!(url.query(), Some("token=token-wxyz"));
+}
+
+#[tokio::test]
+async fn a_rejected_credential_is_not_sent_again_until_it_changes() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = default_client();
+
+    // The fingerprint of what each transfer sends, and the transfer itself.
+    let plan_at = |config: &GeoIpConfig| {
+        let transfer = planned(Kind::City, config, &server).remove(0);
+        (fingerprint(std::slice::from_ref(&transfer)), transfer)
+    };
+
+    let mut config = credentialled(dir.path(), GeoIpProvider::MaxMind);
+    let (asked, first) = plan_at(&config);
+    let dest = first.dest.clone();
+    let attempted = attempt("city", Some(&dest), asked, || first.run(&client)).await;
+    assert!(
+        matches!(
+            attempted,
+            Attempt::Ran(Err(GeoIpDownloadError::CredentialRejected { .. }))
+        ),
+        "{attempted:?}"
+    );
+
+    // The same credential would be refused the same way, so it costs nothing.
+    let (asked, again) = plan_at(&config);
+    let attempted = attempt("city", Some(&dest), asked, || again.run(&client)).await;
+    assert!(matches!(attempted, Attempt::Waiting(_)), "{attempted:?}");
+    assert_eq!(requested_paths(&server).await.len(), 1);
+
+    // A different credential is a different question, and is asked at once.
+    config.auto_download.maxmind_license_key = Some("licence-rotated".into());
+    let (asked, rotated) = plan_at(&config);
+    let attempted = attempt("city", Some(&dest), asked, || rotated.run(&client)).await;
+    assert!(matches!(attempted, Attempt::Ran(Err(_))), "{attempted:?}");
+    assert_eq!(requested_paths(&server).await.len(), 2);
 }
 
 #[tokio::test]

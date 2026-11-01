@@ -23,6 +23,7 @@
 //! timeout rather than a total one.
 
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -228,6 +229,25 @@ impl Credential {
         }
     }
 
+    /// Feed what this credential sends into `state`.
+    fn identify(&self, state: &mut impl Hasher) {
+        match self {
+            Self::None => state.write_u8(0),
+            Self::Basic {
+                username, password, ..
+            } => {
+                state.write_u8(1);
+                username.expose().hash(state);
+                password.expose().hash(state);
+            }
+            Self::QueryToken { name, value, .. } => {
+                state.write_u8(2);
+                name.hash(state);
+                value.expose().hash(state);
+            }
+        }
+    }
+
     /// Config fields this credential was read from, when there is one.
     const fn fields(&self) -> Option<&'static str> {
         match self {
@@ -286,6 +306,15 @@ pub(crate) struct Transfer {
 }
 
 impl Transfer {
+    /// Feed everything this transfer sends, and where it writes, into `state`.
+    pub(crate) fn identify(&self, state: &mut impl Hasher) {
+        self.url.hash(state);
+        self.fallback_url.hash(state);
+        self.checksum_url.hash(state);
+        self.dest.hash(state);
+        self.credential.identify(state);
+    }
+
     /// The same transfer with nothing checked beyond the format and the digest.
     ///
     /// This is the shape the transport, archive and status cases are asserted

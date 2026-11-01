@@ -50,6 +50,7 @@ pub(crate) mod source;
 pub(crate) mod verify;
 
 use std::fs;
+use std::hash::{DefaultHasher, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -530,7 +531,10 @@ async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
     }
 
     let stamp = database.files.first().map(PathBuf::as_path);
-    match attempt(kind.label(), stamp, || download(kind, config)).await {
+    // A configuration that cannot be planned costs no request, so any one
+    // fingerprint serves it.
+    let asked = plan(kind, config).map_or(0, |transfers| fingerprint(&transfers));
+    match attempt(kind.label(), stamp, asked, || download(kind, config)).await {
         Attempt::Ran(Ok(files)) => {
             telemetry::attempt(kind.label(), "ok");
             age(&files);
@@ -691,16 +695,19 @@ pub(crate) enum Attempt<T> {
 /// Run `fetch` unless the file stamped at `stamp` is cooling down.
 ///
 /// A file the provider has just refused is not asked for again until its
-/// cool-down passes, and the stale copy serves meanwhile.
+/// cool-down passes, and the stale copy serves meanwhile. `fingerprint` names
+/// the configuration the request is made under, so a permanent failure holds
+/// back that configuration and no other.
 pub(crate) async fn attempt<T, F>(
     kind: &'static str,
     stamp: Option<&Path>,
+    fingerprint: u64,
     fetch: impl FnOnce() -> F,
 ) -> Attempt<T>
 where
     F: Future<Output = Result<T, GeoIpDownloadError>>,
 {
-    if let Some(wait) = stamp.and_then(|file| cooldown::wait_for(file, kind)) {
+    if let Some(wait) = stamp.and_then(|file| cooldown::wait_for(file, kind, fingerprint)) {
         return Attempt::Waiting(wait);
     }
 
@@ -708,10 +715,21 @@ where
     if let Some(file) = stamp {
         match &result {
             Ok(_) => cooldown::clear(file),
-            Err(e) => cooldown::begin(file, e),
+            Err(e) => cooldown::begin(file, e, fingerprint),
         }
     }
     Attempt::Ran(result)
+}
+
+/// A digest of everything a set of transfers sends, credential included.
+///
+/// Held in memory only, and never logged.
+pub(crate) fn fingerprint(transfers: &[Transfer]) -> u64 {
+    let mut state = DefaultHasher::new();
+    for transfer in transfers {
+        transfer.identify(&mut state);
+    }
+    state.finish()
 }
 
 /// The transfers that fetch one database.
