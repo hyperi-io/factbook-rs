@@ -718,13 +718,16 @@ async fn an_oversized_body_is_not_asked_for_again_inside_its_cool_down() {
 
     let first = attempt("city", Some(dest), fetch).await;
     assert!(
-        matches!(first, Some(Err(GeoIpDownloadError::TooLarge { .. }))),
+        matches!(
+            first,
+            Attempt::Ran(Err(GeoIpDownloadError::TooLarge { .. }))
+        ),
         "{first:?}"
     );
     assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     let second = attempt("city", Some(dest), fetch).await;
-    assert!(second.is_none(), "{second:?}");
+    assert!(matches!(second, Attempt::Waiting(_)), "{second:?}");
     assert_eq!(
         requests.load(std::sync::atomic::Ordering::SeqCst),
         1,

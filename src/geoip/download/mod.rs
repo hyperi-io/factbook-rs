@@ -265,6 +265,16 @@ pub enum GeoIpDownloadError {
         /// Length that arrived.
         actual: u64,
     },
+
+    /// A recent refusal holds the next request back, and there is no copy on
+    /// disk to serve meanwhile.
+    #[error("{path} is not fetched again for another {wait_secs} seconds after its last refusal")]
+    CoolingDown {
+        /// File the refusal was for.
+        path: String,
+        /// Seconds before the next request is made.
+        wait_secs: u64,
+    },
 }
 
 impl GeoIpDownloadError {
@@ -519,12 +529,9 @@ async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
         return Some(database);
     }
 
-    match attempt(kind.label(), database.files.first(), || {
-        download(kind, config)
-    })
-    .await
-    {
-        Some(Ok(files)) => {
+    let stamp = database.files.first().map(PathBuf::as_path);
+    match attempt(kind.label(), stamp, || download(kind, config)).await {
+        Attempt::Ran(Ok(files)) => {
             telemetry::attempt(kind.label(), "ok");
             age(&files);
             return Some(Database {
@@ -532,7 +539,7 @@ async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
                 files,
             });
         }
-        Some(Err(e)) => {
+        Attempt::Ran(Err(e)) => {
             telemetry::attempt(kind.label(), e.outcome());
             warn!(
                 kind = kind.label(),
@@ -541,7 +548,7 @@ async fn resolve(kind: Kind, config: &GeoIpConfig) -> Option<Database> {
                 "GeoIP database download failed"
             );
         }
-        None => {}
+        Attempt::Waiting(_) => {}
     }
 
     // A stale database still answers most lookups correctly, so it beats
@@ -671,21 +678,30 @@ async fn download(kind: Kind, config: &GeoIpConfig) -> Result<Vec<PathBuf>, GeoI
     Ok(files)
 }
 
-/// Run `fetch` unless the database stamped at `stamp` is cooling down.
+/// How one attempt at a download came out.
+#[derive(Debug)]
+pub(crate) enum Attempt<T> {
+    /// The file is cooling down for this long yet, so nothing was asked.
+    Waiting(Duration),
+
+    /// The fetch ran, and ended so.
+    Ran(Result<T, GeoIpDownloadError>),
+}
+
+/// Run `fetch` unless the file stamped at `stamp` is cooling down.
 ///
-/// A database the provider has just refused is not asked for again until its
-/// cool-down passes, and the stale copy serves meanwhile. `None` means the
-/// attempt was skipped.
-async fn attempt<F>(
+/// A file the provider has just refused is not asked for again until its
+/// cool-down passes, and the stale copy serves meanwhile.
+pub(crate) async fn attempt<T, F>(
     kind: &'static str,
-    stamp: Option<&PathBuf>,
+    stamp: Option<&Path>,
     fetch: impl FnOnce() -> F,
-) -> Option<Result<Vec<PathBuf>, GeoIpDownloadError>>
+) -> Attempt<T>
 where
-    F: Future<Output = Result<Vec<PathBuf>, GeoIpDownloadError>>,
+    F: Future<Output = Result<T, GeoIpDownloadError>>,
 {
-    if stamp.is_some_and(|file| cooldown::wait_for(file, kind).is_some()) {
-        return None;
+    if let Some(wait) = stamp.and_then(|file| cooldown::wait_for(file, kind)) {
+        return Attempt::Waiting(wait);
     }
 
     let result = fetch().await;
@@ -695,7 +711,7 @@ where
             Err(e) => cooldown::begin(file, e),
         }
     }
-    Some(result)
+    Attempt::Ran(result)
 }
 
 /// The transfers that fetch one database.

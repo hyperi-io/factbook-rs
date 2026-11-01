@@ -76,7 +76,7 @@ A short body is the one refusal that keeps its bytes: they are a valid prefix of
 
 The body ceiling stops a response that never ends from filling the data filesystem. A declared length past it is refused before a byte lands, and either refusal starts the wait below.
 
-A refused or rate-limited download also writes a `.retry` stamp beside the lock: the time before which the database is not asked for again. A 429 waits as long as `Retry-After` says and any other refusal waits an hour, both capped at a day. The stale copy serves meanwhile, and a download that passes removes the stamp. Failures of the network itself start no wait.
+A refused or rate-limited download also writes a `.retry` stamp beside the lock: the time before which the database or table is not asked for again. A 429 waits as long as `Retry-After` says and any other refusal waits an hour, both capped at a day. The stale copy serves meanwhile, and a download that passes removes the stamp. Failures of the network itself start no wait.
 
 The digest runs only where a publisher publishes one, and it is the expensive check: a full read and hash of the archive. The last three belong to the guard, which runs the volume floor first because two `stat` calls cost less than mapping a database. The last two of those never both apply -- a provider database is probed for an address and a table is loaded as the source states it (rows, width, key column and resident ceiling), and the guard is built carrying only the one its payload takes.
 

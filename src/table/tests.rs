@@ -677,6 +677,51 @@ async fn a_replacement_the_load_would_refuse_leaves_the_previous_file_in_place()
 }
 
 #[tokio::test]
+async fn a_refused_table_is_not_asked_for_again_inside_its_cool_down() {
+    for (refusal, response) in [
+        (
+            "a rate limit",
+            ResponseTemplate::new(429).insert_header("retry-after", "600"),
+        ),
+        (
+            "a login page",
+            ResponseTemplate::new(200).set_body_bytes(b"<!DOCTYPE html><html></html>".to_vec()),
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("networks.csv");
+        fs::write(&file, NETWORKS).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        let source = source_at(&server, "networks.csv");
+
+        for _ in 0..2 {
+            let table = Table::ensure(&source, &auto(dir.path())).await.unwrap();
+            assert_eq!(table.len(), 2, "{refusal}");
+        }
+        let requests = server.received_requests().await.unwrap().len();
+        assert_eq!(requests, 1, "{refusal} let a second request through");
+
+        // With no copy to serve, the wait is reported rather than spent on a
+        // request.
+        fs::remove_file(&file).unwrap();
+        let err = Table::ensure(&source, &auto(dir.path())).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TableError::Fetch(GeoIpDownloadError::CoolingDown { wait_secs, .. })
+                    if wait_secs > 0
+            ),
+            "{refusal}: {err:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
 async fn a_setting_that_can_only_fail_is_refused_before_any_request() {
     for (edit, key) in [
         (
@@ -912,9 +957,11 @@ async fn a_schema_that_names_its_columns_refuses_a_file_of_another_width() {
     assert!(!dir.path().join("networks.csv").exists());
 
     // The same body under a schema taken from the file is admitted, so it is
-    // the declared width doing the refusing.
+    // the declared width doing the refusing. A fresh directory, because the
+    // refusal above holds this one back for its cool-down.
     source.schema = Schema::Auto;
-    let table = Table::ensure(&source, &auto(dir.path())).await.unwrap();
+    let fresh = tempfile::tempdir().unwrap();
+    let table = Table::ensure(&source, &auto(fresh.path())).await.unwrap();
     assert_eq!(table.len(), 2);
 }
 

@@ -74,7 +74,7 @@ pub(super) fn wait_for(dest: &Path, kind: &'static str) -> Option<Duration> {
             kind,
             dest = %dest.display(),
             wait_secs = remaining,
-            "GeoIP provider asked us to wait, serving the copy on disk until then"
+            "the provider asked us to wait, serving the copy on disk until then"
         );
     }
 

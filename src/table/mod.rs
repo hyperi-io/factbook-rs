@@ -111,7 +111,7 @@ use crate::geoip::AutoDownloadConfig;
 use crate::geoip::DatabaseFormat;
 use crate::geoip::download::fetch::{self, Archive, Credential, Transfer};
 use crate::geoip::download::verify::Guard;
-use crate::geoip::download::{self, GeoIpDownloadError, SECS_PER_DAY, is_fresh};
+use crate::geoip::download::{self, Attempt, GeoIpDownloadError, SECS_PER_DAY, is_fresh};
 use parse::Parsed;
 
 pub use config::{Index, Schema, SourceArchive, TableFormat, TableSource};
@@ -330,7 +330,8 @@ impl Table {
     /// Downloading is non-fatal by the same contract as the geo path: a
     /// transfer that fails over a copy already on disk logs a warning and reads
     /// that copy, because a stale table answers most lookups and no table
-    /// answers none.
+    /// answers none. A refusal or a rate limit starts the same cool-down the geo
+    /// path keeps, and the copy on disk serves until it passes.
     ///
     /// Reading is not. The rows and their index are held to
     /// `auto.resident_max_bytes`, and a source that outgrows it is abandoned
@@ -343,9 +344,10 @@ impl Table {
     ///
     /// # Errors
     ///
-    /// [`TableError::Fetch`] when the download fails and there is no local copy
-    /// to fall back to, [`TableError::OverResidentCeiling`] when the source will
-    /// not fit, or any of the read errors of [`Table::load`].
+    /// [`TableError::Fetch`] when the download fails or is cooling down and
+    /// there is no local copy to fall back to,
+    /// [`TableError::OverResidentCeiling`] when the source will not fit, or any
+    /// of the read errors of [`Table::load`].
     pub async fn ensure(
         source: &TableSource,
         auto: &AutoDownloadConfig,
@@ -369,15 +371,25 @@ impl Table {
             let transfer = transfer(source, dest.clone());
             let guard = Guard::for_table(source.format, &source.schema, &source.index, auto);
 
-            if let Err(e) = transfer.run_guarded(&client, guard).await {
-                if !dest.exists() {
-                    return Err(e.into());
-                }
-                warn!(
+            let fetched = download::attempt("table", Some(&dest), || {
+                transfer.run_guarded(&client, guard)
+            })
+            .await;
+            match fetched {
+                Attempt::Ran(Ok(_)) => {}
+                Attempt::Ran(Err(e)) if dest.exists() => warn!(
                     file = %dest.display(),
                     error = %e,
                     "table download failed, reading the copy already on disk"
-                );
+                ),
+                Attempt::Ran(Err(e)) => return Err(e.into()),
+                Attempt::Waiting(_) if dest.exists() => {}
+                Attempt::Waiting(wait) => {
+                    return Err(TableError::Fetch(GeoIpDownloadError::CoolingDown {
+                        path: dest.display().to_string(),
+                        wait_secs: wait.as_secs(),
+                    }));
+                }
             }
         }
 
