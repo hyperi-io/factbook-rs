@@ -1324,7 +1324,10 @@ async fn a_cancelled_transfer_holds_its_lock_until_the_file_is_in_place() {
     // The step runs to the end and releases the lock as it finishes.
     let deadline = Instant::now() + Duration::from_secs(10);
     while lock.try_lock().is_err() {
-        assert!(Instant::now() < deadline, "the blocking step never finished");
+        assert!(
+            Instant::now() < deadline,
+            "the blocking step never finished"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(fs::read(&dest).unwrap(), body);
@@ -2232,7 +2235,11 @@ async fn a_body_past_the_size_ceiling_is_refused_and_removed() {
             .await;
 
         if body.len() == fits.len() {
-            assert_eq!(fs::read(result.unwrap()).unwrap(), *body, "declared={declared}");
+            assert_eq!(
+                fs::read(result.unwrap()).unwrap(),
+                *body,
+                "declared={declared}"
+            );
         } else {
             let err = result.unwrap_err();
             assert!(

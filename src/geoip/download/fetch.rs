@@ -500,7 +500,10 @@ impl Transfer {
             0
         };
 
-        match self.stream_from(client, url, part, resume_from, limit).await {
+        match self
+            .stream_from(client, url, part, resume_from, limit)
+            .await
+        {
             // A part file already as long as the body makes the range start at
             // its end, which a server answers with 416.
             Err(GeoIpDownloadError::UnexpectedStatus { status: 416, .. }) if resume_from > 0 => {
