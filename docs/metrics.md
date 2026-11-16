@@ -45,7 +45,7 @@ The `result` label separates five outcomes:
 
 Separate the two when you alert. `refused` is usually the provider's problem: it shipped a login page, a stub, a body past the 4 GiB ceiling, or a database that answers nothing. A size floor, a table schema or a resident ceiling the configuration sets can refuse a download too. `failed` is yours.
 
-`cargo add factbook --no-default-features --features geoip` drops the facade dependency, and every call site compiles to nothing.
+To drop metrics entirely, `cargo add factbook --no-default-features --features geoip` drops the facade dependency, and every call site compiles to nothing.
 
 The two backing gauges say where the bytes are. `enrichment_database_backing` is `resident` or `mapped`, and both series are written, 1 for the chosen one and 0 for the other. So a refresh that flips a database leaves none still reporting the backing it no longer has. A mapped database can stall a lookup while a page is read from the file, where a resident one has the file in memory, so this is the series to read when lookup latency has a tail the cache does not explain.
 

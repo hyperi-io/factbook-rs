@@ -45,7 +45,7 @@ flowchart TB
 
 *Figure 1. L3 Components -- factbook. The dotted arrow is the refusal path.* Up: top of factbook-rs. Down: [L4 Detail -- Download checks](#a-refusal-keeps-the-previous-database), [L4 Detail -- Database and table backing](#a-database-that-will-not-fit-is-mapped-and-a-table-that-will-not-fit-is-refused).
 
-Nothing passes a record between the halves. So a deployment that pre-seeds its databases, or mounts them read-only, can take the lookup half and no HTTP stack at all.
+A deployment that pre-seeds its databases, or mounts them read-only, can take the lookup half and no HTTP stack at all.
 
 ## The atomic rename is what makes the memory map safe
 
@@ -60,7 +60,7 @@ Nothing dangles if a process dies mid-update:
 - The transfer holds an advisory lock on a `.lock` file beside the destination, so two processes sharing a data directory cannot interleave into it. A filesystem with no lock support logs a warning and the transfer goes ahead. The lock gets a file to itself because the part file can be unlinked and recreated mid-transfer, and a lock follows the inode rather than the name.
 - The kernel releases the lock when the process holding it goes away. Cancelling the download does not release it early: the step renaming the staged file holds it until that file is placed or removed.
 - A second process finding the lock held is turned away before it makes a request, so it spends none of the provider's quota and reads what is on disk.
-- A panic during the reader swap poisons a lock guarding a path and a timestamp. It is recovered rather than failing every refresh from then on.
+- A panic in another thread holding the refresh lock poisons it. The lock guards a path and a timestamp, so it is recovered rather than failing every refresh.
 
 ## A refusal keeps the previous database
 
@@ -113,8 +113,6 @@ The digest, where a publisher has one, is the expensive check: a full read and h
 
 ## The cache is keyed on the address, not its text
 
-Most reference lookups are repeats, and the cache saves a database traversal on each.
-
 - The key is `IpAddr`, so `::1` and its long form are one entry, and no string is hashed or allocated per lookup.
 - A hit hands back an `Arc`, because copying a record to reproduce something in memory costs more than the hit itself.
 - Private and reserved ranges never reach the cache. They cannot have an answer, so they short-circuit to one shared record.
@@ -141,7 +139,7 @@ flowchart LR
         direction LR
         tfile[("Table source")]
         tfile -->|fits| held["Held"]
-        tfile -.->|larger| refused["Refused"]
+        tfile -.->|larger| refused["Refused at load"]
     end
 
     database ~~~ table
@@ -155,15 +153,15 @@ flowchart LR
     class database,table group
 ```
 
-*Figure 3. L4 Detail -- Database and table backing. Both database backings answer through the cache, and orange is the refusal.* Up: [L3 Components -- factbook](architecture.md).
+*Figure 3. L4 Detail -- Database and table backing. Both database backings answer through the cache, and orange is a table refused at load.* Up: [L3 Components -- factbook](architecture.md).
 
 A database is in the format the reader reads. One larger than `resident_max_bytes` is memory-mapped instead of being read onto the heap, and it answers through the same cache, so a repeat address never touches the file.
 
 A table is a CSV or a JSON document, and turning one into rows and an index costs several times the file. It cannot be mapped, because it has to be parsed to be used.
 
-The ceiling is hit, never predicted. Size on disk does not say whether a source fits, because encoding, quoting and column count all move the answer. So the read fills memory and stops when it crosses the line. A CSV stops partway through a field and a JSON array partway through an element, and what the read had taken is released as the refusal unwinds.
+Size on disk does not say whether a source fits, because encoding, quoting and column count all move the answer. So the read fills memory and stops when it crosses the line. A CSV stops partway through a field and a JSON array partway through an element, and what the read had taken is released as the refusal unwinds.
 
-A refused table has no fallback. Writing an oversized source out as a MaxMind DB and serving it mapped is not built, tracked in [issue #2](https://github.com/hyperi-io/factbook-rs/issues/2). `Table::backing()` and the `enrichment_table_backing` gauge report where a table's rows are, and the one answer is `resident`.
+A table refused at load has no fallback. A refused download leaves the copy on disk loading. Writing an oversized source out as a MaxMind DB and serving it mapped is not built, tracked in [issue #2](https://github.com/hyperi-io/factbook-rs/issues/2). `Table::backing()` and the `enrichment_table_backing` gauge report where a table's rows are, and the one answer is `resident`.
 
 ## One record type, several source schemas
 
@@ -184,7 +182,7 @@ The cost is a second record decode on each cache miss. A deployment that would r
 | `metrics` *(default)* | the `metrics` facade | download outcomes, database age and backing |
 | `metrics-lookup` | the same facade + `geoip-lookup` | cache hits, misses, size and lookup duration |
 
-A download-only build has no database reader, and a lookup-only build has no HTTP client, because neither feature lists the other's dependencies. CI checks that with a feature-matrix build, which catches a module behind one feature using a crate another feature declares. Test builds are the exception: the dev-dependencies pull an HTTP client whatever features are selected.
+A download-only build has no database reader, and a lookup-only build has no HTTP client, because neither feature lists the other's dependencies. CI checks that with a feature-matrix build, which catches a module behind one feature using a crate another feature declares. Test builds pull an HTTP client whatever the features.
 
 `metrics-lookup` names `geoip-lookup` because the cache it instruments is there. Taken without it, every call site it would emit from is compiled out, so the feature would pull a dependency and measure nothing.
 

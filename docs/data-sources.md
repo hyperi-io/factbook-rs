@@ -54,7 +54,7 @@ The paid MaxMind line downloads GeoIP2-ISP for the network half. Its distinguish
 
 `custom` downloads nothing. Set `city_db_path` and `asn_db_path` and factbook reads the files there.
 
-factbook verifies a published digest before a download may replace what is on disk, where the provider publishes one. sapics publishes a `.sha256` beside each release asset, and MaxMind serves a digest of the archive at the same endpoint, gated on the same account. DB-IP and IPinfo publish none, so the volume floor and the content checks stand in.
+factbook verifies a published digest before a download may replace what is on disk, where the provider publishes one. sapics publishes a `.sha256` for each file under a separate `checksum` release tag, and MaxMind serves a digest of the archive at the same endpoint, gated on the same account. DB-IP and IPinfo publish none, so the volume floor and the content checks stand in.
 
 That gap is one reason the ASN default is `origin-asn` rather than DB-IP: of the sources needing no account, the two sapics sets alone can be checked against a digest from their publisher, and the location half has no such option at all. The blank operator column above is the second reason.
 

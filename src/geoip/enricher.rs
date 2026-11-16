@@ -145,10 +145,9 @@ pub struct CacheConfig {
     /// Largest file, in bytes, read into memory rather than mapped.
     ///
     /// At or under this a database is read onto the heap when it is opened, so
-    /// no lookup can fault on a page; above it the file is mapped and its pages
-    /// arrive at the operating system's discretion. The database occupies its
-    /// own size either way -- what changes is whether a lookup can stall.
-    /// Zero maps every database.
+    /// no lookup waits for the file's pages. Above it the file is mapped, its
+    /// pages arrive at the operating system's discretion, and one copy in the
+    /// page cache serves every process on the node. Zero maps every database.
     pub resident_max_bytes: u64,
 
     /// Keep the source fields no typed field names, in
@@ -529,7 +528,7 @@ impl GeoIp {
         ips.iter().map(|&ip| self.lookup(ip)).collect()
     }
 
-    /// Answers currently held in the cache.
+    /// Answers held in the cache.
     #[must_use]
     pub fn cached_entries(&self) -> usize {
         self.inner.cache.len()
@@ -1202,7 +1201,7 @@ mod tests {
         assert_eq!(record.country_code.as_deref(), Some("US"));
         assert_eq!(record.country_name.as_deref(), Some("United States"));
         assert_eq!(record.continent_code.as_deref(), Some("NA"));
-        // The source writes `AS15169`; every other source writes a number.
+        // The source writes `AS15169`, and every other source writes a number.
         assert_eq!(record.autonomous_system_number, Some(15169));
         assert_eq!(
             record.autonomous_system_organization.as_deref(),
