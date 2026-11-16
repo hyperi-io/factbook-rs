@@ -6,11 +6,11 @@
 *.swo
 *~
 
-# OS junk (never useful in repo)
+# OS files
 .DS_Store
 Thumbs.db
 
-# Local environment files (never commit -- contain secrets)
+# Local environment files, which hold secrets
 .env
 .env.*
 .env.local
@@ -45,12 +45,10 @@ cobertura.xml
 !.cargo/config.toml
 !.cargo/audit.toml
 
-# Git worktrees (local dev convenience)
+# Git worktrees
 .worktrees/
 
-# AI agent working files -- local-only, never committed. Mirrored in
-# .git/info/exclude, because a tracked .gitignore alone does not protect a
-# clone that has not pulled it yet.
+# AI agent working files, mirrored in .git/info/exclude.
 docs/superpowers/
 .hyperi-ai
 CLAUDE.md
@@ -65,9 +63,6 @@ GEMINI.md
 .cursor/
 .gemini/
 
-# Local scratch / tmp (CORE.md: scratch goes here, gitignored, NOT
-# /tmp). Bare patterns (no leading slash) match a tmp dir at ANY
-# depth, so these cover top-level .tmp/ and tmp/ as well as nested
-# ones like tests/tmp/. Mirrored in attach.py _DEFAULT_EXCLUDES.
+# Local scratch, at any depth.
 .tmp/
 tmp/

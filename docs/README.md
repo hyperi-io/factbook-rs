@@ -16,4 +16,4 @@ Start with [getting-started.md](getting-started.md) -- it takes an empty project
 | [metrics.md](metrics.md) | Wiring up alerts, or asking what to watch |
 | [architecture.md](architecture.md) | Understanding how a refused download cannot damage a running service |
 
-The crate README covers the shape of the API and what the library is for. `SOURCES.md` in the repository root points at where each publisher states its own terms.
+The crate README covers the API and what the library is for. `SOURCES.md` in the repository root points at where each publisher states the terms for its data.

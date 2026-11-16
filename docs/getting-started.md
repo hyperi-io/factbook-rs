@@ -6,9 +6,7 @@
 
 # Getting started
 
-By the end of this you will have downloaded two databases and resolved an address, with no provider account.
-
-## Add the crate
+By the end of this you will have downloaded two databases and resolved an address, with no provider account. Start by adding the crate and a runtime:
 
 ```console
 cargo add factbook
@@ -19,7 +17,7 @@ The default features cover both halves: fetching databases and answering from th
 
 ## Resolve an address
 
-`ensure_databases` downloads whatever is missing or stale and hands back the files. `GeoIp::from_databases` maps them behind a cache. They are separate calls so a host that already has its databases can skip the first.
+`ensure_databases` downloads whatever is missing or stale and hands back the files. `GeoIp::from_databases` opens them behind a cache. They are separate calls so a host that has its databases by another route can skip the first.
 
 ```rust
 use factbook::geoip::{CacheConfig, GeoIp, GeoIpConfig, ensure_databases};
@@ -37,19 +35,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The defaults fetch DB-IP Lite for location and sapics `origin-asn` for networks, neither of which needs a signup. Files land in `/var/lib/geoip`; set `auto_download.data_dir` if that directory is not writable.
+The defaults fetch DB-IP Lite for location and sapics `origin-asn` for networks, neither of which needs a signup. Files land in `/var/lib/geoip`. Set `auto_download.data_dir` if that directory is not writable.
 
-Expect a record naming the country and the operating network:
+Expect a record naming the country and the operating network, along these lines (values depend on the build):
 
 ```text
 GeoIpRecord { city_name: Some("Mountain View"), continent_code: Some("NA"), continent_name: Some("North America"), country_code: Some("US"), country_name: Some("United States"), region_name: Some("California"), region_code: None, postal_code: None, timezone: None, latitude: Some(37.422), longitude: Some(-122.085), metro_code: None, accuracy_radius: None, autonomous_system_number: Some(15169), autonomous_system_organization: Some("Google LLC"), is_private: false, network: Some("8.8.8.0/24"), asn_network: Some("8.8.8.0/24"), as_domain: None, extra: ExtraFields { fields: [("city.geoname_id", UInt(5375480)), ("country.is_in_european_union", Bool(false)), ("city.names.de", Str("Mountain View"))] } }
 ```
 
-Every field is present in the output whether or not the source filled it, and which ones come back populated depends on the source rather than on factbook. Anything the source carried that has no field of its own is in `extra`, keyed by the path it sits at in the source record, so a paid edition or a richer build reaches you without factbook being changed for it. `record.to_schema_map()` hands back the typed fields and those together, as flat key and value pairs. The first run moves both databases and takes as long as the link allows -- the location half is the larger by an order of magnitude. Progress is logged every 30 seconds through the `tracing` facade, so install a subscriber if you want to watch it.
+Every field is present in the output whether or not the source filled it, and which ones come back populated depends on the source rather than on factbook. Anything the source had with no typed field is in `extra`, keyed by the path it sits at in the source record, so a paid edition or a richer build reaches you without factbook being changed for it. `record.to_schema_map()` hands back the typed fields and those together, as flat key and value pairs.
+
+The first run moves both databases and takes as long as the link allows, and the location half is the larger by an order of magnitude. Progress is logged every 30 seconds through the `tracing` facade, so install a subscriber if you want to watch it.
 
 ## Keep it fresh without a background thread
 
-factbook starts no timer. Call `ensure_databases` again on whatever schedule the host already has, then tell the reader to pick up anything that moved:
+factbook starts no timer. Call `ensure_databases` again on whatever schedule the host keeps, then tell the reader to pick up anything that moved:
 
 ```rust
 if geoip.refresh_if_changed()? {
@@ -57,7 +57,7 @@ if geoip.refresh_if_changed()? {
 }
 ```
 
-The check is one `stat` per database and the reader swap itself is lock-free, so a lookup never waits on it. It is never done during a lookup either: a hit costs tens of nanoseconds and a `stat` is a system call.
+The check is one `stat` per database and the reader swap itself is lock-free, so a lookup never waits on it. It is never done during a lookup either, because a `stat` is a system call and costs more than the cache hit it would sit beside.
 
 ## Fetch something no provider models
 
@@ -108,7 +108,7 @@ BR-4402,Acetone,L,3
 
 `table.get("BR-4402")` then reaches that row, and `row.get("hazard_class")` reads a cell from it.
 
-## Take only the half you need
+## Take the half you need
 
 A host running someone else's lookup engine wants the files kept fresh and nothing else:
 
@@ -116,7 +116,7 @@ A host running someone else's lookup engine wants the files kept fresh and nothi
 cargo add factbook --no-default-features --features geoip-download
 ```
 
-A host whose databases arrive by some other route wants the reader and no HTTP client:
+A host with databases arriving by some other route wants the reader and no HTTP client:
 
 ```console
 cargo add factbook --no-default-features --features geoip-lookup
@@ -132,7 +132,7 @@ cargo test --all-features
 
 Three targets run -- the unit tests, the live provider tests and the doctests -- and every one reports `test result: ok` with nothing failed.
 
-The doctests compile the README's examples, so a stale example there fails the build. The examples in this directory are not compiled; treat them as illustrative.
+The doctests compile the README's examples, so a stale example there fails the build. The examples in this directory are not compiled, so treat them as illustrative.
 
 The live provider tests are skipped unless asked for, because they spend a provider's daily quota. To run them:
 
@@ -142,8 +142,4 @@ FACTBOOK_LIVE=1 cargo test --test live_provider -- --nocapture
 
 Without credentials that exercises DB-IP and both sapics sources. Setting `MAXMIND_ACCOUNT_ID`, `MAXMIND_LICENSE_KEY` or `IP_INFO_API_TOKEN` adds the provider each belongs to.
 
-## Where to go next
-
-- [data-sources.md](data-sources.md) -- which source to pick, and what each answers.
-- [configuration.md](configuration.md) -- every key and its default.
-- [architecture.md](architecture.md) -- why a refused download cannot damage a running service.
+Next, [data-sources.md](data-sources.md) says which source to pick and what each answers, [configuration.md](configuration.md) lists every key and its default, and [architecture.md](architecture.md) says why a refused download cannot damage a running service.

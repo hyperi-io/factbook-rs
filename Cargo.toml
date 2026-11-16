@@ -20,13 +20,10 @@ readme = "docs/crate.md"
 publish = true
 keywords = ["geoip", "mmdb", "maxmind", "enrichment", "reference-data"]
 categories = ["network-programming", "caching", "database"]
-# An allowlist, so a file must be named here to reach a consumer. The leading
-# slashes anchor to the package root: these are gitignore-style globs, and a
-# bare `README.md` would also match `docs/README.md`.
+# Leading slashes anchor to the package root, so `/README.md` misses `docs/README.md`.
 include = [
     "/src/**",
-    # The bench is a declared target and opens the fixtures, so shipping one
-    # without the other panics instead of benchmarking.
+    # The bench opens the fixtures, so it ships with them or panics.
     "/benches/**",
     "/tests/data/**",
     "/README.md",
@@ -43,15 +40,11 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-# The crate exists to do geoip, so the whole capability is the default. A
-# consumer that only provisions the files (it runs someone else's lookup engine)
-# takes `default-features = false, features = ["geoip-download"]` and pays for
-# no MMDB reader.
+# What each feature pulls in, and why the absent ones are absent: docs/architecture.md.
 default = ["geoip", "metrics"]
 
 geoip = ["geoip-download", "geoip-lookup"]
 
-# Resolve, freshness-check and download the databases. No reader, no lookup.
 geoip-download = [
     "dep:reqwest",
     "dep:tokio",
@@ -64,9 +57,6 @@ geoip-download = [
     "dep:ipnet",
 ]
 
-# Read and cache. A database is read into memory when it fits under the resident
-# ceiling and mapped when it does not, so `mmap` is what keeps an oversized one
-# openable.
 geoip-lookup = [
     "dep:maxminddb",
     "dep:quick_cache",
@@ -74,45 +64,16 @@ geoip-lookup = [
     "dep:arc-swap",
 ]
 
-# A `geoip-convert` feature belongs here once a table too large for the resident
-# ceiling is written out as a database rather than refused (#2). It is absent
-# rather than declared-and-inert: a feature that pulls the MMDB writer and
-# changes no behaviour is one a consumer cannot tell is doing nothing.
-
-# Download outcomes and the age of each database, through the `metrics` facade.
-#
-# ON by default. It runs once per database per refresh, so the cost is a stat on
-# a daily or monthly cadence, and the age gauge is the only signal a deployment
-# has that its downloads stopped working -- lookups keep hitting a cache built
-# from a database nobody has replaced in months.
 metrics = ["dep:metrics"]
 
-# Cache hits, misses, size and lookup duration.
-#
-# OFF by default, on measurement rather than principle: it costs three to four
-# times a cache hit, on the one path the crate exists to make fast. Take it when
-# you want cache behaviour visible and can pay for it.
-#
-# It names the lookup half because the cache it instruments is there: taken
-# without it, every call site it would emit from is compiled out and the feature
-# silently measures nothing.
 metrics-lookup = ["metrics", "geoip-lookup"]
 
-# A `vrl` feature belongs here once a host actually needs a record mapped into
-# `vrl::value::ObjectMap`. It is absent rather than declared-and-empty: adding a
-# feature later breaks nobody, and shipping one that pulls two LALRPOP grammar
-# builds while exposing no API wastes every consumer's build.
-
-# Criterion supplies its own main, so the libtest harness is off. The whole
-# target is gated on `geoip-lookup`, since with no reader there is no lookup to
-# measure -- `cargo bench --no-default-features` then compiles nothing here.
+# Criterion supplies its own main, so the libtest harness is off.
 [[bench]]
 name = "geoip_lookup"
 harness = false
 required-features = ["geoip-lookup"]
 
-# The resident table is the default backing and the one that has to stay cheap,
-# so what a row costs to hand back is measured rather than argued about.
 [[bench]]
 name = "table_lookup"
 harness = false
@@ -124,48 +85,24 @@ thiserror = ">=2.0.21, <3"
 tracing = ">=0.1.44, <0.2"
 
 # --- geoip-download ---
-# `default-features = false` drops reqwest's `default-tls` (native-tls +
-# openssl); rustls is the house standard. `query` is what lets the IPinfo token
-# ride on the request builder instead of being formatted into a URL that then
-# gets logged.
+# rustls rather than native-tls, and `query` keeps the IPinfo token out of the logged URL.
 reqwest = { version = ">=0.13.5, <0.14", default-features = false, features = ["json", "rustls", "query"], optional = true }
 tokio = { version = ">=1.54.1, <2", features = ["rt", "fs", "time"], optional = true }
 flate2 = { version = ">=1.1.10, <2", optional = true }
 tar = { version = ">=0.4.46, <0.5", optional = true }
 chrono = { version = ">=0.4.45, <0.5", optional = true }
 serde_json = { version = ">=1.0.154, <2", optional = true }
-# Verifies a download against the digest a provider publishes beside it, which
-# is a stronger integrity check than anything derivable from the bytes alone.
 sha2 = { version = ">=0.11.1, <0.12", optional = true }
 
-# Longest-prefix matching for a table keyed by CIDR ranges. A prefix trie is a
-# real data structure with a real performance argument, and this is the
-# maintained one -- `ipnet-trie` is a thin wrapper over an older release of it.
+# Longest-prefix match for an `index: prefix` table.
 prefix-trie = { version = ">=0.10.1, <0.11", default-features = false, features = ["ipnet"], optional = true }
-# The CIDR type and its parser, neither of which std has. Every one of its own
-# dependencies is optional, so it arrives on its own.
 ipnet = { version = ">=2.12.2, <3", default-features = false, optional = true }
 # --- geoip-lookup ---
-# 0.31 bounds the work a crafted database can force during decoding, and a
-# downloaded database is untrusted input. dfe-loader and vector-vrl's bindings
-# take the same 0.32 line, so the DFE consumers share one reader.
+# 0.31 and later bound what a crafted database can expand to: SECURITY.md.
 maxminddb = { version = ">=0.32.0, <0.33", features = ["mmap"], optional = true }
-# Clock-PRO/S3-FIFO with a ghost queue for recently-evicted keys. Measured
-# against moka on this record shape: better hit ratio in every cell tested, 8x
-# faster on the hit path and 6.5x less per-entry bookkeeping.
-#
-# It also serves a synchronous and an async coalescing get-or-insert from ONE
-# cache instance, which moka cannot -- moka splits them across `sync::Cache` and
-# `future::Cache`. VRL's interpreter is synchronous and dfe-loader is async, so
-# one instance serving both is what lets all four consumers share a cache.
-#
-# Never name this crate in a public signature: it is 0.x, so every upstream bump
-# would be a breaking change for factbook's consumers.
+# Never name this crate in a public signature: it is 0.x, so its bumps would break consumers.
 quick_cache = { version = ">=0.7.0, <0.8", optional = true }
-# City, country, timezone and subdivision are nearly always under 24 bytes,
-# which CompactString stores inline -- no heap allocation per field per record.
 compact_str = { version = ">=0.10.0, <0.11", features = ["serde"], optional = true }
-# Lock-free reader swap, so a refresh never blocks a lookup.
 arc-swap = { version = ">=1.9.3, <2", optional = true }
 
 # --- metrics ---
@@ -177,16 +114,12 @@ tempfile = ">=3.27.0, <4"
 serde_json = ">=1.0.154, <2"
 criterion = { version = ">=0.8.2, <0.9", features = ["html_reports"] }
 pretty_assertions = ">=1.4.1, <2"
-# Serve the provider URLs over loopback so the download tests exercise the
-# transfer, the auth shapes and the status handling, not a URL string.
+# Serves the provider URLs over loopback for the download tests.
 wiremock = ">=0.6.5, <0.7"
-# Declaration must match the optional dependency exactly -- two reqwest builds
-# in one graph is an E0464 on the lib test target.
+# Must match the optional dependency exactly: two reqwest builds is E0464 on the lib tests.
 reqwest = { version = ">=0.13.5, <0.14", default-features = false, features = ["json", "rustls", "query"] }
 
-# Dependency debug info is the largest single consumer of compiler memory and
-# target-dir space in this graph, and a backtrace through a dependency is not
-# what anyone debugs. Our own crate keeps its symbols.
+# Dependency debug info is off: it dominates compiler memory and target-dir space.
 [profile.dev.package."*"]
 debug = false
 
@@ -199,8 +132,7 @@ unsafe_code = "deny"
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 
-# Suggests Duration::from_hours/from_mins/from_days -- Rust 1.99+ APIs, above
-# our MSRV, so the suggestion is unsatisfiable.
+# Its suggestions are Rust 1.99 APIs, above the MSRV.
 duration_suboptimal_units = "allow"
 
 # Test and bench code does not inherit lib.rs attributes.

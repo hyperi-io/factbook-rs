@@ -16,21 +16,14 @@
 
 A high-speed, self-maintaining fact enricher for data at scale.
 
-Point it at reference data -- wherever it lives, in whatever shape it ships --
-and it fetches, verifies, indexes and serves it, keeping itself current without
-anyone tending it. Your hot path gets a lookup measured in nanoseconds against
-facts that were refreshed while it was running.
+Point it at reference data -- wherever it lives, in whatever shape it ships -- and it fetches, verifies, indexes and serves it, keeping itself current without anyone tending it. Your hot path gets a cached lookup in hundreds of nanoseconds against facts that were refreshed while it was running.
 
 **What people point it at:**
 
-- **IP geolocation and reputation** -- the batteries-included case, with the
-  providers already modelled.
-- **Fraud correlation** -- ASN, hosting and proxy side tables joined onto the
-  event that needs scoring.
-- **Telco BGP** -- prefix-to-origin and operator-name data at carrier
-  granularity rather than the vanilla cyber view.
-- **Defence telemetry streams** -- a reference table an operator names in their
-  own config and fetches over their own link, no provider is implemented here.
+- IP geolocation and reputation, the batteries-included case, with the providers modelled.
+- Fraud correlation: ASN, hosting and proxy side tables joined onto the event that needs scoring.
+- Telco BGP: prefix-to-origin and operator-name data at carrier granularity rather than the vanilla cyber view.
+- Defence telemetry streams: a reference table an operator names in their own config and fetches over their own link, no provider is implemented here.
 
 That last one is the point of the generic half: factbook does not need to know
 what your data means to keep it fresh and fast.
@@ -67,8 +60,7 @@ account for. The measurements are in
 
 ### GeoIP with a provider account
 
-Name the provider and hand it your credentials. The tier is named too, never
-inferred from which credential happens to be set:
+Name the provider and hand it your credentials. The tier is stated, never inferred from which credential happens to be set:
 
 ```rust,no_run
 use factbook::geoip::{
@@ -153,11 +145,7 @@ schema:
 Unknown keys are an error rather than a silent default, so a misspelt `indx` is
 caught when the config loads rather than at the first fetch.
 
-**One key, or several conditions.** Enrichment asks what is filed under a key,
-and `get` answers that in a hash lookup. A host whose lookups arrive as
-condition objects asks something else -- the rows where every field matches at
-once -- and `find` takes the whole object. An equality on the indexed column
-still goes through the index rather than walking the table:
+**One key, or several conditions.** Enrichment asks what is filed under a key, and `get` answers that in a hash lookup. A host with lookups arriving as condition objects asks something else -- the rows where every field matches at once -- and `find` takes the whole object. An equality on the indexed column still goes through the index rather than walking the table:
 
 ```rust
 use factbook::table::{Condition, Index, Query, Schema, Table, TableFormat};
@@ -188,19 +176,11 @@ are settings on the query rather than four more methods.
 
 ## How it works
 
-Four stages, and every source goes through the same ones: **acquire** over a
-link that may be slow or throttled, **verify** before anything becomes live
-data, **maintain** on the source's own cadence, and **serve** from a reader
-behind a cache -- reading the database onto the heap when it fits under the
-configured ceiling, mapping it when it does not.
+Four stages, and every source goes through the same ones: **acquire** over a link that may be slow or throttled, **verify** before anything becomes live data, **maintain** on the source's cadence, and **serve** from a reader behind a cache -- reading the database onto the heap when it fits under the configured ceiling, mapping it when it does not.
 
-A refused download never replaces a good database -- the file already on disk
-keeps being served. A cache hit took about 300 ns against about 6 us for the
-database read behind it (`benches/geoip_lookup.rs`, 2026-11-01, x86_64), and
-private or reserved addresses never reach the cache at all.
+A refused download never replaces a good database -- the file on disk keeps being served. A cache hit took about 300 ns against about 6 us for the database read behind it (`benches/geoip_lookup.rs`, 2026-11-01, x86_64), and private or reserved addresses never reach the cache at all.
 
-Why that ordering makes the memory map safe, and what the six checks are:
-[docs/architecture.md](https://github.com/hyperi-io/factbook-rs/blob/main/docs/architecture.md).
+Why that ordering makes the memory map safe, and what the seven checks are: [docs/architecture.md](https://github.com/hyperi-io/factbook-rs/blob/main/docs/architecture.md).
 
 ## Documentation
 
@@ -220,9 +200,4 @@ Open bugs: [this repo](https://github.com/hyperi-io/factbook-rs/issues?q=is%3Aop
 
 Apache-2.0. See `LICENSE`.
 
-factbook ships no reference data. It fetches at runtime from whichever source
-you configure, and each source sets its own terms for its own data.
-[SOURCES.md](https://github.com/hyperi-io/factbook-rs/blob/main/SOURCES.md)
-points at where each publisher states them.
-
-Credentials are held in a `Secret` newtype that never reaches a log line or a process argument. IPinfo's token goes on as a query parameter added by the request builder, never into a URL string the crate logs.
+factbook ships no reference data. It fetches at runtime from whichever source you configure, and each source sets the terms for its data. [SOURCES.md](https://github.com/hyperi-io/factbook-rs/blob/main/SOURCES.md) points at where each publisher states them.
