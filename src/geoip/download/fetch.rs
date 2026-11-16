@@ -1112,6 +1112,7 @@ fn extract_member(
 ) -> Result<(), GeoIpDownloadError> {
     let decoder = MultiGzDecoder::new(io::BufReader::new(source));
     let mut archive = tar::Archive::new(decoder);
+    let mut found = false;
 
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -1122,11 +1123,24 @@ fn extract_member(
         if is_match {
             let mut out = io::BufWriter::new(fs::File::create(staged)?);
             copy_bounded(&mut entry, &mut out, dest, MAX_EXPANDED_BYTES)?;
-            return Ok(());
+            found = true;
+            break;
         }
     }
 
-    Err(GeoIpDownloadError::ArchiveMemberMissing { member })
+    if !found {
+        return Err(GeoIpDownloadError::ArchiveMemberMissing { member });
+    }
+
+    // The gzip trailer's CRC is checked only when the decoder reaches the end of
+    // the stream, so read on past the member. A part file resumed from a prefix
+    // of another build fails here when it has no digest to fail against.
+    copy_bounded(
+        archive.into_inner(),
+        &mut io::sink(),
+        dest,
+        MAX_EXPANDED_BYTES,
+    )
 }
 
 /// Append an extension rather than replacing one: `foo.mmdb` becomes
@@ -1541,6 +1555,26 @@ mod tests {
 
         assert_eq!(usize::try_from(result.unwrap()).unwrap(), payload.len());
         assert_eq!(fs::read(&dest).unwrap(), payload);
+    }
+
+    #[test]
+    fn materialise_tar_gz_rejects_a_damaged_gzip_trailer() {
+        // The member sits ahead of the trailer, so reading only as far as the
+        // member would land a body whose CRC or length does not match.
+        let payload = mmdb_body(b"city database bytes");
+        let intact = tar_gz("GeoLite2-City.mmdb", &payload);
+
+        let mut bad_crc = intact.clone();
+        let crc_at = bad_crc.len() - 8;
+        bad_crc[crc_at] ^= 0xff;
+        let truncated = intact[..intact.len() - 8].to_vec();
+
+        for (name, archive) in [("bad crc", bad_crc), ("missing trailer", truncated)] {
+            let (_dir, dest, result) = extract(&archive, "GeoLite2-City.mmdb");
+
+            assert!(result.is_err(), "{name}: the damaged archive was admitted");
+            assert!(!dest.exists(), "{name}: nothing may reach the destination");
+        }
     }
 
     #[test]
