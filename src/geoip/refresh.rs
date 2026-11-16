@@ -137,6 +137,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, SystemTime};
 
@@ -477,11 +478,15 @@ mod tests {
         assert!(geoip.lookup(probe).is_some());
         thread::sleep(max_age + Duration::from_millis(50));
 
-        let (has_read, release) = crate::geoip::enricher::pause::hold();
+        let (handoff, handed) = mpsc::channel();
         let reread = {
             let geoip = geoip.clone();
-            thread::spawn(move || geoip.lookup(probe))
+            thread::spawn(move || {
+                handoff.send(crate::geoip::enricher::pause::hold()).unwrap();
+                geoip.lookup(probe)
+            })
         };
+        let (has_read, release) = handed.recv().unwrap();
         has_read.recv().unwrap();
         replace(&path, CITY_DB, at(60));
         assert!(geoip.refresh_if_changed().unwrap());

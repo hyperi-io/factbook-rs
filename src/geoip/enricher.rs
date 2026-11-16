@@ -590,25 +590,33 @@ impl GeoIp {
 pub(super) mod pause {
     use std::sync::Mutex;
     use std::sync::mpsc::{self, Receiver, Sender};
+    use std::thread::{self, ThreadId};
 
-    /// The two ends of the held read, when one is held.
-    static HELD: Mutex<Option<(Sender<()>, Receiver<()>)>> = Mutex::new(None);
+    /// The thread, and the two ends of its held read, when one is held.
+    static HELD: Mutex<Option<(ThreadId, Sender<()>, Receiver<()>)>> = Mutex::new(None);
 
-    /// Hold the next read until the test lets it go.
+    /// Hold the calling thread's next read until the test lets it go.
     ///
+    /// Tests run in parallel and every one of them reads, so the hold belongs to
+    /// the thread that asked for it and no other thread's read can take it.
     /// Returns a receiver that fires once the read is done, and the sender that
     /// releases it.
     pub(in crate::geoip) fn hold() -> (Receiver<()>, Sender<()>) {
         let (read, has_read) = mpsc::channel();
         let (release, released) = mpsc::channel();
-        *HELD.lock().unwrap() = Some((read, released));
+        *HELD.lock().unwrap() = Some((thread::current().id(), read, released));
         (has_read, release)
     }
 
-    /// Wait here while a test holds the read. Returns at once otherwise.
+    /// Wait here while a test holds this thread's read. Returns at once otherwise.
     pub(super) fn point() {
-        let held = HELD.lock().unwrap().take();
-        if let Some((read, release)) = held {
+        let mut held = HELD.lock().unwrap();
+        if held
+            .as_ref()
+            .is_some_and(|(owner, ..)| *owner == thread::current().id())
+        {
+            let (_, read, release) = held.take().unwrap();
+            drop(held);
             let _ = read.send(());
             let _ = release.recv();
         }
