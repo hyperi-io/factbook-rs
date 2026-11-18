@@ -4,7 +4,9 @@ all-features = true
 
 [advisories]
 yanked = "warn"
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, not vulnerable, and no patched release exists. The geoip-download feature uses it directly. Drop when the dependency graph no longer has chrono." },
+]
 
 # MPL-2.0 is left out: it is file-level weak copyleft.
 [licenses]
