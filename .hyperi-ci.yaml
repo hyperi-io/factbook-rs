@@ -12,7 +12,6 @@
 classification: oss
 
 language: rust
-license: Apache-2.0
 quality:
   enabled: true
   rust:
