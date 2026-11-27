@@ -43,7 +43,7 @@ flowchart TB
     class acquire,lookup group
 ```
 
-*Figure 1. L3 Components -- factbook. The dotted arrow is the refusal path.* Up: top of factbook-rs. Down: [L4 Detail -- Download checks](#a-refusal-keeps-the-previous-database), [L4 Detail -- Database and table backing](#a-database-that-will-not-fit-is-mapped-and-a-table-that-will-not-fit-is-refused).
+*Figure 1. L3 Components -- factbook.* Up: top of factbook-rs. Down: [L4 Detail -- Download checks](#a-refusal-keeps-the-previous-database), [L4 Detail -- Database and table backing](#a-database-that-will-not-fit-is-mapped-and-a-table-that-will-not-fit-is-refused).
 
 A deployment that pre-seeds its databases, or mounts them read-only, can take the lookup half and no HTTP stack at all.
 
@@ -99,7 +99,7 @@ flowchart LR
     class checks,transfer,staged group
 ```
 
-*Figure 2. L4 Detail -- Download checks. The dotted arrow is the refusal path.* Up: [L3 Components -- factbook](architecture.md).
+*Figure 2. L4 Detail -- Download checks.* Up: [L3 Components -- factbook](architecture.md).
 
 A short body is the one refusal that keeps its bytes, because they are a valid prefix of the file. The next run continues from them with a `Range` request when the result can be checked afterwards: a published digest, or a gzip body with a checksum that fails on a splice. A raw body with no digest starts again, because a server can answer a range from a rebuilt file.
 
@@ -153,7 +153,7 @@ flowchart LR
     class database,table group
 ```
 
-*Figure 3. L4 Detail -- Database and table backing. Both database backings answer through the cache, and orange is a table refused at load.* Up: [L3 Components -- factbook](architecture.md).
+*Figure 3. L4 Detail -- Database and table backing. Both database backings answer through the cache.* Up: [L3 Components -- factbook](architecture.md).
 
 A database is in the format the reader reads. One larger than `resident_max_bytes` is memory-mapped instead of being read onto the heap, and it answers through the same cache, so a repeat address never touches the file.
 
